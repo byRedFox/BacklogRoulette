@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['D:\\SteamLibrary\\steamrandom\\1.ico'],
+    icon=['1.ico'],
 )
