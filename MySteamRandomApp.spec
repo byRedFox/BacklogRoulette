@@ -3,19 +3,21 @@
 
 import os
 
-# Иконка необязательна: без 1.ico сборка пройдёт со стандартной иконкой
+# Иконка и музыка необязательны: без них сборка всё равно пройдёт
 ICON = '1.ico' if os.path.exists('1.ico') else None
+DATAS = [(name, '.') for name in ('1.ico', 'apptheme.mp3') if os.path.exists(name)]
 
 a = Analysis(
     ['MySteamRandomApp.py'],
     pathex=[],
     binaries=[],
-    datas=[(ICON, '.')] if ICON else [],  # иконка окна внутри .exe
+    datas=DATAS,  # вшиваются в .exe
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['pandas', 'numpy', 'matplotlib'],
+    # Лишние библиотеки, которые PyInstaller может зацепить и раздуть .exe
+    excludes=['tkinter', 'pandas', 'numpy', 'matplotlib', 'PyQt5', 'PyQt6', 'PySide2'],
     noarchive=False,
     optimize=0,
 )
@@ -31,7 +33,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,  # UPX ломает DLL Qt
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
