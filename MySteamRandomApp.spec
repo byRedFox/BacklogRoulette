@@ -1,16 +1,28 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Сборка: python -m PyInstaller --noconfirm MySteamRandomApp.spec  (или просто build.bat)
 
+import glob
 import os
+
+import PySide6
 
 # Иконка и музыка необязательны: без них сборка всё равно пройдёт
 ICON = 'icon.ico' if os.path.exists('icon.ico') else None
 DATAS = [(name, '.') for name in ('icon.ico', 'apptheme.mp3') if os.path.exists(name)]
 
+# Проигрыватель FFmpeg для трейлеров: новые трейлеры Steam (HLS, до 1080p) открывает только он.
+# Кладём его в сборку явно — без него Qt берёт проигрыватель Windows, и видео идёт в низком качестве.
+QT_DIR = os.path.dirname(PySide6.__file__)
+BINARIES = [(path, 'PySide6/plugins/multimedia')
+            for path in glob.glob(os.path.join(QT_DIR, 'plugins', 'multimedia', '*.dll'))]
+BINARIES += [(path, 'PySide6')
+             for pattern in ('avcodec*.dll', 'avformat*.dll', 'avutil*.dll', 'swresample*.dll', 'swscale*.dll')
+             for path in glob.glob(os.path.join(QT_DIR, pattern))]
+
 a = Analysis(
     ['MySteamRandomApp.py'],
     pathex=[],
-    binaries=[],
+    binaries=BINARIES,
     datas=DATAS,  # вшиваются в .exe
     hiddenimports=[],
     hookspath=[],
@@ -43,4 +55,6 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=[ICON] if ICON else None,
+    # Автор, версия и права в свойствах .exe (правый клик → «Свойства» → «Подробно»)
+    version='version_info.txt' if os.path.exists('version_info.txt') else None,
 )
