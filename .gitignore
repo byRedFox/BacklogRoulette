@@ -2,6 +2,7 @@
 build/
 dist/
 /MySteamRandomApp.exe
+/BacklogRoulette.exe
 
 # Python
 __pycache__/

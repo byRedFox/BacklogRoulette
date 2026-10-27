@@ -4,8 +4,8 @@
 import os
 
 # Иконка и музыка необязательны: без них сборка всё равно пройдёт
-ICON = '1.ico' if os.path.exists('1.ico') else None
-DATAS = [(name, '.') for name in ('1.ico', 'apptheme.mp3') if os.path.exists(name)]
+ICON = 'icon.ico' if os.path.exists('icon.ico') else None
+DATAS = [(name, '.') for name in ('icon.ico', 'apptheme.mp3') if os.path.exists(name)]
 
 a = Analysis(
     ['MySteamRandomApp.py'],
@@ -29,7 +29,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='MySteamRandomApp',
+    name='BacklogRoulette',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

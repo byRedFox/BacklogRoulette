@@ -1,4 +1,4 @@
-"""My Steam Random — рандомайзер «Во что сыграть дальше?» для библиотеки Steam.
+"""Backlog Roulette — рандомайзер «Во что сыграть дальше?» для библиотеки Steam.
 
 Интерфейс в стиле Windows 11 (PySide6 + PySide6-Fluent-Widgets), логика — в core.py.
 """
@@ -28,7 +28,9 @@ from qfluentwidgets import (Action, BodyLabel, CaptionLabel, CheckBox, ComboBox,
 
 import core
 
-__version__ = "2.0.5"
+__version__ = "2.0.6"
+APP_NAME = "Backlog Roulette"
+APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 
 THEMES = {"auto": Theme.AUTO, "light": Theme.LIGHT, "dark": Theme.DARK}
 THEME_KEYS = ["auto", "light", "dark"]
@@ -1531,7 +1533,7 @@ class SettingsPage(QWidget):
         layout.addWidget(StrongBodyLabel("Оформление", self))
         layout.addLayout(appearance)
         layout.addStretch(1)
-        layout.addWidget(CaptionLabel(f"My Steam Random {__version__}", self))
+        layout.addWidget(CaptionLabel(f"{APP_NAME} {__version__} — рандомайзер для библиотеки Steam", self))
         self.credit_label = CaptionLabel("Музыка: «Soliloquy» — Matthew Pablo (matthewpablo.com), "
                                          "лицензия CC-BY 3.0, opengameart.org/content/soliloquy", self)
         layout.addWidget(self.credit_label)
@@ -1719,10 +1721,10 @@ class MainWindow(MSFluentWindow):
                              position=NavigationItemPosition.BOTTOM)
         self.libraryChanged.connect(self.on_library_changed)
 
-        self.setWindowTitle(f"My Steam Random {__version__}")
-        icon = core.find_resource(core.ICON_NAME)
-        if icon:
-            self.setWindowIcon(QIcon(icon))
+        self.setWindowTitle(f"{APP_NAME} {__version__}")
+        # Заголовок Fluent рисует значок сам и берёт его только у окна, не у приложения
+        if not QApplication.windowIcon().isNull():
+            self.setWindowIcon(QApplication.windowIcon())
         self.resize(980, 720)
         self.setMinimumSize(780, 640)
         screen = QApplication.primaryScreen().availableGeometry()
@@ -1815,8 +1817,19 @@ def install_error_hooks(window):
 
 def main():
     core.setup_logging()
-    core.log.info("Запуск My Steam Random %s (Python %s)", __version__, sys.version.split()[0])
+    core.log.info("Запуск %s %s (Python %s)", APP_NAME, __version__, sys.version.split()[0])
+    if sys.platform == "win32":
+        # Без этого Windows при запуске из .py показывает на панели задач значок Python
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+        except (AttributeError, OSError):
+            pass
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    icon = core.find_resource(core.ICON_NAME)
+    if icon:
+        app.setWindowIcon(QIcon(icon))  # для главного окна и всех диалогов
     setTheme(THEMES.get(core.load_settings()["theme"], Theme.AUTO))
     window = MainWindow()
     install_error_hooks(window)

@@ -40,7 +40,7 @@ LOG_FILE = os.path.join(LOGS_DIR, "app.log")
 NAMES_CACHE_FILE = os.path.join(BASE_DIR, "steam_app_names.json")  # названия семейных игр
 NAMES_CACHE_TTL = 7 * 24 * 3600  # неделя
 AUDIO_EXTENSIONS = (".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".wma", ".opus")
-ICON_NAME = "1.ico"
+ICON_NAME = "icon.ico"  # рисуется скриптом make_icon.py
 MUSIC_NAME = "apptheme.mp3"
 
 COVER_SIZE = (300, 450)
