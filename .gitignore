@@ -13,10 +13,9 @@ venv/
 *.tmp
 games.json.broken
 covers_not_found.json
+steam_app_names.json
+logs/
 
 # Личные ключи: SteamGridDB, Steam Web API и SteamID (вводятся в окне «Настройки»)
 api_key.txt
 settings.json
-
-covers/
-games.json
