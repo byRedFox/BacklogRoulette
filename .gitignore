@@ -16,6 +16,11 @@ covers_not_found.json
 steam_app_names.json
 logs/
 
+# Личные данные: свой список игр и скачанные обложки
+games.json
+SteamGames.xlsx
+covers/
+
 # Личные ключи: SteamGridDB, Steam Web API и SteamID (вводятся в окне «Настройки»)
 api_key.txt
 settings.json
