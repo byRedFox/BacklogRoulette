@@ -1,16 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
+# Сборка: python -m PyInstaller --noconfirm MySteamRandomApp.spec  (или просто build.bat)
 
+import os
+
+# Иконка необязательна: без 1.ico сборка пройдёт со стандартной иконкой
+ICON = '1.ico' if os.path.exists('1.ico') else None
 
 a = Analysis(
     ['MySteamRandomApp.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[(ICON, '.')] if ICON else [],  # иконка окна внутри .exe
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['pandas', 'numpy', 'matplotlib'],
     noarchive=False,
     optimize=0,
 )
@@ -35,5 +40,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['1.ico'],
+    icon=[ICON] if ICON else None,
 )
