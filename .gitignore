@@ -15,6 +15,10 @@ venv/
 games.json.broken
 covers_not_found.json
 steam_app_names.json
+steam_details.json
+steam_reviews.json
+steam_soundtracks.json
+cache/
 logs/
 
 # Личные данные: свой список игр и скачанные обложки
