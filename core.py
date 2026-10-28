@@ -72,7 +72,10 @@ DEFAULT_SETTINGS = {
     "steam_id": "",
     "music_enabled": True,
     "music_volume": 40,  # 0–100
-    "music_path": "",  # свой трек или папка с музыкой; пусто — встроенный apptheme.mp3
+    "music_path": "",  # что играет: свой трек, папка или саундтрек Steam; пусто — встроенный apptheme.mp3
+    "music_custom": "",  # своя папка или трек — остаётся в списке, даже когда играет саундтрек
+    "music_shuffle_mode": "off",  # вперемешку: off, all — вся музыка (кроме встроенной), soundtracks — саундтреки
+    "music_repeat": "all",  # all — папка по кругу, one — повторять один трек
     "sounds_enabled": True,  # щелчки барабана и звук остановки
     "theme": "auto",  # auto | light | dark
     # Последний выбор в окне импорта — по нему работает быстрая синхронизация
@@ -99,6 +102,45 @@ def list_audio_files(folder):
     for root, _, names in os.walk(folder):
         files += [os.path.join(root, n) for n in names if n.lower().endswith(AUDIO_EXTENSIONS)]
     return files
+
+
+def natural_key(text):
+    """Сортировка «как в проводнике»: трек 2 идёт раньше трека 10."""
+    return [int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", text)]
+
+
+def folder_tracks(folder):
+    """Треки папки по порядку. Альбомы часто лежат сразу в MP3 и FLAC — одинаковые треки берём один раз."""
+    best = {}
+    for path in list_audio_files(folder):
+        stem, ext = os.path.splitext(os.path.basename(path))
+        rank = AUDIO_EXTENSIONS.index(ext.lower())  # mp3 первым: его открывают оба проигрывателя Qt
+        if stem.casefold() not in best or rank < best[stem.casefold()][0]:
+            best[stem.casefold()] = (rank, path)
+    return sorted((path for _, path in best.values()), key=lambda p: natural_key(os.path.relpath(p, folder)))
+
+
+def track_titles(paths):
+    """Названия треков для плеера: без общего начала («The Medium Original Soundtrack - ») и номера трека."""
+    stems = [os.path.splitext(os.path.basename(p))[0] for p in paths]
+    prefix = os.path.commonprefix(stems) if len(stems) > 1 else ""
+    cut = prefix.rfind(" - ")
+    prefix = prefix[:cut + 3] if cut >= 0 else ""
+    titles = []
+    for stem in stems:
+        title = re.sub(r"^\d{1,3}(?:\s*[-._)]\s*|\s+)(?=\S)", "", stem[len(prefix):])
+        titles.append(title.strip() or stem)
+    return titles
+
+
+def same_path(a, b):
+    return bool(a) and bool(b) and os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
+def is_steam_music(path):
+    """Лежит ли папка в steamapps\\music — там Steam хранит скачанные саундтреки."""
+    sep = os.sep
+    return f"{sep}steamapps{sep}music{sep}" in os.path.normcase(os.path.normpath(path)) + sep
 
 
 # --- Логи -------------------------------------------------------------------
@@ -209,9 +251,10 @@ def save_settings(**changes):
     save_json(SETTINGS_FILE, settings)
 
 
-# Очистка названия от символов, недопустимых в имени файла (и значков ™ ®)
+# Очистка названия: Steam иногда присылает его с HTML-кодами («Assassin&apos;s Creed») — раскрываем их,
+# затем убираем символы, недопустимые в имени файла (и значки ™ ®)
 def clean_name(text):
-    text = re.sub(r'[<>:"/\\|?*™®©]', "", str(text))
+    text = re.sub(r'[<>:"/\\|?*™®©]', "", html.unescape(str(text)))
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -251,7 +294,41 @@ class GameLibrary:
             return (f"Файл games.json повреждён ({e}). Он сохранён как "
                     f"{os.path.basename(broken_path)}, список начат заново.")
         self.games = [g for g in data if isinstance(g, dict) and g.get("name")]
+        if self._fix_escaped_names():
+            try:
+                self.save()
+            except OSError:
+                log.exception("Не удалось сохранить исправленные названия игр")
         return None
+
+    def _fix_escaped_names(self):
+        """До 2.2 названия попадали в список с HTML-кодами: «&apos;» вместо апострофа. Чиним их вместе
+        с файлами обложек. Если такая игра уже есть с правильным названием — оставляем одну."""
+        fixed_count = 0
+        for game in list(self.games):
+            old, new = game["name"], clean_name(game["name"])
+            if new == old:
+                continue
+            fixed_count += 1
+            twin = self.find(new)
+            if twin and twin is not game:
+                if game.get("appid") and not twin.get("appid"):
+                    twin["appid"] = game["appid"]
+                self.games.remove(game)
+            else:
+                game["name"] = new
+            for ext in IMAGE_EXTENSIONS:  # обложка лежит под старым названием
+                old_path, new_path = (os.path.join(COVERS_DIR, base + ext) for base in (old, new))
+                try:
+                    if os.path.exists(old_path):
+                        if os.path.exists(new_path) or find_cover(new):
+                            os.remove(old_path)
+                        else:
+                            os.replace(old_path, new_path)
+                except OSError as e:
+                    log.warning("Не удалось переименовать обложку «%s»: %s", old, e)
+            log.info("Название исправлено: «%s» → «%s»", old, new)
+        return fixed_count
 
     def _migrate_from_excel(self):
         if not os.path.exists(LEGACY_EXCEL_FILE):
@@ -969,21 +1046,20 @@ def fetch_game_details(appid):
         if sources:
             movies.append({"name": movie.get("name", ""), "thumb": movie.get("thumbnail"), "sources": sources})
 
-    # Русского описания у игры нет — Steam присылает английское. Переводим только описания,
-    # названия, разработчиков и жанры оставляем как в Steam.
-    description, short_translated = _to_russian(_strip_html(d.get("short_description")))
+    # Русского описания у игры нет — Steam присылает английское. Переводит его translate_details отдельно,
+    # уже после показа страницы: переводчик бывает медленным, и страница не должна его ждать.
+    # Названия, разработчиков и жанры оставляем как в Steam.
+    description = _strip_html(d.get("short_description"))
     about = _strip_html(d.get("about_the_game") or d.get("detailed_description"))
     if about == description or len(about) <= len(description) + 40:
-        about, about_translated = "", False  # полное описание ничего не добавляет к краткому
-    else:
-        about, about_translated = _to_russian(about)
+        about = ""  # полное описание ничего не добавляет к краткому
     return {
         "version": DETAILS_VERSION,
         "appid": appid,
         "name": d.get("name", ""),
         "description": description,
         "about": about,
-        "translated": short_translated or about_translated,
+        "translated": False,
         "metacritic_url": (d.get("metacritic") or {}).get("url"),
         "achievements_total": (d.get("achievements") or {}).get("total", 0),
         "genres": [g["description"] for g in d.get("genres") or [] if g.get("description")],
@@ -1013,10 +1089,37 @@ UNTRANSLATED_TTL = 3600  # переводчик отказал (часто «с�
 
 def _details_ttl(details):
     """Сколько хранить карточку: две недели, но час — если описание осталось непереведённым."""
-    texts = (details.get("description"), details.get("about"))
-    if any(text and not _is_russian(text) for text in texts):
+    if needs_translation(details):
         return UNTRANSLATED_TTL
     return DETAILS_CACHE_TTL
+
+
+def needs_translation(details):
+    """Есть ли в карточке описание не на русском — тогда его переводит translate_details."""
+    return any(text and not _is_russian(text) for text in (details.get("description"), details.get("about")))
+
+
+def translate_details(details):
+    """Описание карточки на русском: карточка с переводом (она же сохраняется в кэш) или None —
+    переводить нечего или переводчик не ответил (тогда остаётся оригинал, попробуем при следующем открытии)."""
+    if not needs_translation(details):
+        return None
+    result, changed = dict(details), False
+    for key in ("description", "about"):
+        text, translated = _to_russian(details.get(key) or "")
+        if translated:
+            result[key], changed = text, True
+    if not changed:
+        return None
+    result["translated"] = True
+    with _details_lock:
+        cache = _load_details_cache()
+        cache[str(details["appid"])] = result
+        try:
+            save_json(DETAILS_CACHE_FILE, cache)
+        except OSError:
+            log.exception("Не удалось сохранить кэш карточек игр")
+    return result
 
 
 def get_game_details(appid):
@@ -1048,8 +1151,8 @@ def get_game_details(appid):
 def get_achievements(appid, api_key, steam_id):
     """Достижения игры: названия и описания на русском, доля игроков, получено ли у вас.
 
-    Нужен ключ Steam Web API. Ваш прогресс Steam отдаёт только для игр на вашем аккаунте
-    и при открытой игровой информации профиля — иначе "unlocked" = None.
+    Нужен ключ Steam Web API. Свой прогресс берётся из Web API, а если он отказал — со страницы профиля;
+    не вышло и там — "unlocked" = None, а в "progress_note" — почему.
     Возвращает None, если у игры нет достижений.
     """
     if not api_key:
@@ -1067,23 +1170,16 @@ def get_achievements(appid, api_key, steam_id):
     except (requests.RequestException, ValueError, KeyError) as e:
         log.warning("Нет статистики достижений для %s: %s", appid, e)
 
-    mine = None
+    mine, progress_note = None, ""
     if steam_id:
-        try:
-            data = fetch(STEAM_PLAYER_ACHIEVEMENTS_URL,
-                         params={"key": api_key, "steamid": steam_id, "appid": appid}).json()
-            stats = data.get("playerstats") or {}
-            if stats.get("success"):
-                mine = {a["apiname"]: a.get("unlocktime", 0) for a in stats.get("achievements") or []
-                        if a.get("achieved")}
-        except (requests.RequestException, ValueError) as e:
-            # Семейная игра, не на этом аккаунте или закрытый профиль — показываем без прогресса
-            log.info("Прогресс достижений для %s недоступен: %s", appid, mask_secrets(e))
+        mine, progress_note = _player_achievements(appid, api_key, steam_id)
+    else:
+        progress_note = "Чтобы видеть свой прогресс, укажите SteamID64 в настройках."
 
     result = []
     for a in items:
         api_name = a.get("name", "")
-        unlocked_at = mine.get(api_name) if mine is not None else None
+        unlocked_at = mine.get(api_name.casefold()) if mine is not None else None
         result.append({
             "name": a.get("displayName") or api_name,
             "description": a.get("description", ""),
@@ -1096,7 +1192,69 @@ def get_achievements(appid, api_key, steam_id):
         })
     # Сначала полученные (свежие выше), потом остальные — от самых частых к редким
     result.sort(key=lambda a: (not a["unlocked"], -a["unlocked_at"], -(a["percent"] or 0)))
-    return {"items": result, "unlocked": len(mine) if mine is not None else None}
+    unlocked = sum(a["unlocked"] for a in result) if mine is not None else None
+    return {"items": result, "unlocked": unlocked, "progress_note": progress_note}
+
+
+def _player_achievements(appid, api_key, steam_id):
+    """Полученные достижения: ({api-имя в нижнем регистре: время получения}, "") или (None, почему не узнали).
+
+    Web API отказывает (403) в играх не с этого аккаунта — например, из семейной библиотеки, — хотя
+    достижения в них ваши и видны на странице профиля. Тогда берём их оттуда: страница отдаёт XML
+    без ключа, если игровая информация профиля открыта. Причину отказа Steam пишет только в теле ответа.
+    """
+    reason = ""
+    try:
+        data = fetch(STEAM_PLAYER_ACHIEVEMENTS_URL,
+                     params={"key": api_key, "steamid": steam_id, "appid": appid, "l": "english"}).json()
+        stats = data.get("playerstats") or {}
+        if stats.get("success"):
+            return {a["apiname"].casefold(): a.get("unlocktime", 0) for a in stats.get("achievements") or []
+                    if a.get("achieved") and a.get("apiname")}, ""
+        reason = stats.get("error") or "Steam не прислал прогресс"
+    except requests.HTTPError as e:
+        try:
+            reason = (e.response.json().get("playerstats") or {}).get("error") or ""
+        except ValueError:
+            pass
+        reason = f"{e.response.status_code}" + (f" — {reason}" if reason else "")
+    except (requests.RequestException, ValueError) as e:
+        reason = mask_secrets(e)
+
+    mine = _profile_achievements(appid, steam_id)
+    if mine is not None:
+        log.info("Прогресс достижений для %s: Web API отказал (%s), взял со страницы профиля — получено %d",
+                 appid, reason, len(mine))
+        return mine, ""
+    log.info("Прогресс достижений для %s недоступен: Web API — %s, страница профиля тоже не отдала", appid, reason)
+    if "not public" in reason.casefold():
+        return None, ("Steam не отдаёт ваш прогресс: в настройках приватности профиля закрыта "
+                      "«Игровая информация». Откройте её — и прогресс появится.")
+    return None, ("Steam не отдаёт ваш прогресс в этой игре — обычно так бывает с играми из семейной "
+                  "библиотеки или не с этого аккаунта.")
+
+
+STEAM_PROFILE_ACHIEVEMENTS_URL = "https://steamcommunity.com/profiles/{steam_id}/stats/{appid}/achievements/"
+
+
+def _profile_achievements(appid, steam_id):
+    """Полученные достижения со страницы профиля Steam (XML). None — страница их не отдала."""
+    try:
+        response = fetch(STEAM_PROFILE_ACHIEVEMENTS_URL.format(steam_id=steam_id, appid=appid),
+                         params={"xml": 1, "l": "english"})
+    except requests.RequestException as e:
+        log.info("Страница достижений профиля для %s не открылась: %s", appid, e)
+        return None
+    text = response.text
+    if "<achievements>" not in text:
+        return None  # закрытый профиль, нет игры или Steam прислал HTML вместо XML
+    mine = {}
+    for block in re.findall(r'<achievement closed="1">(.*?)</achievement>', text, re.DOTALL):
+        name = re.search(r"<apiname>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</apiname>", block, re.DOTALL)
+        when = re.search(r"<unlockTimestamp>(\d+)</unlockTimestamp>", block)
+        if name:
+            mine[html.unescape(name.group(1)).strip().casefold()] = int(when.group(1)) if when else 0
+    return mine
 
 
 def fetch_image(url):
@@ -1232,6 +1390,75 @@ def get_artwork(game, kind, api_key=""):
     return None
 
 
+def _animated_path(game):
+    return _art_path(game, "hero")[:-4] + "_anim.webp"
+
+
+def find_animated_hero(game, api_key):
+    """Есть ли у игры живой фон в SteamGridDB (анимированный WebP): {"path": скачанный файл или None,
+    "url": адрес для скачивания} или None — ключа нет или живого фона у игры нет.
+
+    Сам файл здесь не качается — только по кнопке на странице игры (download_animated_hero): живые фоны
+    весят до 50 МБ. Ответ запоминается рядом с фонами: «.url» — адрес живого фона, «.none» — его нет
+    (забывается после смены ключа SteamGridDB, как и для обычных фонов).
+    """
+    if not api_key:
+        return None
+    path = _animated_path(game)
+    if os.path.exists(path):
+        return {"path": path, "url": None}
+    url_file, missing = path + ".url", path + ".none"
+    if os.path.exists(missing):
+        return None
+    url = read_text(url_file)
+    if url:
+        return {"path": None, "url": url}
+    try:
+        game_id = _griddb_game_id(game, api_key)
+        items = []
+        if game_id:
+            # Qt проигрывает анимированный WebP; анимированный PNG он показал бы неподвижной картинкой
+            items = fetch(f"{STEAMGRIDDB_API_URL}/heroes/game/{game_id}",
+                          headers={"Authorization": f"Bearer {api_key}"},
+                          params={"types": "animated", "mimes": "image/webp"}).json().get("data", [])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not items:
+            write_text(missing, "")
+            return None
+        write_text(url_file, items[0]["url"])
+        return {"path": None, "url": items[0]["url"]}
+    except (requests.RequestException, OSError, ValueError, KeyError) as e:
+        log.warning("Не удалось узнать про живой фон для «%s»: %s", game["name"], mask_secrets(e))
+        return None
+
+
+def download_animated_hero(game, url, progress=None, cancelled=None):
+    """Скачать живой фон. progress(проценты или -1, если сервер не сказал размер) — по ходу загрузки,
+    cancelled() → True — бросить (открыли другую игру). Путь к файлу или None, если загрузку бросили."""
+    path = _animated_path(game)
+    if os.path.exists(path):
+        return path
+    tmp_path = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with requests.get(url, timeout=REQUEST_TIMEOUT, stream=True) as response:
+        response.raise_for_status()
+        total, done = int(response.headers.get("Content-Length") or 0), 0
+        with open(tmp_path, "wb") as f:
+            for chunk in response.iter_content(256 * 1024):
+                if cancelled and cancelled():
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if progress:
+                    progress(min(99, done * 100 // total) if total else -1)
+    if cancelled and cancelled():
+        os.remove(tmp_path)
+        return None
+    os.replace(tmp_path, path)
+    log.info("Живой фон для «%s»: %d КБ", game["name"], done // 1024)
+    return path
+
+
 def make_backdrop(hero_path):
     """Подложка для всей страницы игры: фон, сильно размытый и затемнённый. Маленькая — её растянут."""
     path = os.path.splitext(hero_path)[0] + "_backdrop.jpg"
@@ -1253,6 +1480,437 @@ def clear_artwork_misses():
             for file_name in os.listdir(folder):
                 if file_name.endswith(".none"):
                     os.remove(os.path.join(folder, file_name))
+
+
+# --- Саундтреки Steam -------------------------------------------------------
+# Купленный саундтрек Steam качает в <библиотека>\steamapps\music\<папка альбома>, а рядом с играми кладёт
+# appmanifest_<appid>.acf: в нём appid альбома, его название и имя папки (installdir). К какой игре относится
+# альбом, узнаём у магазина: открытый IStoreBrowseService/GetItems пачкой отвечает, какие приложения —
+# саундтреки (тип 11) и чей это саундтрек (parent_appid). Ключ API для него не нужен.
+# Какие саундтреки куплены, Web API не отдаёт — это знает только магазин после входа на сайт
+# (store.steampowered.com/dynamicstore/userdata), его читает встроенный браузер программы.
+SOUNDTRACKS_FILE = os.path.join(BASE_DIR, "steam_soundtracks.json")
+SOUNDTRACKS_RETRY = 24 * 3600  # магазин не ответил — спросим снова через сутки
+SOUNDTRACK_IMAGES_DIR = os.path.join(CACHE_DIR, "soundtrack")
+COVER_WORDS = ("cover", "folder", "front", "album", "art")  # так обычно называют обложку в папке альбома
+COVER_RATIO = (0.6, 1.4)  # обложка альбома — квадратная или чуть вытянутая; шапки и логотипы не подходят
+STEAM_STORE_ITEMS_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/"
+STEAM_ASSETS_URL = "https://shared.akamai.steamstatic.com/store_item_assets/"
+STORE_TYPE_MUSIC = 11  # тип «саундтрек» в ответе магазина
+STORE_ITEMS_BATCH = 100  # столько appid в одном запросе — адрес не выходит слишком длинным
+STATE_FULLY_INSTALLED = 4  # флаг StateFlags в appmanifest: скачано целиком
+_soundtracks_lock = threading.Lock()
+
+
+def _acf_values(path):
+    """appid, name, installdir и StateFlags из appmanifest_*.acf (первые встреченные — они в начале файла)."""
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+    except OSError:
+        return {}
+    values = {}
+    for key, value in re.findall(r'^\s*"(appid|name|installdir|stateflags)"\s+"([^"]*)"', text,
+                                 re.MULTILINE | re.IGNORECASE):
+        values.setdefault(key.lower(), value)
+    return values
+
+
+def find_soundtracks(log_result=True):
+    """Скачанные саундтреки Steam: [{"appid" (или None), "name", "folder", "tracks": [путь, ...]}, ...]."""
+    albums, seen = [], set()
+    for library in steam_library_dirs():
+        steamapps = os.path.join(library, "steamapps")
+        music = os.path.join(steamapps, "music")
+        if not os.path.isdir(music):
+            continue
+        manifests = {}
+        try:
+            for file_name in os.listdir(steamapps):
+                if file_name.startswith("appmanifest_") and file_name.endswith(".acf"):
+                    values = _acf_values(os.path.join(steamapps, file_name))
+                    if values.get("installdir"):
+                        manifests[os.path.normcase(values["installdir"])] = values
+            entries = os.listdir(music)
+        except OSError as e:
+            log.warning("Не удалось прочитать папку саундтреков %s: %s", music, e)
+            continue
+        for entry in entries:
+            folder = os.path.join(music, entry)
+            key = os.path.normcase(os.path.normpath(folder))
+            if key in seen or not os.path.isdir(folder):
+                continue
+            seen.add(key)
+            manifest = manifests.get(os.path.normcase(entry), {})
+            flags = manifest.get("stateflags", "")
+            if flags.isdigit() and not int(flags) & STATE_FULLY_INSTALLED:
+                continue  # Steam ещё качает альбом
+            tracks = folder_tracks(folder)
+            if not tracks:
+                continue  # папка пустая
+            appid = manifest.get("appid", "")
+            albums.append({"appid": int(appid) if appid.isdigit() else None,
+                           "name": manifest.get("name") or entry, "folder": folder, "tracks": tracks})
+    albums.sort(key=lambda a: natural_key(a["name"]))
+    if log_result:
+        log.info("Саундтреки Steam: %d%s", len(albums),
+                 "".join(f"\n  {a['name']} ({a['appid'] or 'без appid'}): {len(a['tracks'])} треков" for a in albums))
+    return albums
+
+
+def store_items(appids):
+    """Сведения магазина о приложениях: {appid: {"type", "name", "parent", "header"}}. Чего нет в магазине — нет и тут."""
+    ids = sorted(set(appids))
+    items = {}
+    for start in range(0, len(ids), STORE_ITEMS_BATCH):
+        query = {"ids": [{"appid": appid} for appid in ids[start:start + STORE_ITEMS_BATCH]],
+                 "context": {"language": "russian", "country_code": "US"},
+                 "data_request": {"include_assets": True}}
+        data = fetch(STEAM_STORE_ITEMS_URL, params={"input_json": json.dumps(query, separators=(",", ":"))}).json()
+        for item in (data.get("response") or {}).get("store_items") or []:
+            appid = item.get("appid") or item.get("id")
+            if not appid or item.get("success") != 1:
+                continue
+            assets = item.get("assets") or {}
+            header = ""
+            if assets.get("asset_url_format") and assets.get("header"):
+                header = STEAM_ASSETS_URL + assets["asset_url_format"].replace("${FILENAME}", assets["header"])
+            items[appid] = {"type": item.get("type"), "name": item.get("name") or "",
+                            "parent": (item.get("related_items") or {}).get("parent_appid"), "header": header}
+    return items
+
+
+def _load_soundtrack_cache():
+    """steam_soundtracks.json: {"albums": {appid: сведения о саундтреке}, "not_music": [appid, ...],
+    "owned": [appid купленных саундтреков], "synced": когда последний раз сверялись со Steam}."""
+    with _soundtracks_lock:
+        try:
+            with open(SOUNDTRACKS_FILE, encoding="utf-8") as f:
+                cache = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            cache = {}
+    if not isinstance(cache, dict):
+        cache = {}
+    if "albums" not in cache:  # в первых сборках 2.2 в файле лежали только альбомы
+        cache = {"albums": {k: v for k, v in cache.items() if isinstance(v, dict)}}
+    cache.setdefault("not_music", [])
+    cache.setdefault("owned", [])
+    return cache
+
+
+def _save_soundtrack_cache(cache):
+    with _soundtracks_lock:
+        try:
+            save_json(SOUNDTRACKS_FILE, cache)
+        except OSError:
+            log.exception("Не удалось сохранить кэш саундтреков")
+
+
+def _describe_music(appids, cache):
+    """Спрашивает магазин о приложениях, про которые ещё ничего не знаем, и запоминает саундтреки среди них.
+
+    Тип приложения не меняется, поэтому каждое приложение спрашиваем один раз. Нет связи — исключение requests.
+    """
+    albums, not_music, now = cache["albums"], set(cache["not_music"]), time.time()
+    wanted = [appid for appid in appids
+              if appid not in not_music and (str(appid) not in albums or (
+                  albums[str(appid)].get("failed") and now - albums[str(appid)].get("fetched", 0) > SOUNDTRACKS_RETRY))]
+    if not wanted:
+        return
+    items = store_items(wanted)
+    parents = {}
+    for appid in wanted:
+        item = items.get(appid)
+        if not item:
+            continue  # магазин не знает приложение (сняли с продажи) — спросим при следующей синхронизации
+        if item["type"] != STORE_TYPE_MUSIC:
+            not_music.add(appid)
+            continue
+        albums[str(appid)] = {"name": item["name"], "game": item["parent"], "game_name": "",
+                              "header": item["header"], "fetched": now}
+        if item["parent"]:
+            parents.setdefault(item["parent"], []).append(str(appid))
+    if parents:
+        try:
+            names = store_items(parents)
+        except (requests.RequestException, ValueError):
+            names = {}
+        for parent, keys in parents.items():
+            for key in keys:
+                albums[key]["game_name"] = (names.get(parent) or {}).get("name", "")
+    cache["not_music"] = sorted(not_music)
+
+
+def _store_image(appid, url, download=True):
+    """Шапка страницы альбома в магазине — когда другой картинки нет."""
+    path = os.path.join(SOUNDTRACK_IMAGES_DIR, f"{appid}.jpg")
+    if os.path.exists(path):
+        return path
+    if not (download and url):
+        return None
+    try:
+        content = fetch(url).content
+        os.makedirs(SOUNDTRACK_IMAGES_DIR, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(content)
+    except (requests.RequestException, OSError) as e:
+        log.warning("Не удалось скачать картинку саундтрека %s: %s", appid, e)
+        return None
+    return path
+
+
+def _steam_cover(appid):
+    """Обложка альбома из кэша клиента Steam — та, что видна у саундтрека в библиотеке Steam."""
+    steam_dir = find_steam_dir()
+    if not (steam_dir and appid):
+        return None
+    library_cache = os.path.join(steam_dir, "appcache", "librarycache")
+    paths = []
+    for root, _, names in os.walk(os.path.join(library_cache, str(appid))):  # новый клиент: папка на приложение
+        paths += [os.path.join(root, n) for n in names if n.lower().endswith(IMAGE_EXTENSIONS)]
+    for folder in (library_cache, os.path.join(steam_dir, "music", "_database", "covers")):
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        paths += [os.path.join(folder, n) for n in names  # старый клиент: <appid>_library_600x900.jpg
+                  if n.lower().endswith(IMAGE_EXTENSIONS) and re.split(r"[_.]", n)[0] == str(appid)]
+    best, best_score = None, None
+    for path in paths:
+        try:
+            with Image.open(path) as image:
+                width, height = image.size
+        except (OSError, ValueError):
+            continue
+        ratio = width / height
+        if not COVER_RATIO[0] <= ratio <= COVER_RATIO[1] or min(width, height) < 150:
+            continue  # шапка, логотип или значок
+        score = (abs(math.log(ratio)), -width * height)  # самая квадратная, из равных — самая крупная
+        if best_score is None or score < best_score:
+            best, best_score = path, score
+    return best
+
+
+def _syncsafe(data):
+    return (data[0] << 21) | (data[1] << 14) | (data[2] << 7) | data[3]
+
+
+def _id3_picture(body, major):
+    """(тип картинки, байты) из кадра APIC (PIC в ID3v2.2). Тип 3 — обложка альбома."""
+    encoding = body[0]
+    if major == 2:
+        kind, rest = body[4], body[5:]  # 3 буквы формата вместо MIME
+    else:
+        end = body.index(b"\x00", 1)
+        kind, rest = body[end + 1], body[end + 2:]
+    if encoding in (1, 2):  # UTF-16: описание кончается двумя нулями
+        i = 0
+        while i + 1 < len(rest) and rest[i:i + 2] != b"\x00\x00":
+            i += 2
+        return kind, rest[i + 2:]
+    return kind, rest[rest.index(b"\x00") + 1:]
+
+
+def _embedded_art(path):
+    """Обложка, вшитая в трек: кадр APIC в MP3 (ID3v2) или блок PICTURE во FLAC. None — её нет."""
+    best = None
+    try:
+        with open(path, "rb") as f:
+            head = f.read(10)
+            if head[:3] == b"ID3" and len(head) == 10:
+                major, flags = head[3], head[5]
+                data = f.read(_syncsafe(head[6:10]))
+                if flags & 0x80 and major < 4:
+                    data = data.replace(b"\xff\x00", b"\xff")  # снимаем «рассинхронизацию» ID3
+                pos = 0
+                if flags & 0x40:  # расширенный заголовок
+                    pos = 4 + struct.unpack(">I", data[:4])[0] if major == 3 else _syncsafe(data[:4])
+                id_size, header_size = (3, 6) if major == 2 else (4, 10)
+                while pos + header_size <= len(data):
+                    frame_id = data[pos:pos + id_size]
+                    if not frame_id.strip(b"\x00"):
+                        break  # дальше — пустое место в теге
+                    if major == 2:
+                        size = int.from_bytes(data[pos + 3:pos + 6], "big")
+                    elif major == 4:
+                        size = _syncsafe(data[pos + 4:pos + 8])
+                    else:
+                        size = struct.unpack(">I", data[pos + 4:pos + 8])[0]
+                    body = data[pos + header_size:pos + header_size + size]
+                    if major == 4 and body:
+                        frame_flags = data[pos + 9]
+                        if frame_flags & 0x01:
+                            body = body[4:]
+                        if frame_flags & 0x02:
+                            body = body.replace(b"\xff\x00", b"\xff")
+                    pos += header_size + size
+                    if frame_id in (b"APIC", b"PIC") and body:
+                        kind, image = _id3_picture(body, major)
+                        if best is None or kind == 3:
+                            best = image
+                        if kind == 3:
+                            break
+            elif head[:4] == b"fLaC":
+                f.seek(4)
+                while True:
+                    block = f.read(4)
+                    if len(block) < 4:
+                        break
+                    last, kind, size = block[0] & 0x80, block[0] & 0x7F, int.from_bytes(block[1:4], "big")
+                    if kind != 6:
+                        f.seek(size, 1)
+                    else:
+                        data = f.read(size)
+                        picture_type = int.from_bytes(data[0:4], "big")
+                        p = 8 + int.from_bytes(data[4:8], "big")  # MIME
+                        p += 4 + int.from_bytes(data[p:p + 4], "big") + 16  # описание, размеры и цвета
+                        image = data[p + 4:p + 4 + int.from_bytes(data[p:p + 4], "big")]
+                        if best is None or picture_type == 3:
+                            best = image
+                        if picture_type == 3:
+                            break
+                    if last:
+                        break
+    except (OSError, ValueError, IndexError, struct.error):
+        return best
+    return best or None
+
+
+def _embedded_image(album):
+    """Обложка из первых треков альбома — сохраняется в cache\\soundtrack, чтобы не читать треки каждый раз."""
+    key = album["appid"] or hashlib.md5(os.path.normcase(album["folder"]).encode("utf-8")).hexdigest()[:12]
+    path = os.path.join(SOUNDTRACK_IMAGES_DIR, f"{key}_cover.jpg")
+    if os.path.exists(path):
+        return path
+    for track in album["tracks"][:3]:
+        data = _embedded_art(track)
+        if not data:
+            continue
+        try:
+            image = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+            image.thumbnail((600, 600), Image.Resampling.LANCZOS)
+            os.makedirs(SOUNDTRACK_IMAGES_DIR, exist_ok=True)
+            image.save(path, quality=92)
+            return path
+        except (OSError, ValueError, Image.DecompressionBombError) as e:
+            log.warning("Не удалось прочитать обложку из %s: %s", track, e)
+    return None
+
+
+def blurred_cover(path, size=160, radius=14):
+    """Сильно размытая уменьшенная обложка для подложки плеера: (ширина, высота, байты RGB) или None.
+
+    Картинка маленькая — растянутая на всё окно, она остаётся гладкой, а размывается быстро.
+    """
+    from PIL import ImageFilter
+    try:
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            image.thumbnail((size, size), Image.Resampling.LANCZOS)
+            # Края размытия подтягивают чёрный фон — сначала расширяем картинку её же краями
+            pad = radius * 2
+            image = _pad_edges(image, pad)
+            image = image.filter(ImageFilter.GaussianBlur(radius))
+            image = image.crop((pad, pad, image.width - pad, image.height - pad))
+            return image.width, image.height, image.tobytes("raw", "RGB")
+    except (OSError, ValueError, Image.DecompressionBombError) as e:
+        log.warning("Не удалось размыть обложку %s: %s", path, e)
+        return None
+
+
+def _pad_edges(image, pad):
+    """Расширяет картинку на pad точек, повторяя крайние ряды (чтобы края размытия не темнели)."""
+    width, height = image.size
+    canvas = Image.new("RGB", (width + pad * 2, height + pad * 2))
+    canvas.paste(image.resize((width + pad * 2, height + pad * 2)), (0, 0))  # грубо заполняем всё
+    canvas.paste(image, (pad, pad))
+    return canvas
+
+
+def _album_image(album, header_url):
+    """Картинка альбома: обложка из его папки, из кэша клиента Steam или из самих треков,
+    а если её нигде нет — шапка страницы альбома в магазине."""
+    images = []
+    for root, _, names in os.walk(album["folder"]):
+        images += [os.path.join(root, n) for n in names if n.lower().endswith(IMAGE_EXTENSIONS)]
+    if images:
+        named = [p for p in images if any(word in os.path.basename(p).lower() for word in COVER_WORDS)]
+
+        def size(path):
+            try:
+                return os.path.getsize(path)
+            except OSError:
+                return 0
+
+        return max(named or images, key=size)  # самая крупная — обычно и есть обложка
+    return (_steam_cover(album["appid"]) or _embedded_image(album)
+            or (_store_image(album["appid"], header_url) if album["appid"] else None))
+
+
+def soundtrack_details(albums):
+    """Дополняет скачанные альбомы полями "game" (appid игры), "game_name" и "image" (путь к картинке).
+
+    Ответы магазина хранятся в steam_soundtracks.json — к какой игре относится альбом, со временем не меняется.
+    Вызывается в фоновом потоке.
+    """
+    cache = _load_soundtrack_cache()
+    ids = [album["appid"] for album in albums if album["appid"]]
+    before = json.dumps(cache, sort_keys=True)
+    try:
+        _describe_music(ids, cache)
+    except (requests.RequestException, ValueError) as e:
+        log.warning("Магазин Steam не ответил про саундтреки: %s", e)
+        for appid in ids:
+            info = cache["albums"].setdefault(str(appid), {"failed": True})
+            if info.get("failed"):
+                info["fetched"] = time.time()
+    for album in albums:
+        info = (cache["albums"].get(str(album["appid"])) or {}) if album["appid"] else {}
+        album["game"] = info.get("game")
+        album["game_name"] = info.get("game_name") or ""
+        album["image"] = _album_image(album, info.get("header"))
+    if json.dumps(cache, sort_keys=True) != before:
+        _save_soundtrack_cache(cache)
+    return albums
+
+
+def _owned_items(cache, download):
+    items = []
+    for appid in cache["owned"]:
+        info = cache["albums"].get(str(appid)) or {}
+        if info.get("failed"):
+            continue
+        items.append({"appid": appid, "name": info.get("name") or str(appid), "game": info.get("game"),
+                      "game_name": info.get("game_name") or "",
+                      "image": _steam_cover(appid) or _store_image(appid, info.get("header"), download)})
+    items.sort(key=lambda item: natural_key(item["name"]))
+    return items
+
+
+def owned_soundtracks(owned_appids):
+    """Какие из купленных в Steam приложений — саундтреки: [{"appid", "name", "game", "game_name", "image"}, ...].
+
+    owned_appids — всё купленное (игры, DLC, саундтреки). Тип каждого приложения запоминается, так что
+    следующая синхронизация спрашивает магазин только о новых покупках. Вызывается в фоновом потоке.
+    """
+    cache = _load_soundtrack_cache()
+    owned = sorted({appid for appid in owned_appids if isinstance(appid, int) and 0 < appid < SHORTCUT_APPID_MIN})
+    _describe_music(owned, cache)
+    cache["owned"] = [appid for appid in owned
+                      if str(appid) in cache["albums"] and not cache["albums"][str(appid)].get("failed")]
+    cache["synced"] = time.time()
+    _save_soundtrack_cache(cache)
+    log.info("Куплено в Steam: %d, из них саундтреков: %d", len(owned), len(cache["owned"]))
+    return _owned_items(cache, download=True)
+
+
+def cached_owned_soundtracks():
+    """Купленные саундтреки с прошлой синхронизации — без запросов в сеть."""
+    return _owned_items(_load_soundtrack_cache(), download=False)
+
+
+def soundtracks_synced():
+    return bool(_load_soundtrack_cache().get("synced"))
 
 
 # --- Фон рулетки: обложки на «фотоплёнке» -----------------------------------
@@ -1323,6 +1981,8 @@ def film_strips(count):
 TRAILERS_DIR = os.path.join(CACHE_DIR, "trailers")
 TRAILER_MAX_HEIGHT = 1080
 TRAILER_CACHE_FILES = 6  # столько последних трейлеров храним, более старые удаляются
+TRAILER_PREVIEW_FILES = 2  # и столько «быстрых стартов» в низком качестве — они нужны, только пока качается 1080p
+TRAILER_PREVIEW_MIN_HEIGHT = 360  # быстрый старт — самый лёгкий вариант потока, но не мельче этого
 TRAILER_THREADS = 6  # кусочков качаем одновременно
 
 
@@ -1342,8 +2002,9 @@ def _hls_attributes(line):
     return {k: v.strip('"') for k, v in re.findall(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)', line.split(":", 1)[1])}
 
 
-def _hls_variant(master_url, max_height):
-    """Высота кадра, плейлист видео и плейлист звука (или None) — лучший вариант не выше max_height."""
+def _hls_variant(master_url, max_height, lowest=False):
+    """Высота кадра, плейлист видео и плейлист звука (или None) — лучший вариант не выше max_height,
+    а с lowest — самый лёгкий не мельче TRAILER_PREVIEW_MIN_HEIGHT (для быстрого старта)."""
     lines = _playlist_lines(master_url)
     audio_groups, variants = {}, []
     for i, line in enumerate(lines):
@@ -1358,6 +2019,9 @@ def _hls_variant(master_url, max_height):
                              attrs.get("AUDIO")))
     if not variants:
         raise ValueError("в плейлисте нет вариантов видео")
+    if lowest:
+        height, _, video_url, group = min([v for v in variants if v[0] >= TRAILER_PREVIEW_MIN_HEIGHT] or variants)
+        return height, video_url, audio_groups.get(group)
     fitting = [v for v in variants if v[0] <= max_height] or [min(variants)]
     height, _, video_url, group = max(fitting)
     return height, video_url, audio_groups.get(group)
@@ -1653,41 +2317,43 @@ def _prune_trailers():
         files = [os.path.join(TRAILERS_DIR, f) for f in os.listdir(TRAILERS_DIR) if f.endswith(".mp4")]
     except FileNotFoundError:
         return
-    files.sort(key=os.path.getmtime, reverse=True)
-    for path in files[TRAILER_CACHE_FILES:]:
-        try:
-            os.remove(path)
-        except OSError:
-            pass  # трейлер сейчас открыт — удалим в следующий раз
+    for preview, limit in ((False, TRAILER_CACHE_FILES), (True, TRAILER_PREVIEW_FILES)):
+        group = sorted((f for f in files if f.endswith("_low.mp4") == preview), key=os.path.getmtime, reverse=True)
+        for path in group[limit:]:
+            try:
+                os.remove(path)
+            except OSError:
+                pass  # трейлер сейчас открыт — удалим в следующий раз
 
 
-def _trailer_path(master_url):
+def _trailer_path(master_url, preview=False):
     key = hashlib.md5(master_url.split("?")[0].encode("utf-8")).hexdigest()[:16]
-    return os.path.join(TRAILERS_DIR, key + ".mp4")
+    return os.path.join(TRAILERS_DIR, key + ("_low.mp4" if preview else ".mp4"))
 
 
-def cached_trailer(master_url):
-    """Путь к уже собранному трейлеру этого потока или None."""
-    path = _trailer_path(master_url)
+def cached_trailer(master_url, preview=False):
+    """Путь к уже собранному трейлеру этого потока (preview — быстрый старт в низком качестве) или None."""
+    path = _trailer_path(master_url, preview)
     if os.path.exists(path):
         os.utime(path)  # смотрели недавно — удалится последним
         return path
     return None
 
 
-def trailer_file(master_url, progress=None, cancelled=None):
+def trailer_file(master_url, progress=None, cancelled=None, preview=False):
     """Трейлер из потока HLS одним файлом mp4 в лучшем качестве до 1080p. Возвращает путь к файлу.
 
-    progress(высота кадра, проценты) — по ходу загрузки; cancelled() → True — бросить загрузку.
+    preview — самый лёгкий вариант потока: качается за пару секунд, им трейлер начинается, пока
+    готовится 1080p. progress(высота кадра, проценты) — по ходу загрузки; cancelled() → True — бросить.
     Готовые файлы хранятся в cache/trailers, повторный просмотр открывается сразу.
     """
     os.makedirs(TRAILERS_DIR, exist_ok=True)
-    cached = cached_trailer(master_url)
+    cached = cached_trailer(master_url, preview)
     if cached:
         return cached
-    path = _trailer_path(master_url)
+    path = _trailer_path(master_url, preview)
 
-    height, video_url, audio_url = _hls_variant(master_url, TRAILER_MAX_HEIGHT)
+    height, video_url, audio_url = _hls_variant(master_url, TRAILER_MAX_HEIGHT, lowest=preview)
     playlists = [_hls_segments(video_url)] + ([_hls_segments(audio_url)] if audio_url else [])
     urls = [url for init, segments in playlists for url in (init, *segments)]
 
@@ -1717,8 +2383,8 @@ def trailer_file(master_url, progress=None, cancelled=None):
         if os.path.exists(temp):
             os.remove(temp)
         raise
-    log.info("Трейлер собран из потока: %sp, %d кусочков, %.1f МБ", height, len(urls),
-             os.path.getsize(path) / 1024 / 1024)
+    log.info("Трейлер собран из потока%s: %sp, %d кусочков, %.1f МБ", " (быстрый старт)" if preview else "",
+             height, len(urls), os.path.getsize(path) / 1024 / 1024)
     _prune_trailers()
     return path
 
