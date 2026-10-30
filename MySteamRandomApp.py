@@ -12,29 +12,36 @@ import re
 import sys
 import threading
 import time
+from collections import OrderedDict
 from urllib.parse import quote_plus
 
 LAUNCHED = time.monotonic()  # для замера запуска: отсюда начинается загрузка Qt и библиотек
 
 from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QEvent, QObject, QPointF, QPropertyAnimation,
                             QRect, QRectF, QSize, QSizeF, Qt, QTimer, QUrl, QVariantAnimation, Signal)
-from PySide6.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QImage, QLinearGradient, QMovie,
-                           QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRadialGradient)
+from PySide6.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QImage, QKeySequence,
+                           QLinearGradient, QMovie, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
+                           QRadialGradient, QShortcut)
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer, QSoundEffect
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFrame, QGraphicsOpacityEffect,
                                QGraphicsScene, QGraphicsView, QGridLayout, QHBoxLayout, QLabel, QLayout,
-                               QListWidgetItem, QSizePolicy,
+                               QListView, QListWidget, QListWidgetItem, QSizePolicy, QStyle, QStyledItemDelegate,
                                QStackedWidget, QVBoxLayout, QWidget)
 from qfluentwidgets import (Action, BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon as FIF, InfoBar,
                             IndeterminateProgressBar, InfoBarPosition, LineEdit, ListWidget, MessageBox,
-                            MessageBoxBase,
+                            MessageBoxBase, RadioButton,
                             MSFluentWindow, NavigationItemPosition, PasswordLineEdit, PlainTextEdit,
                             PrimaryPushButton, PrimaryToolButton, ProgressBar, PushButton, RoundMenu, ScrollArea,
                             SearchLineEdit, Slider, StrongBodyLabel,
                             SubtitleLabel, SwitchButton, TextEdit, Theme, TitleLabel, TransparentPushButton,
                             TransparentToggleToolButton, TransparentToolButton,
                             FluentIconBase, isDarkTheme, setTheme, themeColor)
+
+try:  # полосы прокрутки Fluent для обычных списков Qt (плитка на вкладке «Игры»)
+    from qfluentwidgets import SmoothScrollDelegate
+except ImportError:
+    SmoothScrollDelegate = None
 
 # Кнопки бокового меню Fluent шириной 64 точки, а значок в них нарисован с отступом под эту ширину.
 # «О программе» туда не помещается, поэтому меню делаем шире, а значок сдвигаем к середине кнопки.
@@ -53,6 +60,41 @@ try:
 except (ImportError, AttributeError):
     pass
 
+# Окна поверх программы (подключение к Steam, импорт, вопросы) — это затемнение на всё окно, и оно закрывает
+# заголовок, за который окно таскают. Поэтому окно программы можно таскать за само затемнение —
+# например, чтобы перенести его на второй экран, не закрывая окна.
+try:
+    from qfluentwidgets.components.dialog_box.mask_dialog_base import MaskDialogBase
+
+    try:
+        from qframelesswindow.utils import startSystemMove as _start_system_move
+    except ImportError:
+        _start_system_move = None
+
+    class _MaskDrag(QObject):
+        def eventFilter(self, obj, event):
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                window = obj.window()
+                if _start_system_move:
+                    _start_system_move(window, event.globalPosition().toPoint())
+                elif window.windowHandle():
+                    window.windowHandle().startSystemMove()
+                return True
+            return False
+
+    _mask_dialog_init = MaskDialogBase.__init__
+
+    def _draggable_mask_init(self, *args, **kwargs):
+        _mask_dialog_init(self, *args, **kwargs)
+        mask = getattr(self, "windowMask", None)
+        if mask is not None:
+            self._mask_drag = _MaskDrag(self)  # держим ссылку, иначе фильтр удалится вместе с обёрткой Python
+            mask.installEventFilter(self._mask_drag)
+
+    MaskDialogBase.__init__ = _draggable_mask_init
+except (ImportError, AttributeError):
+    pass
+
 # Встроенный браузер. Движок нужно загрузить до создания QApplication. Нет его — ссылки
 # открываются во внешнем браузере, как раньше.
 try:
@@ -63,7 +105,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.2"
+__version__ = "2.3"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -103,6 +145,9 @@ class Worker(QObject):
     def _run(self):
         try:
             result = self.fn(*self.args)
+        except core.ServiceBusy as e:  # сайт не ответил — обычное дело, простыня в логе не нужна
+            core.log.warning("%s: %s", getattr(self.fn, "__name__", self.fn), core.mask_secrets(e))
+            self.failed.emit(core.mask_secrets(f"{type(e).__name__}: {e}"))
         except Exception as e:  # noqa: BLE001 — показываем любую ошибку пользователю
             core.log.exception("Ошибка в фоновой задаче %s", getattr(self.fn, "__name__", self.fn))
             self.failed.emit(core.mask_secrets(f"{type(e).__name__}: {e}"))
@@ -135,10 +180,380 @@ class Timing:
         core.log.info("Замер: %s — %.2f с (%s)", self.name, time.monotonic() - self.start, ", ".join(self.marks))
 
 
+try:
+    from qfluentwidgets import InfoBarIcon  # цветные значки «успех / сведения / внимание / ошибка»
+
+    NOTICE_ICONS = {"success": InfoBarIcon.SUCCESS, "info": InfoBarIcon.INFORMATION,
+                    "warning": InfoBarIcon.WARNING, "error": InfoBarIcon.ERROR}
+except (ImportError, AttributeError):
+    NOTICE_ICONS = {}
+
+
+class Notice(QWidget):
+    """Уведомление в стиле окон программы: карточка по центру окна — значок, заголовок, текст и крестик,
+    слева полоска цвета уведомления. Закрывается сама (пока над ней мышь — ждёт), крестиком или щелчком.
+    Несколько уведомлений встают столбиком, самое новое — внизу."""
+
+    WIDTH = 460
+    MIN_DURATION = 4000  # мс: короче текст не успеть прочитать
+    SHADOW = 14  # поля под тень вокруг карточки
+    ICON = 20
+    MAX_SHOWN = 3
+    # Полоска слева: светлая тема, тёмная; у «сведений» — цвет темы
+    ACCENTS = {"success": (QColor(15, 123, 15), QColor(108, 203, 95)),
+               "warning": (QColor(157, 93, 0), QColor(252, 225, 0)),
+               "error": (QColor(196, 43, 28), QColor(255, 153, 164))}
+
+    def __init__(self, kind, host, title, text, duration):
+        super().__init__(host)
+        self.kind, self.host, self.closing = kind, host, False
+        s = self.SHADOW
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(s + 20 + self.ICON + 12, s + 14, s + 8, s + 16)
+        layout.setSpacing(8)
+        texts = QVBoxLayout()
+        texts.setSpacing(4)
+        title_label = StrongBodyLabel(title, self)
+        title_label.setWordWrap(True)
+        texts.addWidget(title_label)
+        if text:
+            body = BodyLabel(text, self)
+            body.setWordWrap(True)
+            texts.addWidget(body)
+        layout.addLayout(texts, 1)
+        close = TransparentToolButton(FIF.CLOSE, self)
+        close.setFixedSize(28, 28)
+        close.setIconSize(QSize(10, 10))
+        close.setToolTip("Закрыть")
+        close.clicked.connect(self.dismiss)
+        layout.addWidget(close, 0, Qt.AlignTop)
+
+        width = min(self.WIDTH, max(300, host.width() - 64)) + 2 * s
+        height = layout.totalHeightForWidth(width)
+        self.resize(width, height if height > 0 else layout.sizeHint().height())
+
+        self.effect = QGraphicsOpacityEffect(self)
+        self.effect.setOpacity(0.0)
+        self.setGraphicsEffect(self.effect)
+        self.fade = QPropertyAnimation(self.effect, b"opacity", self)
+        self.fade.setDuration(180)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.dismiss)
+        self.duration = max(duration, self.MIN_DURATION) if duration > 0 else 0
+
+        notices = getattr(host, "_notices", None)
+        if notices is None:
+            notices = host._notices = []
+        if not hasattr(host, "_notice_watch"):  # окно поменяло размер — уведомления снова по центру
+            host._notice_watch = _NoticeWatch(host)
+            host.installEventFilter(host._notice_watch)
+        notice_glass(host)  # всё вокруг — под матовым стеклом, чёткое только уведомление
+        notices.append(self)
+        for old in [n for n in notices if not n.closing][:-self.MAX_SHOWN]:
+            old.dismiss()
+        arrange_notices(host)
+        self.show()
+        self.raise_()
+        self.fade.setStartValue(0.0)
+        self.fade.setEndValue(1.0)
+        self.fade.start()
+        if self.duration:
+            self.timer.start(self.duration)
+
+    def dismiss(self):
+        if self.closing:
+            return
+        self.closing = True
+        self.timer.stop()
+        notices = getattr(self.host, "_notices", [])
+        if self in notices:
+            notices.remove(self)
+        if not any(not n.closing for n in notices):  # последнее уведомление — стекло тоже уходит
+            glass = getattr(self.host, "_notice_glass", None)
+            if glass is not None:
+                glass.vanish()
+        arrange_notices(self.host)
+        self.fade.stop()
+        self.fade.setStartValue(self.effect.opacity())
+        self.fade.setEndValue(0.0)
+        self.fade.finished.connect(self.deleteLater)
+        self.fade.start()
+
+    def enterEvent(self, event):
+        self.timer.stop()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self.duration and not self.closing:
+            self.timer.start(2500)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.dismiss()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        dark = isDarkTheme()
+        s = self.SHADOW
+        card = QRectF(self.rect()).adjusted(s, s, -s, -s)
+        # Мягкая тень: слои всё шире и прозрачнее, чуть ниже карточки
+        painter.setPen(Qt.NoPen)
+        for i in range(s, 0, -1):
+            painter.setBrush(QColor(0, 0, 0, round(7 * (1 - i / s)) + 1))
+            painter.drawRoundedRect(card.adjusted(-i, -i + 3, i, i + 3), 8 + i, 8 + i)
+        path = QPainterPath()
+        path.addRoundedRect(card, 8, 8)
+        painter.fillPath(path, QColor(43, 43, 43) if dark else QColor(255, 255, 255))
+        painter.save()
+        painter.setClipPath(path)
+        accent = self.ACCENTS.get(self.kind)
+        painter.fillRect(QRectF(card.left(), card.top(), 4, card.height()),
+                         (accent[1] if dark else accent[0]) if accent else themeColor())
+        painter.restore()
+        painter.setPen(QPen(QColor(255, 255, 255, 26) if dark else QColor(0, 0, 0, 22), 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(path)
+        icon = NOTICE_ICONS.get(self.kind, FIF.INFO)
+        icon.icon().paint(painter, QRect(round(card.left()) + 20, round(card.top()) + 15, self.ICON, self.ICON))
+
+
+class _NoticeWatch(QObject):
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Resize:
+            arrange_notices(obj)
+        return False
+
+
+def arrange_notices(host):
+    """Уведомления — столбиком по центру окна (тени соседних карточек заходят друг на друга)."""
+    notices = [n for n in getattr(host, "_notices", []) if not n.closing]
+    if not notices:
+        return
+    overlap = Notice.SHADOW * 2 - 10
+    total = sum(n.height() for n in notices) - overlap * (len(notices) - 1)
+    top = max(0, (host.height() - total) // 2)
+    for notice in notices:
+        notice.move((host.width() - notice.width()) // 2, top)
+        notice.raise_()
+        top += notice.height() - overlap
+
+
 def notify(kind, window, title, text="", duration=3500):
-    """Всплывающее уведомление: kind = success | info | warning | error."""
-    getattr(InfoBar, kind)(title, text, orient=Qt.Horizontal, isClosable=True,
-                           duration=duration, position=InfoBarPosition.TOP, parent=window)
+    """Уведомление по центру окна, в общем стиле программы: kind = success | info | warning | error.
+
+    Открыто окно поверх программы («Добавить игру», вопрос) — уведомление встаёт поверх него, а не прячется сзади.
+    """
+    host = window.window() if window is not None else None
+    modal = QApplication.activeModalWidget()
+    if modal is not None and modal.isVisible() and modal.parentWidget() is not None \
+            and modal.parentWidget().window() is host:
+        host = modal
+    if host is not None:
+        Notice(kind, host, title, text, duration)
+
+
+# --- Матовое стекло ----------------------------------------------------------
+def frosted_snapshot(host):
+    """Снимок host, размытый как матовое стекло: картинка уменьшается в несколько шагов и растягивается
+    обратно — так размытие получается мягким и быстрым даже на всё окно. Пустой QPixmap — снять не вышло."""
+    pixmap = host.grab()
+    if pixmap.isNull():
+        return pixmap
+    image = pixmap.toImage()
+    w, h = image.width(), image.height()
+    for divider in (4, 12):
+        image = image.scaled(max(1, w // divider), max(1, h // divider), Qt.IgnoreAspectRatio,
+                             Qt.SmoothTransformation)
+    for divider in (4, 1):
+        image = image.scaled(max(1, w // divider), max(1, h // divider), Qt.IgnoreAspectRatio,
+                             Qt.SmoothTransformation)
+    blurred = QPixmap.fromImage(image)
+    blurred.setDevicePixelRatio(pixmap.devicePixelRatio())
+    return blurred
+
+
+class FrostedGlass(QWidget):
+    """«Матовое стекло» поверх host: его размытый снимок и лёгкая вуаль цвета темы. Чётким остаётся только то,
+    что лежит поверх стекла, — уведомление или кружок ожидания. Щелчки под стекло не проходят."""
+
+    FADE_MS = 220
+    TINT_DARK, TINT_LIGHT = QColor(14, 14, 18, 120), QColor(250, 250, 252, 130)
+
+    def __init__(self, host):
+        super().__init__(host)
+        self.host = host
+        self.opacity = 0.0
+        self.closing = False
+        self.snapshot = frosted_snapshot(host)  # до показа стекла — иначе оно попало бы в собственный снимок
+        self.setAttribute(Qt.WA_NoMousePropagation)
+        self.setGeometry(host.rect())
+        self.fade = QVariantAnimation(self)
+        self.fade.setDuration(self.FADE_MS)
+        self.fade.setEasingCurve(QEasingCurve.OutCubic)
+        self.fade.valueChanged.connect(self._set_opacity)
+        self.fade.finished.connect(self._on_faded)
+        host.installEventFilter(self)  # окно поменяло размер — стекло тоже
+        self.show()
+        self.raise_()
+        self._animate(1.0)
+
+    def _animate(self, target):
+        self.fade.stop()
+        self.fade.setStartValue(self.opacity)
+        self.fade.setEndValue(float(target))
+        self.fade.start()
+
+    def _set_opacity(self, value):
+        self.opacity = float(value)
+        self.update()
+
+    def _on_faded(self):
+        if self.closing:
+            self.host.removeEventFilter(self)
+            self.deleteLater()
+
+    def vanish(self):
+        if self.closing:
+            return
+        self.closing = True
+        self._animate(0.0)
+
+    def eventFilter(self, obj, event):
+        if obj is self.host and event.type() == QEvent.Resize:
+            self.setGeometry(self.host.rect())  # снимок растянется — он и так размыт
+        return False
+
+    def mousePressEvent(self, event):
+        event.accept()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.setOpacity(self.opacity)
+        if not self.snapshot.isNull():
+            painter.drawPixmap(self.rect(), self.snapshot)
+        painter.fillRect(self.rect(), self.TINT_DARK if isDarkTheme() else self.TINT_LIGHT)
+
+
+class NoticeGlass(FrostedGlass):
+    """Стекло под уведомлениями. Щелчок по стеклу закрывает их все."""
+
+    def mousePressEvent(self, event):
+        event.accept()
+        for notice in list(getattr(self.host, "_notices", [])):
+            notice.dismiss()
+
+
+def notice_glass(host):
+    """Под уведомлением — матовое стекло: одно на все уведомления сразу. Если на окне уже кружок ожидания —
+    своё стекло у него есть, уведомление просто встаёт поверх."""
+    busy = getattr(host, "_busy", None)
+    if busy is not None and not busy.closing:
+        return
+    glass = getattr(host, "_notice_glass", None)
+    if glass is not None and glass.closing:
+        try:
+            if glass.fade.state() == QAbstractAnimation.Running:  # ещё тает — возвращаем его, а не снимаем заново
+                glass.closing = False
+                glass._animate(1.0)
+        except RuntimeError:
+            pass  # уже удалено
+    if glass is None or glass.closing:
+        host._notice_glass = NoticeGlass(host)
+    else:
+        glass.raise_()
+
+
+class BusyOverlay(FrostedGlass):
+    """Программа что-то делает в фоне и ничего не показывает (например, после входа в магазин Steam узнаёт
+    покупки и семейную группу) — матовое стекло и крутящийся кружок с надписью: что делается и что будет дальше."""
+
+    RADIUS, RING = 22, 4
+    TIMEOUT_MS = 120000  # страховка: что-то пошло не так — через две минуты стекло уходит само
+
+    def __init__(self, host, title, text=""):
+        super().__init__(host)
+        self.title, self.text = title, text
+        self._angle = 0
+        self.spin_timer = QTimer(self)
+        self.spin_timer.setInterval(16)
+        self.spin_timer.timeout.connect(self._spin)
+        self.spin_timer.start()
+        QTimer.singleShot(self.TIMEOUT_MS, self._timeout)
+        core.log.info("Ожидание на экране: %s%s", title, f" — {text}" if text else "")
+
+    def set_text(self, title, text=""):
+        self.title, self.text = title, text
+        self.update()
+
+    def _spin(self):
+        self._angle = (self._angle + 6) % 360
+        self.update()
+
+    def _timeout(self):
+        if not self.closing:
+            core.log.warning("Ожидание «%s» длилось дольше %d с — убираю стекло", self.title, self.TIMEOUT_MS // 1000)
+            self.vanish()
+
+    def vanish(self):
+        if not self.closing:
+            core.log.info("Ожидание закончено: %s", self.title)
+        super().vanish()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setOpacity(self.opacity)
+        dark = isDarkTheme()
+        w, h = self.width(), self.height()
+        center = QPointF(w / 2, h / 2 - 30)
+        ring = QRectF(center.x() - self.RADIUS, center.y() - self.RADIUS, 2 * self.RADIUS, 2 * self.RADIUS)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(255, 255, 255, 50) if dark else QColor(0, 0, 0, 30), self.RING))
+        painter.drawEllipse(ring)
+        pen = QPen(themeColor(), self.RING)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.drawArc(ring, -self._angle * 16, 100 * 16)
+
+        width = min(520, w - 48)
+        top = center.y() + self.RADIUS + 20
+        title_font = resized_font(self.font(), 4)
+        title_font.setWeight(QFont.DemiBold)
+        painter.setFont(title_font)
+        painter.setPen(WHITE if dark else QColor(0, 0, 0))
+        title_box = QRectF((w - width) / 2, top, width, 400)
+        flags = Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap
+        used = painter.boundingRect(title_box, flags, self.title)
+        painter.drawText(title_box, flags, self.title)
+        if self.text:
+            painter.setFont(resized_font(self.font(), 1))
+            painter.setPen(QColor(255, 255, 255, 200) if dark else QColor(0, 0, 0, 170))
+            painter.drawText(QRectF((w - width) / 2, used.bottom() + 8, width, 400), flags, self.text)
+
+
+def show_busy(window, title, text=""):
+    """Матовое стекло с кружком ожидания поверх всего окна. Уже показано — меняется только надпись."""
+    host = window.window()
+    busy = getattr(host, "_busy", None)
+    if busy is not None and not busy.closing:
+        busy.set_text(title, text)
+        return
+    glass = getattr(host, "_notice_glass", None)
+    if glass is not None and not glass.closing:
+        glass.vanish()  # у кружка своё стекло — двух друг на друге не нужно
+    host._busy = BusyOverlay(host, title, text)
+    arrange_notices(host)  # уведомления, если есть, — поверх кружка
+
+
+def hide_busy(window):
+    busy = getattr(window.window(), "_busy", None)
+    if busy is not None and not busy.closing:
+        busy.vanish()
 
 
 def confirm(window, title, text, yes="Да"):
@@ -244,8 +659,32 @@ class CoverPrefetcher(QObject):
             core.save_not_found(set())
         return self.enqueue(games)
 
+    def forget(self, name):
+        """Игру связали со Steam — обложку для неё ищем заново, уже по номеру в Steam."""
+        with self._lock:
+            if name not in self._failed:
+                return
+            self._failed.discard(name)
+            try:
+                core.save_not_found(self._failed)
+            except OSError:
+                pass
+
+    def upgrade(self, games):
+        """В фоне: обложки, которые Steam собрал из горизонтальной шапки, — заменить настоящими из SteamGridDB.
+        Каждая заменённая обложка сразу появляется на барабане (сигнал coverReady)."""
+        games = [dict(game) for game in games]  # копия: список могут менять в главном потоке
+
+        def run():
+            try:
+                core.upgrade_generated_covers(games, core.griddb_key(), self.coverReady.emit)
+            except Exception:  # noqa: BLE001 — замена обложек не должна ронять программу
+                core.log.exception("Не удалось заменить обложки, собранные Steam")
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _run(self):
-        key = core.read_text(core.API_KEY_FILE)
+        key = core.griddb_key()
         while True:
             with self._lock:
                 if not self._pending:
@@ -513,6 +952,24 @@ class MusicPlayer(QObject):
             self._make_order(self.current_track)  # подборка пуста — перемешиваем то, что играет
         self.player.setLoops(self._loops())
         self.stateChanged.emit()
+
+    def release(self, folder):
+        """Файлы папки сейчас удалят: играет трек из неё — переходим на встроенную тему, а проигрыватели
+        отпускают файлы (открытый трек Windows удалить не даст). True — играло из этой папки."""
+        root = os.path.normcase(os.path.normpath(folder)) + os.sep
+
+        def inside(path):
+            return bool(path) and os.path.normcase(os.path.normpath(path)).startswith(root)
+
+        playing = inside(self.path)
+        if playing:
+            self.set_source("")
+        for deck in self.decks:
+            if deck is not self.deck:  # второй проигрыватель мог держать хвост прошлого трека
+                deck["fade"].stop()
+                deck["player"].stop()
+                deck["player"].setSource(QUrl())
+        return playing
 
     def update_mix(self, entries):
         """Список музыки поменялся (нашлись новые саундтреки) — обновляем подборку, не прерывая трек."""
@@ -868,13 +1325,22 @@ def refresh_repeat_button(button, repeat_one):
 
 
 class MiniPlayer(QWidget):
-    """Маленький плеер в правом верхнем углу рулетки, страницы игры и браузера:
-    нота — перейти на вкладку «Саундтреки» к тому, что играет, выключить звук, предыдущий трек, пауза,
-    следующий трек, вперемешку, повтор трека. Название трека — в подсказках."""
+    """Маленький плеер в правом верхнем углу рулетки, страницы игры и браузера.
+
+    Обычно это одна нота в кружке. Навели мышь — кружок раскрывается влево в пульт: выключить звук,
+    предыдущий трек, пауза, следующий трек, вперемешку, повтор трека. Увели — через мгновение сворачивается.
+    Нота — перейти на вкладку «Саундтреки» к тому, что играет. Название трека — в подсказках.
+    """
+
+    sizeChanged = Signal()  # раскрылся или свернулся — хозяин ставит его на место у правого края
+    COLLAPSE_MS = 700
+    ANIM_MS = 260
+    PAD, GAP = 3, 2
 
     def __init__(self, win, parent):
         super().__init__(parent)
         self.win = win
+        self.reveal = 0.0  # 0 — одна нота, 1 — весь пульт
         self.music_button = TransparentToolButton(FIF.MUSIC, self)
         self.music_button.clicked.connect(win.show_playing_music)
         self.mute_button = TransparentToolButton(FIF.VOLUME, self)
@@ -887,13 +1353,18 @@ class MiniPlayer(QWidget):
         self.next_button.clicked.connect(lambda: win.music.next_track())
         self.shuffle_button = make_shuffle_button(win, self)
         self.repeat_button = make_repeat_button(win, self)
+        # Слева направо; нота — справа: пульт выезжает из-под неё влево, и она остаётся под мышью
+        self.controls = (self.mute_button, self.prev_button, self.play_button, self.next_button,
+                         self.shuffle_button, self.repeat_button)
+        self.collapse_timer = QTimer(self)
+        self.collapse_timer.setSingleShot(True)
+        self.collapse_timer.setInterval(self.COLLAPSE_MS)
+        self.collapse_timer.timeout.connect(self._collapse)
+        self.anim = QVariantAnimation(self)
+        self.anim.setDuration(self.ANIM_MS)
+        self.anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.anim.valueChanged.connect(self._set_reveal)
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        for button in (self.music_button, self.mute_button, self.prev_button, self.play_button, self.next_button,
-                       self.shuffle_button, self.repeat_button):
-            layout.addWidget(button)
         win.music.trackChanged.connect(self.refresh)
         win.music.stateChanged.connect(self.refresh)
         self.refresh()
@@ -906,15 +1377,78 @@ class MiniPlayer(QWidget):
         self.mute_button.setToolTip("Выключить музыку" if music.enabled else "Включить музыку")
         self.play_button.setIcon(FIF.PAUSE if music.playing else FIF.PLAY)
         self.play_button.setToolTip(("Пауза: " if music.playing else "Слушать: ") + track)
+        # Один трек (встроенная тема, свой файл) и так играет по кругу — листать и повторять нечего,
+        # но кнопки остаются на месте, просто неактивны: пульт не «прыгает» и понятно, что они есть
         several = len(music.tracks) > 1
-        self.prev_button.setVisible(several)
-        self.next_button.setVisible(several)
-        self.repeat_button.setVisible(several)  # один трек и так играет по кругу
-        self.prev_button.setToolTip("Предыдущий трек")
-        self.next_button.setToolTip(f"Следующий трек (сейчас {track})")
+        for button in (self.prev_button, self.next_button, self.repeat_button):
+            button.setEnabled(several)
+        self.prev_button.setToolTip("Предыдущий трек" if several else "Играет один трек — он идёт по кругу")
+        self.next_button.setToolTip(f"Следующий трек (сейчас {track})" if several
+                                    else "Играет один трек — он идёт по кругу")
         refresh_shuffle_button(self.shuffle_button, music.shuffle_mode)
         refresh_repeat_button(self.repeat_button, music.repeat_one)
-        self.adjustSize()
+        self._set_reveal(self.reveal)
+
+    def sizeHint(self):
+        note = self.music_button.sizeHint()
+        controls = sum(b.sizeHint().width() + self.GAP for b in self.controls)
+        return QSize(round(2 * self.PAD + note.width() + controls * self.reveal), 2 * self.PAD + note.height())
+
+    def _set_reveal(self, value):
+        self.reveal = float(value)
+        self.resize(self.sizeHint())
+        self._arrange()
+        self.update()
+        self.sizeChanged.emit()  # хозяин ставит плеер у правого края — растёт он влево
+
+    def _arrange(self):
+        """Кнопки — от правого края: нота на месте, остальные выезжают слева из-за края «таблетки»."""
+        x = self.width() - self.PAD
+        for button in (self.music_button,) + self.controls[::-1]:
+            size = button.sizeHint()
+            x -= size.width()
+            button.setGeometry(x, self.PAD, size.width(), size.height())
+            x -= self.GAP
+        for button in self.controls:
+            button.setVisible(self.reveal > 0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._arrange()
+
+    def _animate(self, target):
+        if self.reveal == target and self.anim.state() != QAbstractAnimation.Running:
+            return
+        self.anim.stop()
+        self.anim.setStartValue(self.reveal)
+        self.anim.setEndValue(float(target))
+        self.anim.start()
+
+    def enterEvent(self, event):
+        self.collapse_timer.stop()
+        if self.anim.endValue() != 1.0 or self.reveal < 1.0:
+            self._animate(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.collapse_timer.start()
+        super().leaveEvent(event)
+
+    def _collapse(self):
+        if self.underMouse():
+            return
+        self._animate(0.0)
+
+    def paintEvent(self, event):
+        # Кружок (свёрнут) или «таблетка» (раскрыт) под кнопками — как значок живого фона в шапке игры
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        dark = isDarkTheme()
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.setPen(QPen(QColor(255, 255, 255, 40) if dark else QColor(0, 0, 0, 30), 1))
+        painter.setBrush(QColor(32, 32, 36, 200) if dark else QColor(255, 255, 255, 215))
+        radius = rect.height() / 2
+        painter.drawRoundedRect(rect, radius, radius)
 
 
 # --- Барабан с обложками ----------------------------------------------------
@@ -972,6 +1506,19 @@ class CoverReel(QWidget):
         covered = [g for g in games if core.find_cover(g["name"])]
         return covered if len(covered) >= 10 else games
 
+    def _fill(self, pool, count, recent=()):
+        """count случайных игр для ленты. Игра не повторяется, пока не пройдёт столько карточек, сколько
+        видно на экране (если игр хватает), — иначе в маленькой библиотеке рядом стоят одинаковые обложки.
+        recent — карточки, которые уже стоят перед этими."""
+        strip, recent = [], list(recent)
+        window = min(len(pool) - 1, self.SIDE * 2)
+        for _ in range(count):
+            tail = recent[-window:] if window > 0 else []
+            game = random.choice([g for g in pool if not any(g is r for r in tail)] or pool)
+            strip.append(game)
+            recent.append(game)
+        return strip
+
     def show_idle(self, games, center=None):
         """Неподвижная лента из случайных игр; center — игра по центру."""
         self.spin_anim.stop()
@@ -979,9 +1526,11 @@ class CoverReel(QWidget):
         self.winner, self.glow = center, (1.0 if center else 0.0)
         if games:
             pool = self._pool(games)
-            self.strip = [random.choice(pool) for _ in range(self.SIDE * 2 + 1)]
             if center:
-                self.strip[self.SIDE] = center
+                left = self._fill(pool, self.SIDE, recent=[center])
+                self.strip = left + [center] + self._fill(pool, self.SIDE, recent=left + [center])
+            else:
+                self.strip = self._fill(pool, self.SIDE * 2 + 1)
             self.offset = self.SIDE * self.step
         else:
             self.strip, self.offset = [], 0.0
@@ -999,9 +1548,13 @@ class CoverReel(QWidget):
         if self.strip and ci >= self.SIDE and ci + self.SIDE < len(self.strip):
             head = self.strip[ci - self.SIDE: ci + self.SIDE + 1]
         else:
-            head = [random.choice(pool) for _ in range(self.SIDE * 2 + 1)]
-        filler = [random.choice(pool) for _ in range(random.randint(26, 34))]
-        tail = [random.choice(pool) for _ in range(self.SIDE)]
+            head = self._fill(pool, self.SIDE * 2 + 1)
+        # Прямо перед выпавшей игрой её копий нет — иначе рядом с ней встали бы одинаковые обложки
+        window = min(len(pool) - 1, self.SIDE * 2)
+        filler = self._fill(pool, random.randint(26, 34) - window, recent=head)
+        others = [g for g in pool if g is not winner] or pool
+        filler += self._fill(others, window, recent=head + filler)
+        tail = self._fill(pool, self.SIDE, recent=filler + [winner])
         self.strip = head + filler + [winner] + tail
 
         for game in self.strip:  # подгружаем обложки заранее, чтобы анимация не дёргалась
@@ -1395,12 +1948,94 @@ class LiveButton(QWidget):
             painter.drawArc(ring, 90 * 16, -round(360 * 16 * self.progress / 100))  # от верха по часовой
 
 
+class VariantBar(QWidget):
+    """Выбор варианта живого фона: «таблетка», которая выезжает вправо из-под значка живого фона.
+    ◀ ▶ — предыдущий и следующий вариант (скачиваются по одному), «2 / 5» — какой показан,
+    ✓ — оставить этот, остальные просмотренные удалить."""
+
+    stepRequested = Signal(int)  # -1 — предыдущий, +1 — следующий
+    keepRequested = Signal()
+    HEIGHT = LiveButton.SIZE
+    PAD, GAP = 4, 2
+    ANIM_MS = 240
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.reveal = 0.0  # 0 — спрятана под значком, 1 — выехала целиком
+        self.prev_button = TransparentToolButton(FIF.LEFT_ARROW.icon(color=WHITE), self)
+        self.prev_button.setToolTip("Предыдущий вариант живого фона")
+        self.prev_button.clicked.connect(lambda: self.stepRequested.emit(-1))
+        self.label = CaptionLabel("", self)
+        self.label.setTextColor(WHITE, WHITE)
+        self.label.setAlignment(Qt.AlignCenter)
+        self.next_button = TransparentToolButton(FIF.RIGHT_ARROW.icon(color=WHITE), self)
+        self.next_button.setToolTip("Следующий вариант живого фона")
+        self.next_button.clicked.connect(lambda: self.stepRequested.emit(1))
+        self.keep_button = TransparentToolButton(FIF.ACCEPT.icon(color=WHITE), self)
+        self.keep_button.clicked.connect(self.keepRequested)
+        self.parts = (self.prev_button, self.label, self.next_button, self.keep_button)
+        for button in (self.prev_button, self.next_button, self.keep_button):
+            button.setFixedSize(28, 28)
+            button.setIconSize(QSize(12, 12))
+        self.label.setFixedWidth(QFontMetrics(self.label.font()).horizontalAdvance("30 / 30") + 8)
+        self.anim = QVariantAnimation(self)
+        self.anim.setDuration(self.ANIM_MS)
+        self.anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.anim.valueChanged.connect(self._set_reveal)
+        self.anim.finished.connect(lambda: self.reveal == 0 and self.hide())
+        self.resize(1, self.HEIGHT)
+        self.hide()
+
+    def full_width(self):
+        return 2 * self.PAD + sum(w.width() for w in self.parts) + self.GAP * (len(self.parts) - 1) \
+            + LiveButton.SIZE // 2
+
+    def set_state(self, index, count, chosen, busy):
+        self.label.setText(f"{index + 1} / {count}")
+        for button in (self.prev_button, self.next_button):
+            button.setEnabled(not busy)
+        kept = index == chosen
+        self.keep_button.setEnabled(not busy and not kept)
+        self.keep_button.setToolTip("Этот вариант уже сохранён" if kept else
+                                    "Оставить этот вариант — остальные просмотренные удалятся с диска")
+
+    def slide(self, shown):
+        target = 1.0 if shown else 0.0
+        if target == self.reveal and self.anim.state() != QAbstractAnimation.Running:
+            self.setVisible(shown)
+            return
+        if shown:
+            self.show()
+        self.anim.stop()
+        self.anim.setStartValue(self.reveal)
+        self.anim.setEndValue(target)
+        self.anim.start()
+
+    def _set_reveal(self, value):
+        self.reveal = float(value)
+        self.resize(max(1, round(self.full_width() * self.reveal)), self.HEIGHT)
+        x = self.PAD + LiveButton.SIZE // 2  # левая часть прячется под значком
+        for widget in self.parts:
+            widget.move(x, (self.HEIGHT - widget.height()) // 2)
+            x += widget.width() + self.GAP
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 1, -0.5, -1)
+        painter.setPen(QPen(QColor(255, 255, 255, 90), 1))
+        painter.setBrush(QColor(0, 0, 0, 150))
+        painter.drawRoundedRect(rect, rect.height() / 2, rect.height() / 2)
+
+
 class HeroHeader(QWidget):
     """Шапка страницы игры: широкий фон, который внизу растворяется в окне, логотип или название поверх
     и большая кнопка ▶ по центру, если у игры есть трейлер."""
 
     playClicked = Signal()
-    liveRequested = Signal()  # нажали значок, а живой фон ещё не скачан — страница игры начинает загрузку
+    liveRequested = Signal(int)  # нужен вариант живого фона номер N, а он ещё не скачан — страница игры качает его
+    liveKeepRequested = Signal(int)  # оставить вариант номер N, остальные удалить
     MIN_HEIGHT, MAX_HEIGHT = 360, 600
     PLAY_RADIUS = 40
     LOGO_MAX_UPSCALE = 2.0  # маленькие логотипы увеличиваем, но не сильнее — иначе станут мыльными
@@ -1414,7 +2049,12 @@ class HeroHeader(QWidget):
         self.movie = None  # играющий живой фон: его кадры подменяют self.hero
         self.live_path = None  # скачанный живой фон этой игры
         self._movie_held = False  # на время трейлера живой фон стоит
-        # Значок «живой фон» — только у игр, для которых он нашёлся
+        # Варианты живого фона: сколько их в SteamGridDB, какой показан и какой выбран (сохранён)
+        self.live_count, self.live_index, self.live_chosen = 0, 0, None
+        # Значок «живой фон» — только у игр, для которых он нашёлся; справа от него выезжает выбор варианта
+        self.variant_bar = VariantBar(self)
+        self.variant_bar.stepRequested.connect(self._step_variant)
+        self.variant_bar.keepRequested.connect(lambda: self.liveKeepRequested.emit(self.live_index))
         self.live_button = LiveButton(self)
         self.live_button.clicked.connect(self._on_live_clicked)
         self.live_button.hide()
@@ -1436,9 +2076,11 @@ class HeroHeader(QWidget):
     def set_game(self, title):
         self._stop_movie()
         self.live_path = None
+        self.live_count, self.live_index, self.live_chosen = 0, 0, None
         self.live_button.set_progress(None)
         self.live_button.set_active(False)
         self.live_button.hide()
+        self.variant_bar.slide(False)
         self.hero = self.logo = self.static = None
         self.title = title
         self.has_trailer = False
@@ -1499,11 +2141,17 @@ class HeroHeader(QWidget):
     # вверху появляется значок. Первое нажатие качает живой фон (кольцо на значке) и включает его,
     # следующие переключают шапку между живым и обычным фоном. Сам живой фон не включается и заранее
     # не качается: файлы тяжёлые, а анимация заметно нагружает страницу.
-    def show_live(self, path=None):
-        """У игры есть живой фон; path — он уже скачан. False — скачанный файл Qt не открывает."""
+    # Вариантов в SteamGridDB несколько — пока живой фон включён, справа от значка выезжают ◀ ▶ и ✓:
+    # листать варианты (каждый качается, когда до него дошли) и оставить понравившийся.
+    def show_live(self, path=None, count=1, chosen=None):
+        """У игры есть живой фон: count вариантов, chosen — номер выбранного, path — он уже скачан.
+        False — скачанный файл Qt не открывает."""
         if path and not QMovie(path).isValid():
             return False
         self.live_path = path
+        self.live_count = max(1, count)
+        self.live_chosen = chosen if path else None
+        self.live_index = chosen if path and chosen is not None else 0
         self.live_button.set_progress(None)
         self.live_button.set_active(False)
         self._update_live_button()
@@ -1514,20 +2162,32 @@ class HeroHeader(QWidget):
     def set_live_progress(self, progress):
         self.live_button.set_progress(progress)
         self.live_button.setToolTip("Живой фон загружается…")
+        self._update_variant_bar()
 
-    def live_ready(self, path):
-        """Живой фон скачался — сразу включаем: его для этого и качали. False — Qt не может его открыть."""
+    def live_ready(self, path, index, chosen=None):
+        """Вариант index скачался — сразу включаем: его для этого и качали. chosen — какой теперь выбран.
+        False — Qt не может его открыть."""
         self.live_button.set_progress(None)
         if not QMovie(path).isValid():
             self._update_live_button()
             return False
-        self.live_path = path
+        self.live_path, self.live_index = path, index
+        if chosen is not None:
+            self.live_chosen = chosen
         self._toggle_live(True)
         return True
 
     def live_failed(self):
         self.live_button.set_progress(None)
         self._update_live_button()
+
+    def release_live(self):
+        """Отпустить файл живого фона (его сейчас переименуют или удалят) — шапка пока на обычном фоне."""
+        self._stop_movie()
+        self.hero = self.static
+        self.update()
+        self.live_button.set_progress(-1)
+        self._update_variant_bar()
 
     def _on_live_clicked(self):
         if self.live_button.progress is not None:
@@ -1536,7 +2196,13 @@ class HeroHeader(QWidget):
             self._toggle_live(self.movie is None)
         else:
             self.set_live_progress(-1)
-            self.liveRequested.emit()
+            self.liveRequested.emit(self.live_index)
+
+    def _step_variant(self, step):
+        if self.live_button.progress is not None or self.live_count < 2:
+            return
+        self.set_live_progress(-1)
+        self.liveRequested.emit((self.live_index + step) % self.live_count)
 
     def _toggle_live(self, on):
         self._stop_movie()
@@ -1559,7 +2225,19 @@ class HeroHeader(QWidget):
             tip = "Включить живой фон"
         else:
             tip = "Включить живой фон — он скачается из SteamGridDB"
+        if self.live_count > 1:
+            tip += f"\nВариантов в SteamGridDB: {self.live_count} — листать их стрелками справа"
         self.live_button.setToolTip(tip)
+        self._update_variant_bar()
+
+    def _update_variant_bar(self):
+        """Выбор варианта виден, пока живой фон включён (или качается следующий вариант) и вариантов больше одного."""
+        busy = self.live_button.progress is not None
+        shown = self.live_count > 1 and not self.live_button.isHidden() and (
+            self.movie is not None or (busy and self.live_path is not None))
+        self.variant_bar.set_state(self.live_index, self.live_count, self.live_chosen, busy)
+        self.variant_bar.slide(shown)
+        self.live_button.raise_()  # левый край «таблетки» прячется под значком
 
     def hold_movie(self, held):
         """Поставить живой фон на паузу (трейлер поверх) или продолжить."""
@@ -1573,6 +2251,7 @@ class HeroHeader(QWidget):
     def _stop_movie(self):
         if self.movie:
             self.movie.stop()
+            self.movie.setFileName("")  # Qt держит файл открытым — без этого Windows не даст его удалить
             self.movie.deleteLater()
             self.movie = None
 
@@ -1583,6 +2262,7 @@ class HeroHeader(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.live_button.move(16, 16)
+        self.variant_bar.move(16 + LiveButton.SIZE // 2, 16)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1671,7 +2351,9 @@ class HeroHeader(QWidget):
 
 # --- Диалоги ----------------------------------------------------------------
 class CheckList(ScrollArea):
-    """Прокручиваемый список флажков для выбора коллекций."""
+    """Прокручиваемый список флажков для выбора коллекций. У коллекции может быть своя подпись ("label")."""
+
+    changed = Signal()  # отметили или сняли флажок
 
     def __init__(self, collections, checked_ids, parent=None):
         super().__init__(parent)
@@ -1685,8 +2367,9 @@ class CheckList(ScrollArea):
         layout.setSpacing(6)
         self.boxes = []
         for collection in collections:
-            box = CheckBox(f"{collection['name']} ({len(collection['apps'])})", inner)
+            box = CheckBox(collection.get("label") or f"{collection['name']} ({len(collection['apps'])})", inner)
             box.setChecked(collection["id"] in checked_ids)
+            box.stateChanged.connect(lambda _state: self.changed.emit())
             layout.addWidget(box)
             self.boxes.append((collection, box))
         layout.addStretch(1)
@@ -1699,9 +2382,15 @@ class CheckList(ScrollArea):
 
 
 class AddGamesDialog(MessageBoxBase):
+    """Несколько игр списком — без поиска в Steam, только названия."""
+
     def __init__(self, parent):
         super().__init__(parent)
-        self.viewLayout.addWidget(SubtitleLabel("Добавить игры", self))
+        self.viewLayout.addWidget(SubtitleLabel("Добавить игры списком", self))
+        hint = CaptionLabel("Игры из списка добавятся без связи со Steam. Связать игру потом — правый клик по ней "
+                            "на вкладке «Игры Steam» → «Найти в Steam».", self)
+        hint.setWordWrap(True)
+        self.viewLayout.addWidget(hint)
         self.edit = TextEdit(self)
         self.edit.setPlaceholderText("По одной игре в строке (или через «|»)")
         self.edit.setMinimumSize(420, 220)
@@ -1713,68 +2402,410 @@ class AddGamesDialog(MessageBoxBase):
         return re.split(r"[|\n]", self.edit.toPlainText())
 
 
-class ImportDialog(MessageBoxBase):
-    """Выбор коллекций для импорта. Считаются только игры Steam — свои и семейной библиотеки:
-    сторонние игры, добавленные в коллекции вручную, пропускаются."""
+class AddGameDialog(MessageBoxBase):
+    """Добавить игру с поиском в магазине Steam. У найденной игры есть номер в Steam (appid), а с ним —
+    описание, скриншоты, трейлеры, обложки и установка через Steam. Ключ и вход для поиска не нужны.
 
-    def __init__(self, parent, collections, known_ids, family_count, settings):
+    С game — «Найти в Steam» для игры, добавленной вручную: найденный номер привязывается к ней.
+    """
+
+    ICON = QSize(120, 45)  # картинки поиска Steam — 231×87
+    SEARCH_DELAY = 500  # мс: ищем, когда перестали печатать
+
+    def __init__(self, parent, game=None, term="", synced=False):
         super().__init__(parent)
-        self.hidden_apps = set()
-        visible = []
-        for collection in collections or []:
-            steam_apps = collection["apps"] & known_ids
-            if collection["id"] == "hidden":
-                self.hidden_apps = steam_apps
-            elif steam_apps:
-                visible.append({**collection, "apps": steam_apps})
+        self.win = parent
+        self.game = game
+        self.choice = None  # {"appid", "name"} — выбранная игра
+        self.plain_name = None  # «Без Steam» — название как ввели
+        self.bulk = False  # «Списком…»
+        self.want_owned = False  # «Показать, что есть на моём аккаунте» — войти в магазин и вернуться сюда
+        self.results = []
+        self._token = 0
+        self._closed = False
+        self._rows_by_image = {}
+        self.owned = core.owned_apps()
+        self.my_id = parent.my_steam_id()
+        self.listed = {g["appid"] for g in parent.library.games if g.get("appid")}
 
-        self.viewLayout.addWidget(SubtitleLabel("Импорт из Steam", self))
-        if visible:
-            self.viewLayout.addWidget(StrongBodyLabel("Из каких коллекций брать игры", self))
-            hint = CaptionLabel("Ничего не отмечено — все ваши игры и семейные игры из коллекций. "
-                                "В скобках — сколько в коллекции игр Steam; сторонние игры не учитываются.", self)
-            hint.setWordWrap(True)
-            self.viewLayout.addWidget(hint)
-            self.collection_list = CheckList(visible, set(settings["import_include"]), self)
-            self.viewLayout.addWidget(self.collection_list)
-        else:
-            self.collection_list = None
-            hint = CaptionLabel("Коллекции Steam на этом ПК не найдены — будут импортированы только ваши "
-                                "игры. Проверьте, что Steam установлен и SteamID указан верно.", self)
-            hint.setWordWrap(True)
-            self.viewLayout.addWidget(hint)
-        if family_count:
-            self.viewLayout.addWidget(CaptionLabel(f"Найдено игр семейной библиотеки: {family_count}", self))
-
-        self.skip_hidden = None
-        if self.hidden_apps:
-            self.skip_hidden = CheckBox(f"Пропускать скрытые игры ({len(self.hidden_apps)})", self)
-            self.skip_hidden.setChecked(settings["import_skip_hidden"])
-            self.viewLayout.addWidget(self.skip_hidden)
-        self.unplayed = CheckBox("Только игры, в которые я ещё не играл", self)
-        self.unplayed.setChecked(settings["import_unplayed"])
-        self.viewLayout.addWidget(self.unplayed)
-        if family_count:
-            note = CaptionLabel("Время в семейных играх Steam не сообщает — они считаются неначатыми.", self)
+        self.viewLayout.addWidget(SubtitleLabel(f"Найти в Steam: «{game['name']}»" if game else "Добавить игру", self))
+        hint = CaptionLabel("Программа найдёт игру в магазине Steam — у неё будут описание, скриншоты, трейлеры, "
+                            "обложки и кнопка «Установить». Для поиска не нужны ни ключ, ни вход.", self)
+        hint.setWordWrap(True)
+        self.viewLayout.addWidget(hint)
+        if synced:  # вернулись сюда после «Показать, что есть на моём аккаунте» — итог прямо в этом окне
+            if self.owned:
+                note = CaptionLabel(f"✓ Вход в магазин Steam есть: игр и дополнений на аккаунте — {len(self.owned)}. "
+                                    "У найденных игр ниже видно, какие уже ваши.", self)
+                note.setTextColor(themeColor(), themeColor())
+            else:
+                note = CaptionLabel("Вход в магазин Steam не выполнен — без него Steam не говорит, что есть "
+                                    "на аккаунте. Найти и добавить игру можно и так.", self)
+                note.setTextColor(*WARNING_TEXT)
             note.setWordWrap(True)
             self.viewLayout.addWidget(note)
-        self.replace = CheckBox("Заменить мой список: убрать игры Steam, которых нет в выборе", self)
-        self.replace.setChecked(settings["import_replace"])
-        self.viewLayout.addWidget(self.replace)
-        self.viewLayout.addWidget(CaptionLabel("Игры, добавленные вручную, останутся в любом случае.", self))
+        self.search = SearchLineEdit(self)
+        self.search.setPlaceholderText("Название, номер игры или ссылка на её страницу в магазине Steam")
+        self.search.textChanged.connect(lambda _text: self.search_timer.start())
+        if hasattr(self.search, "searchSignal"):  # Enter и кнопка поиска
+            self.search.searchSignal.connect(lambda _text: self._search())
+        else:
+            self.search.returnPressed.connect(self._search)
+        self.viewLayout.addWidget(self.search)
+        self.status = CaptionLabel("", self)
+        self.status.setWordWrap(True)
+        self.viewLayout.addWidget(self.status)
+        self.list = ListWidget(self)
+        self.list.setIconSize(self.ICON)
+        self.list.setMinimumHeight(300)
+        self.list.currentRowChanged.connect(self._on_row)
+        self.list.itemDoubleClicked.connect(lambda _item: self._choose())
+        self.viewLayout.addWidget(self.list)
+        if QWebEngineView:
+            # Что есть на аккаунте, Steam без ключа показывает только тому, кто вошёл в магазин
+            text = "Обновить, что есть на моём аккаунте" if self.owned else "Показать, что есть на моём аккаунте"
+            owned_button = (TransparentPushButton if self.owned else PushButton)(text, self, FIF.PEOPLE)
+            owned_button.setToolTip("Вход в магазин Steam во встроенном браузере (удобнее по QR-коду). "
+                                    "Потом программа сама вернётся сюда, к этому поиску")
+            owned_button.clicked.connect(self._want_owned)
+            self.viewLayout.addWidget(owned_button, 0, Qt.AlignLeft)
 
-        self.widget.setMinimumWidth(500)
+        self.search_timer = QTimer(self)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.setInterval(self.SEARCH_DELAY)
+        self.search_timer.timeout.connect(self._search)
+        self.loader = ImageLoader(self)
+        self.loader.loaded.connect(self._on_image)
+
+        self.widget.setMinimumWidth(600)
+        self.yesButton.setText("Привязать" if game else "Добавить")
+        self.yesButton.setEnabled(False)
+        self.yesButton.clicked.disconnect()
+        self.yesButton.clicked.connect(self._choose)
+        self.cancelButton.setText("Отмена")
+        if not game:
+            plain = PushButton("Без Steam", self.buttonGroup)
+            plain.setToolTip("Добавить под тем названием, что введено, — для игр не из Steam")
+            plain.clicked.connect(self._add_plain)
+            bulk = TransparentPushButton("Списком…", self.buttonGroup)
+            bulk.setToolTip("Несколько игр сразу, по названиям, без поиска в Steam")
+            bulk.clicked.connect(self._add_bulk)
+            self.buttonLayout.insertWidget(1, plain, 1, Qt.AlignVCenter)
+            self.buttonLayout.insertWidget(2, bulk, 1, Qt.AlignVCenter)
+        term = term or (game["name"] if game else "")
+        if term:
+            self.search.setText(term)
+            self.search_timer.stop()
+            QTimer.singleShot(0, self._search)
+        self.search.setFocus()
+
+    def _want_owned(self):
+        self.want_owned = True
+        self.accept()
+
+    def _caption(self, appid):
+        """Подпись под найденной игрой: есть ли она на аккаунте (после входа в магазин) и установлена ли на ПК."""
+        owner = core.installed_owner(appid)  # файлы Steam на диске — без ключа и без входа
+        installed_mine = owner is not None and (not owner or not self.my_id or owner == self.my_id)
+        installed_other = owner is not None and not installed_mine
+        if appid in self.owned:
+            return "✓ Есть на вашем аккаунте Steam" + (" · установлена на этом ПК" if installed_mine else "")
+        if installed_mine:
+            return "✓ Установлена на этом ПК"
+        if installed_other:
+            name = core.steam_account_names().get(owner)
+            return f"Установлена на этом ПК другим аккаунтом Steam{f' — {name}' if name else ''}"
+        if self.owned:
+            return "Нет на вашем аккаунте Steam — установить можно будет после покупки"
+        return f"Магазин Steam · номер {appid}"
+
+    def _search(self):
+        self.search_timer.stop()
+        term = self.search.text().strip()
+        self._token += 1
+        token = self._token
+        self.list.clear()
+        self.results, self._rows_by_image = [], {}
+        self.yesButton.setEnabled(False)
+        if not term:
+            self.status.setText("")
+            return
+        self.status.setText("Ищу в магазине Steam…")
+        worker = Worker(core.search_store, term, parent=self.win)  # окно могут закрыть раньше, чем придёт ответ
+        worker.finished.connect(lambda items: self._on_results(token, items))
+        worker.failed.connect(lambda message: self._on_failed(token, message))
+        worker.start()
+
+    def _on_results(self, token, items):
+        if self._closed or token != self._token:
+            return
+        self.results = items
+        if not items:
+            self.status.setText("В магазине Steam ничего не нашлось. Попробуйте название по-английски, номер игры "
+                                "или ссылку на её страницу. Игра не из Steam — «Без Steam».")
+            return
+        self.status.setText("Выберите игру и нажмите «" + self.yesButton.text() + "» (или дважды щёлкните по ней).")
+        for row, item in enumerate(items):
+            listed = item["appid"] in self.listed and not (self.game and self.game.get("appid") == item["appid"])
+            caption = "Уже в вашем списке" if listed else self._caption(item["appid"])
+            entry = QListWidgetItem(f"{item['name']}\n{caption}")
+            entry.setSizeHint(QSize(0, self.ICON.height() + 14))
+            if listed:
+                entry.setFlags(Qt.NoItemFlags)
+            self.list.addItem(entry)
+            if item["image"]:
+                self._rows_by_image.setdefault(item["image"], []).append(row)
+                self.loader.request(item["image"])
+        first = next((i for i in range(self.list.count()) if self.list.item(i).flags() & Qt.ItemIsEnabled), -1)
+        self.list.setCurrentRow(first)
+
+    def _on_failed(self, token, message):
+        if self._closed or token != self._token:
+            return
+        self.status.setText("Магазин Steam не ответил: " + message.split(": ", 1)[-1])
+
+    def _on_image(self, url, content):
+        if self._closed:
+            return
+        pixmap = QPixmap()
+        if not content or not pixmap.loadFromData(content):
+            return
+        pixmap = pixmap.scaled(self.ICON, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        for row in self._rows_by_image.get(url, []):
+            item = self.list.item(row)
+            if item:
+                item.setIcon(QIcon(pixmap))
+
+    def _on_row(self, row):
+        item = self.list.item(row) if row >= 0 else None
+        self.yesButton.setEnabled(bool(item and item.flags() & Qt.ItemIsEnabled and row < len(self.results)))
+
+    def _choose(self):
+        row = self.list.currentRow()
+        item = self.list.item(row) if row >= 0 else None
+        if not item or not item.flags() & Qt.ItemIsEnabled or row >= len(self.results):
+            return
+        self.choice = {"appid": self.results[row]["appid"], "name": self.results[row]["name"]}
+        self.accept()
+
+    def _add_plain(self):
+        name = core.clean_name(self.search.text())
+        if not name:
+            self.status.setText("Сначала введите название игры.")
+            return
+        self.plain_name = name
+        self.accept()
+
+    def _add_bulk(self):
+        self.bulk = True
+        self.accept()
+
+    def done(self, code):
+        self._closed = True  # опоздавшие ответы поиска и картинки больше не нужны
+        self.search_timer.stop()
+        super().done(code)
+
+
+# Выбор в окне импорта, который запоминается для быстрой синхронизации
+IMPORT_KEYS = ("import_include", "import_skip_hidden", "import_unplayed", "import_replace", "import_family",
+               "import_unverified")
+
+
+class ImportDialog(MessageBoxBase):
+    """Импорт из Steam. Сверху — что нашлось: ваши игры и семейная группа (и проверил ли её Steam), ниже —
+    откуда брать игры и что пропускать, внизу — сколько игр добавится; это число пересчитывается на лету.
+
+    Считаются только игры Steam: дополнения, программы и сторонние игры, добавленные в коллекции вручную,
+    пропускаются. want_login — нажали «Войти и проверить»: окно закрылось, чтобы войти в магазин Steam
+    и открыть импорт заново, уже с проверенной семейной группой.
+    """
+
+    def __init__(self, parent, library, settings, listed):
+        super().__init__(parent)
+        self.library, self.settings, self.listed = library, settings, listed
+        self.want_login = False
+        games = library["games"]
+        known = {game["appid"] for game in games}
+        own = {game["appid"] for game in games if not game["family"]}
+        family = sum(game["family"] and game.get("verified", True) for game in games)
+        guessed = {game["appid"] for game in games if not game.get("verified", True)}
+        collections = library["collections"] or []
+        hidden = next((c for c in collections if c["id"] == "hidden"), None)
+        self.hidden_apps = hidden["apps"] & known if hidden else set()
+        visible = []
+        for collection in collections:
+            apps = collection["apps"] & known
+            if collection["id"] == "hidden" or not apps:
+                continue  # «Скрытые» — отдельным флажком ниже, пустые коллекции не показываем
+            sure, unsure = len(apps - guessed), len(apps & guessed)
+            label = f"{collection['name']} ({sure})" + (f" + {unsure} не проверено" if unsure else "")
+            if collection["id"] in core.SPECIAL_COLLECTIONS:
+                label += " — служебная коллекция Steam"
+            visible.append({**collection, "apps": apps, "label": label})
+
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(0, 0, 14, 0)  # справа — место под полосу прокрутки
+        layout.setSpacing(6)
+
+        def heading(text):
+            layout.addSpacing(8)
+            layout.addWidget(StrongBodyLabel(text, body))
+
+        def hint(text, warning=False, indent=True):
+            label = CaptionLabel(text, body)
+            label.setWordWrap(True)
+            if indent:
+                label.setContentsMargins(28, 0, 0, 4)  # под текстом флажка, а не под самим флажком
+            if warning:
+                label.setTextColor(*WARNING_TEXT)
+            layout.addWidget(label)
+            return label
+
+        def option(text, checked, note, warning=False):
+            box = CheckBox(text, body)
+            box.setChecked(checked)
+            box.stateChanged.connect(self._update)
+            layout.addWidget(box)
+            hint(note, warning)
+            return box
+
+        # Что нашлось
+        layout.addWidget(StrongBodyLabel("Что нашлось в Steam", body))
+        hidden_own = len(self.hidden_apps & own)
+        layout.addWidget(BodyLabel(f"Мои игры: {len(own)}" + (f" (из них скрыты в Steam: {hidden_own})"
+                                                               if hidden_own else ""), body))
+        if library.get("family_checked"):
+            layout.addWidget(BodyLabel(f"Семейная группа: {family} игр других участников — проверено Steam"
+                                       if library.get("family_member")
+                                       else "Семейная группа: вы в ней не состоите — проверено Steam", body))
+        else:
+            layout.addWidget(BodyLabel("Семейная группа: не проверена", body))
+            reason = (f"Steam не ответил: {library['family_error']}. " if library.get("family_error") else
+                      "Семейную группу Steam показывает только после входа в магазин Steam во встроенном браузере. ")
+            if guessed:
+                reason += (f"Без проверки в ваших коллекциях нашлось игр не с вашего аккаунта: {len(guessed)} — "
+                           "семейные ли они и есть ли к ним доступ сейчас, не узнать.")
+            hint(reason, warning=True, indent=False)
+            if QWebEngineView:
+                again = library.get("store_login")
+                login = PushButton("Проверить ещё раз" if again else "Войти и проверить", body, FIF.PEOPLE)
+                login.setToolTip("Спросить Steam ещё раз" if again else
+                                 "Вход в магазин Steam во встроенном браузере (удобнее по QR-коду), потом это окно "
+                                 "откроется снова — уже с играми семейной группы")
+                login.clicked.connect(self._login)
+                layout.addWidget(login, 0, Qt.AlignLeft)
+
+        # Откуда брать игры
+        heading("Откуда брать игры")
+        self.all_radio = RadioButton("Все мои игры", body)
+        layout.addWidget(self.all_radio)
+        hint("Вся ваша библиотека Steam, как «Мои игры» в клиенте Steam"
+             + (", и игры семейной группы, если они отмечены ниже." if family or guessed else "."))
+        self.pick_radio = RadioButton("Только из коллекций", body)
+        layout.addWidget(self.pick_radio)
+        self.collection_list = None
+        if visible:
+            hint("Ваши папки в библиотеке Steam. В скобках — сколько в коллекции игр, которые можно добавить: "
+                 "дополнения, программы и сторонние игры не считаются. Пустые коллекции не показаны.")
+            self.collection_list = CheckList(visible, set(settings["import_include"]), body)
+            self.collection_list.changed.connect(self._update)
+            row = QHBoxLayout()
+            row.setContentsMargins(24, 0, 0, 0)
+            row.addWidget(self.collection_list)
+            layout.addLayout(row)
+        else:
+            self.pick_radio.setEnabled(False)
+            hint("Коллекций с играми не нашлось. " + (library.get("collections_hint") or ""))
+        picked = bool(set(settings["import_include"]) & {c["id"] for c in visible})
+        (self.pick_radio if picked else self.all_radio).setChecked(True)
+        self.all_radio.toggled.connect(self._update)
+
+        # Что добавить и что пропустить
+        heading("Что добавить")
+        self.family_box = self.unverified_box = self.skip_hidden = None
+        if family:
+            self.family_box = option(
+                f"Игры семейной группы ({family})", settings["import_family"],
+                "Игры других участников семьи, которые Steam разрешает вам запускать. Время в них Steam "
+                "не сообщает — для «ещё не играл» они считаются неначатыми.")
+        if guessed:
+            self.unverified_box = option(
+                f"Непроверенные игры из коллекций ({len(guessed)})", settings["import_unverified"],
+                "Игры из ваших коллекций, которых нет среди ваших покупок. Steam без входа в магазин не говорит, "
+                "доступны ли они вам, — поэтому по умолчанию они не добавляются. Лучше нажать «Войти и проверить».",
+                warning=True)
+        if self.hidden_apps:
+            self.skip_hidden = option(
+                f"Пропускать скрытые игры ({len(self.hidden_apps)})", settings["import_skip_hidden"],
+                "Игры, которые вы скрыли в библиотеке Steam (служебная коллекция «Скрытые»).")
+        self.unplayed = option("Только игры, в которые я ещё не играл", settings["import_unplayed"],
+                               "По времени в игре, которое сообщает Steam.")
+        self.replace = option("Заменить мой список: убрать игры Steam, которых нет в выборе",
+                              settings["import_replace"], "Игры, добавленные вручную, останутся в любом случае.")
+        layout.addStretch(1)
+
+        scroll = ScrollArea(self)
+        scroll.setWidget(body)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget {background: transparent; border: none}")
+        # Окно не выше главного: всё, что не влезло, прокручивается
+        scroll.setFixedHeight(min(layout.totalHeightForWidth(self.WIDTH) + 8, max(260, parent.height() - 300)))
+
+        self.viewLayout.addWidget(SubtitleLabel("Импорт из Steam", self))
+        self.viewLayout.addWidget(scroll)
+        self.counter = StrongBodyLabel("", self)
+        self.counter.setTextColor(themeColor(), themeColor())
+        self.viewLayout.addWidget(self.counter)
+
+        self.widget.setMinimumWidth(self.WIDTH + 48)
+        self.widget.setMaximumWidth(self.WIDTH + 48)
         self.yesButton.setText("Импортировать")
         self.cancelButton.setText("Отмена")
+        self._update()
+
+    WIDTH = 580
+
+    def _login(self):
+        self.want_login = True
+        self.accept()
+
+    def _update(self, *_):
+        """Сколько игр добавится при этом выборе и сколько из них уже в списке."""
+        if self.collection_list:
+            self.collection_list.setEnabled(self.pick_radio.isChecked())
+        choice = self.selection()
+        if self.pick_radio.isChecked() and not choice["import_include"]:
+            self.counter.setText("Отметьте хотя бы одну коллекцию")
+            self.yesButton.setEnabled(False)
+            return
+        selected, _ = core.select_games(self.library, choice)
+        ids = {game["appid"] for game in selected}
+        new = len(ids - self.listed)
+        text = f"Будет добавлено: {new} · уже в списке: {len(ids) - new}"
+        gone = len(self.listed - ids) if choice["import_replace"] else 0
+        if gone:
+            text += f" · уберётся из списка: {gone}"
+        self.counter.setText(text if ids else "Под этот выбор не подходит ни одна игра")
+        self.yesButton.setEnabled(bool(ids))
 
     def selection(self):
-        """Выбор пользователя в виде, который сохраняется для быстрой синхронизации."""
-        chosen = self.collection_list.checked() if self.collection_list else []
+        """Выбор пользователя в виде, который сохраняется для быстрой синхронизации. Чего в окне нет
+        (например, семейных игр не нашлось), остаётся как было."""
+        settings = self.settings
+
+        def checked(box, key):
+            return box.isChecked() if box else bool(settings[key])
+
+        chosen = self.collection_list.checked() if self.collection_list and self.pick_radio.isChecked() else []
         return {
             "import_include": [c["id"] for c in chosen],
-            "import_skip_hidden": bool(self.skip_hidden and self.skip_hidden.isChecked()),
+            "import_skip_hidden": checked(self.skip_hidden, "import_skip_hidden"),
             "import_unplayed": self.unplayed.isChecked(),
             "import_replace": self.replace.isChecked(),
+            "import_family": checked(self.family_box, "import_family"),
+            "import_unverified": checked(self.unverified_box, "import_unverified"),
         }
 
 
@@ -1920,8 +2951,8 @@ class ImportProgressDialog(MessageBoxBase):
         self.bar = ProgressBar(self)
         self.bar.setRange(0, 100)
         self.viewLayout.addWidget(self.bar)
-        self.hint = CaptionLabel("Первый раз до минуты: ищутся названия семейных игр. Дальше они берутся из кэша.",
-                                 self)
+        self.hint = CaptionLabel("Семейную группу программа проверяет у Steam, если вы вошли в магазин Steam "
+                                 "во встроенном браузере. Первый раз загрузка может занять до минуты.", self)
         self.hint.setWordWrap(True)
         self.viewLayout.addWidget(self.hint)
 
@@ -1957,6 +2988,681 @@ class ClearDialog(MessageBoxBase):
         self.widget.setMinimumWidth(460)
         self.yesButton.setText("Очистить")
         self.cancelButton.setText("Отмена")
+
+
+WARNING_TEXT = (QColor(157, 93, 0), QColor(252, 225, 0))  # цвет предупреждений Fluent: светлая и тёмная тема
+
+# Шрифт текста в мастере подключения: основной — 14 px, подсказки — 13 (у обычных подписей Fluent 12 —
+# в длинных пояснениях это мелко)
+WIZARD_BODY_PX, WIZARD_CAPTION_PX = 14, 13
+
+
+def wizard_text(text, parent, caption=False, warning=False):
+    """Абзац текста в мастере подключения и в окне ключа SteamGridDB: с переносом строк и ровным шрифтом."""
+    label = (CaptionLabel if caption else BodyLabel)(text, parent)
+    label.setWordWrap(True)
+    font = QFont(label.font())
+    font.setPixelSize(WIZARD_CAPTION_PX if caption else WIZARD_BODY_PX)
+    label.setFont(font)
+    if warning:
+        label.setTextColor(*WARNING_TEXT)
+    return label
+
+
+# Что работает без ключа Steam Web API — в мастере подключения и в окне после «Пропустить»
+KEYLESS_FEATURES = (
+    "Игры добавляются через «Игры Steam» → «Добавить» — с поиском по магазину Steam, описанием, трейлерами "
+    "и установкой.",
+    "После входа в магазин Steam во встроенном браузере видно, что есть на аккаунте: игры и саундтреки.",
+    "Рулетка, музыка и браузер работают как обычно.",
+)
+KEYLESS_MISSING = "Без ключа не будет только коллекций при импорте, «Синхронизации» и достижений."
+
+
+class SteamLaterDialog(MessageBoxBase):
+    """После «Пропустить» в мастере подключения: что работает без Steam и где подключить его потом."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.viewLayout.addWidget(SubtitleLabel("Steam можно подключить позже", self))
+        for text, caption in [("Программа работает и без подключения к Steam:", False)] \
+                + [("• " + line, False) for line in KEYLESS_FEATURES] \
+                + [(KEYLESS_MISSING, True),
+                   ("Подключить: «Настройки» → «Войти через Steam» или «Импорт из Steam» на вкладке «Игры Steam».",
+                    True)]:
+            self.viewLayout.addWidget(wizard_text(text, self, caption))
+        self.widget.setMinimumWidth(520)
+        self.widget.setMaximumWidth(520)
+        self.yesButton.setText("Добавить игру")
+        self.cancelButton.setText("Понятно")
+
+
+class GridKeyPanel(QWidget):
+    """Ключ SteamGridDB: что он даёт, как его получить, поле и проверка. Стоит в мастере подключения
+    (необязательный шаг) и в отдельном окне «Настройки» → «Ключ SteamGridDB».
+
+    Ключ проверяется одним запросом к SteamGridDB и хранится зашифрованным в settings.json (как ключ Steam).
+    checked(ключ) — проверен и сохранён; busyChanged(True/False) — идёт проверка.
+    """
+
+    checked = Signal(str)
+    busyChanged = Signal(bool)
+
+    def __init__(self, win, parent=None, in_wizard=False):
+        super().__init__(parent)
+        self.win = win
+        self._closed = False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(10)
+
+        def text(value, caption=False, warning=False):
+            label = wizard_text(value, self, caption, warning)
+            layout.addWidget(label)
+            return label
+
+        self.note = text("", caption=True)  # в мастере: что уже готово перед этим шагом
+        self.note.setTextColor(themeColor(), themeColor())
+        self.note.hide()
+        layout.addWidget(StrongBodyLabel("Ещё красивее — с ключом SteamGridDB", self))
+        text("SteamGridDB — сайт, где игроки выкладывают картинки для игр. С ключом программа возьмёт оттуда "
+             "то, чего нет в Steam: вертикальные обложки, фоны и логотипы на странице игры, живые фоны.")
+        text("Без ключа — официальные картинки Steam, большинству игр их хватает. "
+             + ("Шаг можно пропустить: «Настройки» → «Ключ SteamGridDB»." if in_wizard else "Ключ бесплатный."),
+             caption=True)
+        text("1. «Открыть страницу ключа» и войдите на SteamGridDB (можно через Steam).\n"
+             "2. Нажмите «Generate API Key».\n"
+             "3. Скопируйте ключ и вставьте сюда.")
+        open_button = PushButton("Открыть страницу ключа", self, FIF.LINK)
+        open_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(core.STEAMGRIDDB_KEY_PAGE)))
+        layout.addWidget(open_button, 0, Qt.AlignLeft)
+        self.key_edit = PasswordLineEdit(self)
+        self.key_edit.setPlaceholderText("Ключ SteamGridDB")
+        self.key_edit.setText(core.griddb_key())
+        self.key_edit.returnPressed.connect(self.check)
+        layout.addWidget(self.key_edit)
+        self.bar = IndeterminateProgressBar(self)
+        self.bar.hide()
+        layout.addWidget(self.bar)
+        self.status = text("", caption=True)
+        self.status.hide()
+        text("Ключ личный: он хранится только на этом ПК, зашифрованным, и уходит только в SteamGridDB.",
+             caption=True, warning=True)
+        layout.addStretch(1)
+
+    def set_note(self, value):
+        self.note.setText(value)
+        self.note.setVisible(bool(value))
+
+    def focus(self):
+        self.key_edit.setFocus()
+
+    def check(self):
+        key = self.key_edit.text().strip()
+        if not key:
+            self._set_status("Сначала вставьте ключ — или пропустите этот шаг.", warning=True)
+            return
+        self.bar.show()
+        self.status.hide()
+        self.busyChanged.emit(True)
+        worker = Worker(core.check_griddb_key, key, parent=self.win)  # окно могут закрыть раньше ответа
+        worker.finished.connect(self._on_checked)
+        worker.failed.connect(self._on_failed)
+        worker.start()
+
+    def _set_status(self, value, warning=False):
+        self.status.setText(value)
+        self.status.setTextColor(*(WARNING_TEXT if warning else (QColor(0, 0, 0, 160), QColor(255, 255, 255, 170))))
+        self.status.show()
+
+    def _on_checked(self, key):
+        if self._closed:
+            return
+        self.bar.hide()
+        self.busyChanged.emit(False)
+        try:
+            core.save_settings(griddb_api_key=key)
+        except OSError as e:
+            self._set_status(f"Не удалось сохранить ключ: {e}", warning=True)
+            return
+        core.log.info("Ключ SteamGridDB сохранён (зашифрованным)")
+        self.checked.emit(key)
+
+    def _on_failed(self, message):
+        if self._closed:
+            return
+        self.bar.hide()
+        self.busyChanged.emit(False)
+        self._set_status(message.split(": ", 1)[-1] + ".", warning=True)
+
+    def close_panel(self):
+        self._closed = True  # опоздавший ответ проверки больше не нужен
+
+
+class SteamGridDialog(MessageBoxBase):
+    """«Настройки» → «Ключ SteamGridDB»: то же, что шаг мастера, отдельным окном."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.saved = False
+        self.viewLayout.addWidget(SubtitleLabel("Ключ SteamGridDB", self))
+        self.panel = GridKeyPanel(parent, self)
+        if core.griddb_key():
+            self.panel.set_note("Ключ уже сохранён. Вставьте новый, чтобы заменить его.")
+        self.viewLayout.addWidget(self.panel)
+        self.yesButton.setText("Проверить и сохранить")
+        self.yesButton.clicked.disconnect()
+        self.yesButton.clicked.connect(self.panel.check)
+        self.panel.busyChanged.connect(self._on_busy)
+        self.panel.checked.connect(self._on_saved)
+        self.cancelButton.setText("Отмена")
+        self.widget.setMinimumWidth(560)
+        self.widget.setMaximumWidth(560)
+        QTimer.singleShot(0, self.panel.focus)
+
+    def _on_busy(self, busy):
+        self.yesButton.setEnabled(not busy)
+        self.yesButton.setText("Проверяю…" if busy else "Проверить и сохранить")
+
+    def _on_saved(self, _key):
+        self.saved = True
+        self.accept()
+
+    def done(self, code):
+        self.panel.close_panel()
+        super().done(code)
+
+
+class SteamSetupDialog(MessageBoxBase):
+    """Подключение к Steam: вход через сайт Steam во внешнем браузере, затем ключ Steam Web API.
+
+    Пароль вводится только на сайте Steam в браузере пользователя — программа получает лишь SteamID,
+    и Steam подтверждает его отдельным запросом (см. core.SteamLogin). Ключ пользователь создаёт сам
+    и вставляет сюда, программа сразу проверяет его и хранит зашифрованным.
+
+    Steam выдаёт ключ не всем аккаунтам. Тогда шаг «Без ключа» рассказывает, что работает и так, и спрашивает,
+    можно ли запомнить SteamID. Запомнили — в следующий раз мастер откроется сразу на шаге ключа. Не запомнили —
+    SteamID помнится до закрытия программы (MainWindow.session_steam_id), чтобы не водить по входу заново.
+    Второй раз «Без ключа» с тем же аккаунтом ничего не спрашивает — просто закрывает мастер.
+    """
+
+    LOGIN, KEY, NOKEY, GRID, DONE = range(5)
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.win = parent
+        settings = core.load_settings()
+        self.had_key = bool(settings["steam_api_key"])  # ключ уже есть — «Без ключа» не предлагаем
+        no_key = settings.get("steam_setup") == "no_key" and not self.had_key
+        self.was_no_key = no_key  # раньше работали без ключа — в конце расскажем, что с ключом добавилось
+        saved_id = settings["steam_id"] if no_key else ""  # вход с прошлого раза уже подтверждён Steam
+        session_id = getattr(parent, "session_steam_id", "") if no_key else ""  # вход в этом запуске, не запомнен
+        self.steam_id = saved_id or session_id
+        self.remembered = bool(saved_id)
+        self._repeat_id = self.steam_id  # «Без ключа» с этим аккаунтом уже выбирали — второй раз не спрашиваем
+        self.session_id = ""  # не запомнили SteamID — программа помнит его до закрытия
+        self.repeated = False
+        self.names = {}  # SteamID → имя профиля Steam
+        self.connected = False  # ключ проверен и сохранён
+        self.no_key = False  # выбрали «Без ключа»
+        self.want_import = False
+        self._login = None
+        self._closed = False
+        self._switch_from = ""  # «Сменить аккаунт»: с какого аккаунта уходим
+        self._pending_id = ""
+        # Необязательный шаг «ключ SteamGridDB» — после ключа Steam (или «Без ключа»), если ключа SteamGridDB ещё нет
+        self.need_grid = not settings["griddb_api_key"]
+        self.grid_saved = False
+        self._after_grid = None  # "done" — дальше страница «Готово», "accept" — закрыть мастер
+
+        self.viewLayout.addWidget(SubtitleLabel("Подключение к Steam", self))
+        self.step_label = CaptionLabel("", self)
+        self.viewLayout.addWidget(self.step_label)
+        self.pages = QStackedWidget(self)
+        self.pages.addWidget(self._login_page())
+        self.pages.addWidget(self._key_page())
+        self.pages.addWidget(self._nokey_page())
+        self.grid_panel = GridKeyPanel(parent, in_wizard=True)
+        self.grid_panel.busyChanged.connect(self._on_grid_busy)
+        self.grid_panel.checked.connect(lambda _key: self._leave_grid(saved=True))
+        self.pages.addWidget(self.grid_panel)
+        self.pages.addWidget(self._done_page())
+        self.viewLayout.addWidget(self.pages)
+
+        # Что делают кнопки, решает шаг: войти, проверить ключ, запомнить SteamID, импортировать
+        self.yesButton.clicked.disconnect()
+        self.yesButton.clicked.connect(self._on_primary)
+        self.cancelButton.clicked.disconnect()
+        self.cancelButton.clicked.connect(self._on_secondary)
+        self.widget.setMinimumWidth(560)
+        self.widget.setMaximumWidth(560)
+        if self.steam_id:
+            self._show_account(self.steam_id)
+            self.previous_label.show()
+            core.log.info("Мастер подключения: в прошлый раз ключа не было — открываю шаг ключа (SteamID %s)",
+                          core.short_steam_id(self.steam_id))
+            self._show_step(self.KEY)
+        else:
+            self.login_note.setVisible(no_key)
+            self._show_step(self.LOGIN)
+
+    # --- Аккаунт ---
+    def _who(self, steam_id):
+        """«Имя (SteamID …1234)» — имя, если уже узнали, иначе только последние цифры SteamID."""
+        name = self.names.get(steam_id)
+        return f"{name} (SteamID {core.short_steam_id(steam_id)})" if name else f"SteamID {core.short_steam_id(steam_id)}"
+
+    def _show_account(self, steam_id):
+        """Строка «Вы вошли в Steam»: сразу с SteamID, имя профиля подставляется, когда придёт."""
+        self.account_label.setText(f"Вы вошли в Steam: {self.names.get(steam_id, '')} (SteamID {steam_id})"
+                                   if self.names.get(steam_id) else f"Вы вошли в Steam: SteamID {steam_id}")
+        if steam_id in self.names:
+            return
+        worker = Worker(core.steam_persona_name, steam_id, parent=self.win)  # окно могут закрыть раньше ответа
+        worker.finished.connect(lambda name: self._on_persona(steam_id, name))
+        worker.start()
+
+    def _on_persona(self, steam_id, name):
+        if self._closed or not name:
+            return
+        self.names[steam_id] = name
+        if steam_id == self.steam_id:
+            self._show_account(steam_id)
+            if self.pages.currentIndex() == self.NOKEY:
+                self._show_step(self.NOKEY)  # в вопросе про SteamID — тоже с именем
+
+    # --- Шаги ---
+    @staticmethod
+    def _page():
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(10)
+        return page, layout
+
+    @staticmethod
+    def _text(text, parent, caption=False, warning=False):
+        return wizard_text(text, parent, caption, warning)
+
+    def _login_page(self):
+        page, layout = self._page()
+        self.login_note = self._text(
+            "В прошлый раз Steam не выдал ключ, а аккаунт не запомнен — поэтому снова вход. Ключа всё ещё нет? "
+            "На следующем шаге снова будет «Без ключа».", page, warning=True)
+        self.login_note.hide()
+        layout.addWidget(self.login_note)
+        layout.addWidget(self._text(
+            "Войдите в Steam — в вашем браузере откроется официальная страница входа. Программа возьмёт из Steam "
+            "список ваших игр.", page))
+        layout.addWidget(self._text(
+            "Пароль и коды Steam Guard вводятся только на сайте Steam. Программа получает лишь номер аккаунта "
+            "(SteamID).", page, caption=True))
+        layout.addWidget(self._text(
+            "«Sign into 127.0.0.1» на странице Steam — это сама программа на вашем ПК, а не чужой сайт.",
+            page, caption=True))
+        layout.addWidget(self._text(
+            "Не проходит вход по QR-коду или Steam Guard? Отключите VPN или прокси и откройте страницу входа "
+            "ещё раз.", page, caption=True))
+        self.login_bar = IndeterminateProgressBar(page)
+        self.login_bar.hide()
+        self.login_status = self._text("", page, caption=True)
+        self.login_status.hide()
+        self.reopen_button = TransparentPushButton("Открыть страницу входа ещё раз", page, FIF.LINK)
+        self.reopen_button.hide()
+        self.reopen_button.clicked.connect(self._open_login_page)
+        # Смена аккаунта: браузер помнит вход, поэтому сначала выйти из Steam на его сайте
+        self.steam_site_button = TransparentPushButton("Открыть сайт Steam в браузере", page, FIF.GLOBE)
+        self.steam_site_button.hide()
+        self.steam_site_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://store.steampowered.com/")))
+        self.same_button = TransparentPushButton("", page, FIF.ACCEPT)
+        self.same_button.hide()
+        self.same_button.clicked.connect(lambda: self._use_account(self._pending_id))
+        layout.addWidget(self.login_bar)
+        layout.addWidget(self.login_status)
+        layout.addWidget(self.reopen_button, 0, Qt.AlignLeft)
+        layout.addWidget(self.steam_site_button, 0, Qt.AlignLeft)
+        layout.addWidget(self.same_button, 0, Qt.AlignLeft)
+        layout.addStretch(1)
+        return page
+
+    def _key_page(self):
+        page, layout = self._page()
+        self.account_label = StrongBodyLabel("", page)
+        layout.addWidget(self.account_label)
+        other = TransparentPushButton("Не ваш аккаунт? Сменить", page, FIF.PEOPLE)
+        other.setToolTip("Как войти в Steam другим аккаунтом — браузер помнит прошлый вход")
+        other.clicked.connect(self._login_again)
+        layout.addWidget(other, 0, Qt.AlignLeft)
+        self.previous_label = self._text(
+            "В прошлый раз Steam не выдал ключ этому аккаунту. Появился — вставьте ниже, нет — «Без ключа».",
+            page, warning=True)
+        self.previous_label.hide()
+        layout.addWidget(self.previous_label)
+        layout.addWidget(self._text(
+            "Нужен ваш ключ Steam Web API — с ним программа читает список игр. Выдаёт его только сам Steam:", page))
+        layout.addWidget(self._text(
+            "1. «Открыть страницу ключа» — откроется в том же браузере.\n"
+            "2. В «Domain Name» впишите localhost, отметьте согласие и нажмите «Register». Попросит "
+            "подтверждение в приложении Steam — подтвердите.\n"
+            "3. Скопируйте строку после «Key» и вставьте сюда.", page))
+        open_button = PushButton("Открыть страницу ключа", page, FIF.LINK)
+        open_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(core.STEAM_API_KEY_PAGE)))
+        layout.addWidget(open_button, 0, Qt.AlignLeft)
+        self.key_edit = PasswordLineEdit(page)
+        self.key_edit.setPlaceholderText("Ключ: 32 знака из цифр и букв A–F")
+        self.key_edit.returnPressed.connect(self._on_primary)
+        layout.addWidget(self.key_edit)
+        self.key_bar = IndeterminateProgressBar(page)
+        self.key_bar.hide()
+        self.key_status = self._text("", page, caption=True)
+        self.key_status.hide()
+        layout.addWidget(self.key_bar)
+        layout.addWidget(self.key_status)
+        layout.addWidget(self._text(
+            "Никому не сообщайте ключ: кто его просит — мошенник. Программа хранит ключ только на этом ПК, "
+            "зашифрованным.", page, caption=True, warning=True))
+        layout.addWidget(self._text(
+            "Steam выдаёт ключ не всем — например, если на аккаунте ещё нет игр («You will be granted access…»). "
+            "Тогда нажмите «Без ключа».", page, caption=True))
+        layout.addStretch(1)
+        return page
+
+    def _nokey_page(self):
+        page, layout = self._page()
+        layout.addWidget(StrongBodyLabel("Программа работает и без ключа", page))
+        for line in KEYLESS_FEATURES:
+            layout.addWidget(self._text("• " + line, page))
+        layout.addWidget(self._text(KEYLESS_MISSING, page, caption=True))
+        self.remember_text = self._text("", page)
+        layout.addWidget(self.remember_text)
+        layout.addWidget(self._text(
+            "Ключ можно добавить позже: «Настройки» → «Войти через Steam».", page, caption=True))
+        back = TransparentPushButton("Назад к ключу", page, FIF.LEFT_ARROW)
+        back.clicked.connect(lambda: self._show_step(self.KEY))
+        layout.addWidget(back, 0, Qt.AlignLeft)
+        layout.addStretch(1)
+        return page
+
+    def _done_page(self):
+        page, layout = self._page()
+        self.done_title = StrongBodyLabel("", page)
+        self.done_text = self._text("", page)
+        layout.addWidget(self.done_title)
+        layout.addWidget(self.done_text)
+        self.private_text = self._text(
+            "Steam не показал игры: в приватности профиля скрыта «Игровая информация». Сделайте её открытой — "
+            "и импорт заработает.", page, caption=True, warning=True)
+        self.private_button = PushButton("Открыть настройки приватности", page, FIF.LINK)
+        self.private_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(core.STEAM_PRIVACY_PAGE)))
+        layout.addWidget(self.private_text)
+        layout.addWidget(self.private_button, 0, Qt.AlignLeft)
+        layout.addStretch(1)
+        return page
+
+    def _show_step(self, step):
+        self.pages.setCurrentIndex(step)
+        total = 3 if self.need_grid else 2
+        grid_label = ("Шаг 3 из 3 — картинки SteamGridDB (необязательно)" if self._after_grid == "done"
+                      else "Картинки SteamGridDB (необязательно)")
+        self.step_label.setText((f"Шаг 1 из {total} — вход в Steam", f"Шаг 2 из {total} — ключ Steam Web API",
+                                 "Без ключа", grid_label, "Готово")[step])
+        self.yesButton.setText(("Войти через Steam", "Проверить ключ", "Запомнить SteamID", "Проверить и сохранить",
+                                "Импортировать игры")[step])
+        self.yesButton.setEnabled(True)
+        self.cancelButton.setText(("Пропустить", "Отмена" if self.had_key else "Без ключа", "Не запоминать",
+                                   "Пропустить", "Позже")[step])
+        self.cancelButton.setToolTip("")
+        if step == self.GRID:
+            self.grid_panel.focus()
+            self.cancelButton.setToolTip("Без ключа SteamGridDB — картинки только из Steam. Добавить потом: "
+                                         "«Настройки» → «Ключ SteamGridDB»")
+        elif step == self.KEY:
+            self.key_edit.setFocus()
+            self.cancelButton.setToolTip("Ключа по-прежнему нет — закрыть мастер, программа работает как раньше"
+                                         if self._known_no_key() else "")
+        elif step == self.NOKEY:
+            self.remember_text.setText(
+                f"Запомнить аккаунт ({self._who(self.steam_id)}) на этом ПК? Это только номер — не пароль и не "
+                "ключ. По нему программа проверит, что в клиент Steam вошли вы, и разделит саундтреки по "
+                "аккаунтам. Стереть — «Настройки» → «Удалить ключ и выйти». Не запомните — программа забудет его "
+                "при закрытии.")
+
+    def _known_no_key(self):
+        """«Без ключа» с этим аккаунтом уже выбирали — второй раз ничего не спрашиваем."""
+        return bool(self._repeat_id) and self.steam_id == self._repeat_id
+
+    def _on_primary(self):
+        step = self.pages.currentIndex()
+        if step == self.LOGIN:
+            self._start_login()
+        elif step == self.KEY:
+            self._check_key()
+        elif step == self.NOKEY:
+            self._finish_no_key(remember=True)
+        elif step == self.GRID:
+            self.grid_panel.check()
+        else:
+            self.want_import = True
+            self.accept()
+
+    def _on_secondary(self):
+        step = self.pages.currentIndex()
+        if step == self.KEY and not self.had_key:
+            if self._known_no_key():
+                self._close_no_key()
+            else:
+                self._show_step(self.NOKEY)
+        elif step == self.NOKEY:
+            self._finish_no_key(remember=False)
+        elif step == self.GRID:
+            self._leave_grid(saved=False)
+        else:
+            self.reject()
+
+    # --- Ключ SteamGridDB ---
+    def _open_grid(self, after, note):
+        """Необязательный шаг SteamGridDB, если ключа ещё нет; иначе сразу дальше."""
+        self._after_grid = after
+        if not self.need_grid:
+            self._leave_grid(saved=False)
+            return
+        self.grid_panel.set_note(note)
+        self._show_step(self.GRID)
+
+    def _on_grid_busy(self, busy):
+        self.yesButton.setEnabled(not busy)
+        self.yesButton.setText("Проверяю…" if busy else "Проверить и сохранить")
+        self.cancelButton.setEnabled(not busy)
+
+    def _leave_grid(self, saved):
+        self.cancelButton.setEnabled(True)
+        if saved:
+            self.grid_saved = True
+            core.log.info("Мастер подключения: ключ SteamGridDB добавлен")
+        elif self.need_grid:
+            core.log.info("Мастер подключения: шаг SteamGridDB пропущен")
+        if self._after_grid == "done":
+            if saved:
+                self.done_text.setText(self.done_text.text() + "\n\nКлюч SteamGridDB сохранён.")
+            self._show_step(self.DONE)
+        else:
+            self.accept()
+
+    def _login_again(self):
+        """«Сменить аккаунт»: страница входа Steam сама откроет тот аккаунт, что помнит браузер, —
+        поэтому объясняем, как сначала выйти из него на сайте Steam."""
+        self._switch_from, self.steam_id = self.steam_id, ""
+        self.previous_label.hide()
+        self.login_status.hide()
+        self.same_button.hide()
+        self.login_note.setText(
+            f"Браузер помнит вход, поэтому страница Steam снова откроет {self._who(self._switch_from)}. Сначала "
+            f"выйдите: сайт Steam → имя аккаунта справа вверху → «Выйти из аккаунта». Потом — «Войти через Steam».")
+        self.login_note.show()
+        self.steam_site_button.show()
+        self._show_step(self.LOGIN)
+
+    def _use_account(self, steam_id):
+        self._switch_from = ""
+        self.same_button.hide()
+        self.steam_site_button.hide()
+        self.login_status.hide()
+        self.login_note.hide()
+        self.steam_id = steam_id
+        self.previous_label.setVisible(self._known_no_key())
+        self._show_account(steam_id)
+        self._show_step(self.KEY)
+
+    def _close_no_key(self):
+        """Ключа по-прежнему нет, а «Без ключа» с этим аккаунтом уже выбирали: настройки не трогаем."""
+        self.no_key = self.repeated = True
+        self.session_id = "" if self.remembered else self.steam_id
+        core.log.info("Мастер подключения: ключа по-прежнему нет — закрываю, всё остаётся как было")
+        self.accept()
+
+    def _finish_no_key(self, remember):
+        try:
+            core.save_settings(steam_setup="no_key", steam_id=self.steam_id if remember else "")
+        except OSError as e:
+            notify("error", self.win, "Не удалось сохранить настройки", str(e))
+            return
+        self.no_key = True
+        self.session_id = "" if remember else self.steam_id
+        core.log.info("Steam без ключа: SteamID %s", core.short_steam_id(self.steam_id) if remember
+                      else "не запомнен — пользователь отказался, помню до закрытия программы")
+        self._open_grid("accept", "✓ Готово: программа работает без ключа Steam. Остался один необязательный шаг.")
+
+    # --- Вход ---
+    def _start_login(self):
+        if self._login:
+            return
+        try:
+            self._login = core.SteamLogin()
+        except OSError as e:
+            self._set_login_status(f"Не удалось подготовить вход: {e}", warning=True)
+            return
+        core.log.info("Вход через Steam: открываю страницу входа во внешнем браузере")
+        self._open_login_page()
+        self.yesButton.setEnabled(False)
+        self.yesButton.setText("Жду вход в браузере…")
+        self.login_bar.show()
+        self.reopen_button.show()
+        self._set_login_status("Войдите на странице Steam — программа продолжит сама.")
+        worker = Worker(self._login.wait, lambda: self._closed, parent=self.win)
+        worker.finished.connect(self._on_login)
+        worker.failed.connect(self._on_login_failed)
+        worker.start()
+
+    def _open_login_page(self):
+        if self._login:
+            QDesktopServices.openUrl(QUrl(self._login.url()))
+
+    def _set_login_status(self, text, warning=False):
+        self.login_status.setText(text)
+        if warning:
+            self.login_status.setTextColor(*WARNING_TEXT)
+        else:
+            self.login_status.setTextColor(QColor(0, 0, 0, 160), QColor(255, 255, 255, 170))
+        self.login_status.show()
+
+    def _reset_login(self):
+        self._login = None
+        self.login_bar.hide()
+        self.reopen_button.hide()
+        self.yesButton.setEnabled(True)
+        self.yesButton.setText("Войти через Steam")
+
+    def _on_login(self, steam_id):
+        if self._closed or not steam_id:
+            return
+        self._reset_login()
+        self.raise_()
+        self.activateWindow()  # пользователь вернётся из браузера — окно уже на следующем шаге
+        if self._switch_from and steam_id == self._switch_from:
+            # Хотели сменить аккаунт, а браузер снова вошёл прежним — не идём дальше молча
+            self._pending_id = steam_id
+            self._set_login_status(f"Steam снова вошёл аккаунтом {self._who(steam_id)}: браузер всё ещё "
+                                   f"помнит его. Выйдите из него на сайте Steam и нажмите «Войти через Steam» "
+                                   f"ещё раз — или продолжайте с этим аккаунтом.", warning=True)
+            self.same_button.setText(f"Продолжить с аккаунтом {self.names.get(steam_id) or core.short_steam_id(steam_id)}")
+            self.same_button.show()
+            return
+        self._use_account(steam_id)
+
+    def _on_login_failed(self, message):
+        if self._closed:
+            return
+        self._reset_login()
+        self._set_login_status("Не получилось войти: " + message.split(": ", 1)[-1] + ".", warning=True)
+
+    # --- Ключ ---
+    def _check_key(self):
+        key = self.key_edit.text().strip()
+        if not core.STEAM_KEY_RE.fullmatch(key):
+            self._set_key_status("Ключ — это 32 знака из цифр и букв A–F. Скопируйте его со страницы целиком.",
+                                 warning=True)
+            return
+        self.yesButton.setEnabled(False)
+        self.yesButton.setText("Проверяю…")
+        self.key_bar.show()
+        self.key_status.hide()
+        worker = Worker(core.check_steam_key, key, self.steam_id, parent=self.win)
+        worker.finished.connect(lambda info: self._on_key_checked(key, info))
+        worker.failed.connect(self._on_key_failed)
+        worker.start()
+
+    def _set_key_status(self, text, warning=False):
+        self.key_status.setText(text)
+        self.key_status.setTextColor(*(WARNING_TEXT if warning else (QColor(0, 0, 0, 160), QColor(255, 255, 255, 170))))
+        self.key_status.show()
+
+    def _end_key_check(self):
+        self.key_bar.hide()
+        self.yesButton.setEnabled(True)
+        self.yesButton.setText("Проверить ключ")
+
+    def _on_key_failed(self, message):
+        if self._closed:
+            return
+        self._end_key_check()
+        self._set_key_status(message.split(": ", 1)[-1] + ".", warning=True)
+
+    def _on_key_checked(self, key, info):
+        if self._closed:
+            return
+        self._end_key_check()
+        try:
+            core.save_settings(steam_api_key=key, steam_id=self.steam_id, steam_setup="done")
+        except OSError as e:
+            self._set_key_status(f"Не удалось сохранить ключ: {e}", warning=True)
+            return
+        self.connected = True
+        core.log.info("Steam подключён: SteamID %s", core.short_steam_id(self.steam_id))
+        name = f" — {info['name']}" if info.get("name") else ""
+        self.done_title.setText(f"Steam подключён{name}")
+        if info["private"]:
+            self.done_text.setText("Ключ работает и сохранён.")
+        else:
+            # Ключ Steam Web API видит только ваши собственные игры — семейные и саундтреки Steam показывает
+            # после входа в магазин, а он предлагается уже в окне импорта
+            self.done_text.setText(
+                f"Ваших игр в Steam: {info['games']} — пока это только купленные вами. Игры семейной группы и "
+                "саундтреки появятся после входа в магазин Steam: окно импорта предложит войти («Войти и "
+                "проверить»).\n\n«Импортировать игры» — " + ("откроет окно импорта с прошлым выбором."
+                                                            if core.load_settings().get("import_done") else
+                                                            "добавить все игры или только из выбранных коллекций."))
+        if self.was_no_key:
+            self.done_text.setText(self.done_text.text() + (
+                "\n\nС ключом добавились импорт всей библиотеки и коллекций, «Синхронизировать» на вкладке "
+                "«Игры Steam» и достижения в карточке игры. Уже добавленные игры останутся."))
+        self.private_text.setVisible(info["private"])
+        self.private_button.setVisible(info["private"])
+        self._open_grid("done", f"✓ Steam подключён{name}: ключ проверен и сохранён. Остался один необязательный шаг.")
+
+    def reject(self):
+        self._closed = True  # вход в браузере, если он ещё ждёт, прекращается
+        self.grid_panel.close_panel()
+        super().reject()
 
 
 # --- Страница игры ----------------------------------------------------------
@@ -2897,6 +4603,11 @@ class AchievementRow(QWidget):
 # Русские издания с обзорами: прямой адрес обзора узнать нельзя, поэтому ищем его поиском по сайту
 REVIEW_SITES = (("StopGame", "stopgame.ru"), ("Игромания", "igromania.ru"), ("Zone of Games", "zoneofgames.ru"))
 
+# Игра уже есть на аккаунте Steam (по последней синхронизации покупок) — в магазин идут за подарком или DLC
+OWNED_STORE_TEXT = "Подарить или DLC"
+OWNED_STORE_TIP = ("Игра уже есть на вашем аккаунте Steam. На её странице в магазине можно купить её в подарок "
+                   "или докупить дополнения (DLC)")
+
 
 class GamePage(QWidget):
     """Страница выпавшей игры: шапка с фоном и логотипом, кнопки, скриншоты и трейлеры, описание.
@@ -2940,7 +4651,8 @@ class GamePage(QWidget):
         self.header = HeroHeader(self)
         self.header.playClicked.connect(self.play_trailer)
         self.header.liveRequested.connect(self._download_live)
-        self._live_url = None  # адрес живого фона открытой игры (если он есть и ещё не скачан)
+        self.header.liveKeepRequested.connect(self._keep_live)
+        self._live_urls = []  # адреса вариантов живого фона открытой игры
 
         self.play_button = PrimaryPushButton("Играть", self, FIF.PLAY)
         self.play_button.clicked.connect(self.play)
@@ -2952,17 +4664,26 @@ class GamePage(QWidget):
         self.cover_button.clicked.connect(self.home.choose_cover)
         self.store_button = PushButton("Магазин Steam", self, FIF.SHOPPING_CART)
         self.store_button.clicked.connect(self.open_store)
+        self.link_button = PrimaryPushButton("Найти в Steam", self, FIF.SEARCH)
+        self.link_button.setToolTip("Игра добавлена вручную: найдите её в магазине Steam — появятся описание, "
+                                    "скриншоты, трейлеры и установка")
+        self.link_button.clicked.connect(lambda: self.win.library_page.link_game(self.game))
         self.soundtrack_button = PushButton("Слушать саундтрек", self, FIF.MUSIC)
         self.soundtrack_button.clicked.connect(self.listen_soundtrack)
         self.soundtrack_button.hide()
         back_button = TransparentPushButton("К рулетке", self, FIF.LEFT_ARROW)
         back_button.clicked.connect(self.home.back_to_reel)
+        # Карточка одна и та же — выпала игра на рулетке или её открыли из списка, — поэтому и в список
+        # можно вернуться всегда: игра в нём будет выделена
+        library_button = TransparentPushButton("К играм Steam", self, FIF.LIBRARY)
+        library_button.setToolTip("Вернуться на вкладку «Игры Steam» — к этой игре в списке")
+        library_button.clicked.connect(self.home.back_to_library)
 
         # Кнопки по центру; в узком окне переносятся на вторую строку
         buttons_box = QWidget(self)
         buttons = CenteredFlowLayout(buttons_box, spacing=12)
-        for button in (self.play_button, self.spin_button, self.done_button, self.cover_button, self.store_button,
-                       self.soundtrack_button, back_button):
+        for button in (self.play_button, self.link_button, self.spin_button, self.done_button, self.cover_button,
+                       self.store_button, self.soundtrack_button, back_button, library_button):
             buttons.addWidget(button)
         self.buttons = buttons
 
@@ -3025,6 +4746,13 @@ class GamePage(QWidget):
         self.achievements_note = CaptionLabel("", self.achievements_box.body)
         self.achievements_note.setWordWrap(True)
         self.achievements_note.setAlignment(Qt.AlignHCenter)
+        self.privacy_button = PushButton("Открыть настройки приватности", self.achievements_box.body, FIF.LINK)
+        self.privacy_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(core.STEAM_PRIVACY_PAGE)))
+        self.privacy_button.hide()
+        self.key_button = PrimaryPushButton("Добавить ключ Steam", self.achievements_box.body, FIF.PEOPLE)
+        self.key_button.setToolTip("Мастер подключения к Steam — сразу на шаге ключа, если SteamID запомнен")
+        self.key_button.clicked.connect(lambda: self.win.run_steam_setup())
+        self.key_button.hide()
         self.achievements_list = QGridLayout()
         self.achievements_list.setHorizontalSpacing(32)
         self.achievements_list.setVerticalSpacing(14)
@@ -3032,6 +4760,8 @@ class GamePage(QWidget):
         self.achievement_columns = 0
         self.achievements_box.body_layout.addWidget(self.achievements_progress, 0, Qt.AlignHCenter)
         self.achievements_box.body_layout.addWidget(self.achievements_note)
+        self.achievements_box.body_layout.addWidget(self.privacy_button, 0, Qt.AlignHCenter)
+        self.achievements_box.body_layout.addWidget(self.key_button, 0, Qt.AlignHCenter)
         self.achievements_box.body_layout.addSpacing(6)
         self.achievements_box.body_layout.addLayout(self.achievements_list)
 
@@ -3072,8 +4802,8 @@ class GamePage(QWidget):
     def show_game(self, game):
         self.stop_video()
         self._token += 1
-        self.game = game
-        self._live_url = None
+        previous, self.game = self.game, game
+        self._live_urls = []
         # Замер: когда страница на экране, когда пришли фон и описание (по ним видно, что ждёт пользователь)
         self.timing = Timing(f"карточка «{game['name']}»")
         self._waiting = {"фон", "описание"} if game.get("appid") else {"фон"}
@@ -3088,6 +4818,10 @@ class GamePage(QWidget):
         self.thumbs = []
         self.trailer_sources = []
         self.header.set_game(game["name"])
+        if previous and previous is not game:
+            # Ушли с игры, не выбрав вариант живого фона, — просмотренные варианты больше не нужны.
+            # Шапка уже отпустила файл, удаляем в фоне
+            Worker(core.discard_animated_variants, dict(previous), parent=self).start()
         self.backdrop = None
         self.backdrop_anim.stop()
         self.update()
@@ -3101,7 +4835,7 @@ class GamePage(QWidget):
         self.update_buttons()
         self.scroll.verticalScrollBar().setValue(0)
 
-        key = core.read_text(core.API_KEY_FILE)
+        key = core.griddb_key()
         for kind in core.ART_KINDS:
             self._run(core.get_artwork, (dict(game), kind, key), lambda path, k=kind: self._on_art(k, path))
         self._run(core.find_animated_hero, (dict(game), key), self._on_animated_hero)
@@ -3118,8 +4852,9 @@ class GamePage(QWidget):
             self._run(core.get_achievements, (game["appid"], settings["steam_api_key"], settings["steam_id"]),
                       self._on_achievements, self._on_achievements_failed)
         else:
-            self._show_without_details("Игра добавлена вручную, без Steam ID, — описания и скриншотов "
-                                       "из магазина Steam для неё нет.")
+            self._show_without_details("Игра добавлена вручную, без связи со Steam. Нажмите «Найти в Steam» — "
+                                       "программа найдёт её в магазине, и здесь появятся описание, скриншоты "
+                                       "и трейлеры.")
         timing = self.timing
         QTimer.singleShot(0, lambda: timing.mark("на экране"))  # сработает, когда страница нарисована
 
@@ -3157,37 +4892,59 @@ class GamePage(QWidget):
         """У игры есть живой фон в SteamGridDB — в шапке появляется значок. Качается он по нажатию."""
         if not info:
             return
-        self._live_url = info["url"]
-        if not self.header.show_live(info["path"]):
+        self._live_urls = info["urls"]
+        if not self.header.show_live(info["path"], len(info["urls"]), info["chosen"]):
             core.log.warning("Живой фон %s не открылся (нет поддержки WebP в Qt?) — значок не показываю",
                              info["path"])
 
-    def _download_live(self):
-        """Нажали значок живого фона — качаем его в фоне, ход загрузки рисуется кольцом на значке."""
-        token, game, url = self._token, dict(self.game), self._live_url
+    def _download_live(self, index):
+        """Нужен вариант живого фона номер index — качаем его в фоне, ход загрузки рисуется кольцом на значке.
+        Уже скачанный вариант откроется сразу."""
+        token, game = self._token, dict(self.game)
+        url = self._live_urls[index] if 0 <= index < len(self._live_urls) else None
         if not url:
             self.header.live_failed()
             return
         relay = ProgressRelay(self)
         relay.progress.connect(lambda _text, percent: token == self._token and self.header.set_live_progress(percent))
-        worker = Worker(core.download_animated_hero, game, url, lambda percent: relay.report("", percent),
+        worker = Worker(core.download_animated_hero, game, index, url, lambda percent: relay.report("", percent),
                         lambda: token != self._token, parent=self)
-        worker.finished.connect(lambda path: token == self._token and self._on_live_downloaded(path))
+        worker.finished.connect(lambda path: token == self._token and self._on_live_downloaded(path, index))
         worker.failed.connect(lambda message: token == self._token and self._on_live_failed(message))
         worker.finished.connect(relay.deleteLater)
         worker.failed.connect(relay.deleteLater)
         worker.start()
 
-    def _on_live_downloaded(self, path):
+    def _on_live_downloaded(self, path, index):
+        first = self.header.live_path is None  # первый скачанный вариант сразу становится выбранным
         if not path:
             self.header.live_failed()
-        elif not self.header.live_ready(path):
+        elif not self.header.live_ready(path, index, chosen=index if first else None):
             core.log.warning("Живой фон %s не открылся (нет поддержки WebP в Qt?)", path)
             notify("warning", self.win, "Живой фон не открылся", "Остаётся обычный фон.")
 
     def _on_live_failed(self, message):
         self.header.live_failed()
         notify("warning", self.win, "Не удалось скачать живой фон", message)
+
+    def _keep_live(self, index):
+        """✓ — оставить этот вариант живого фона, остальные просмотренные удалить с диска."""
+        token, game = self._token, dict(self.game)
+        self.header.release_live()  # файл сейчас переименуется — Qt должен его отпустить
+        worker = Worker(core.keep_animated_hero, game, index, parent=self)
+        worker.finished.connect(lambda result: token == self._token and self._on_live_kept(result, index))
+        worker.failed.connect(lambda message: token == self._token and self._on_keep_failed(message))
+        worker.start()
+
+    def _on_live_kept(self, result, index):
+        self.header.live_ready(result["path"], index, chosen=index)
+        freed = f" Освободилось {disk_size_text(result['freed'])}." if result["freed"] >= 1024 ** 2 else ""
+        notify("success", self.win, "Живой фон сохранён",
+               f"Вариант {index + 1} из {len(self._live_urls)}. Остальные просмотренные удалены.{freed}")
+
+    def _on_keep_failed(self, message):
+        self.header.live_ready(self.header.live_path, self.header.live_index)  # остаёмся на том же варианте
+        notify("warning", self.win, "Не удалось сохранить живой фон", message)
 
     # --- Размытая подложка под всей страницей ---
     def _on_backdrop(self, path):
@@ -3259,7 +5016,7 @@ class GamePage(QWidget):
         self.about_text.setVisible(bool(about))
         self.translated_note.setText("Описание переведено автоматически")
         self.translated_note.setVisible(bool(details.get("translated")))
-        if core.needs_translation(details):
+        if core.needs_translation(details) and core.translation_enabled():
             # Сначала показываем оригинал, перевод подставим, когда переводчик ответит
             self.translated_note.setText("Перевожу описание на русский…")
             self.translated_note.show()
@@ -3352,6 +5109,8 @@ class GamePage(QWidget):
         self.achievement_rows = []
         self.achievement_columns = 0
         clear_layout(self.achievements_list)
+        self.privacy_button.hide()
+        self.key_button.hide()
         self.achievements_box.set_expanded(False)
         self.achievements_box.hide()
 
@@ -3363,8 +5122,10 @@ class GamePage(QWidget):
             self.achievements_box.set_title("Достижения")
             self.achievements_progress.hide()
             self.achievements_note.setText(data["error"])
+            self.key_button.setVisible(bool(data.get("no_key")))
             return
         self.achievements = data
+        self.privacy_button.setVisible(bool(data.get("private")))
         total, unlocked = len(data["items"]), data["unlocked"]
         self.chip_values["achievements"] = ("Достижения", f"{unlocked} из {total}" if unlocked is not None
                                             else str(total), None)
@@ -3488,6 +5249,11 @@ class GamePage(QWidget):
         installed = bool(appid) and core.is_installed(appid)
         self.play_button.setVisible(bool(appid))
         self.store_button.setVisible(bool(appid))
+        self.link_button.setVisible(bool(self.game) and not appid)
+        owned = bool(appid) and self.win.owns(appid)
+        self.store_button.setText(OWNED_STORE_TEXT if owned else "Магазин Steam")
+        self.store_button.setIcon(FIF.HEART if owned else FIF.SHOPPING_CART)
+        self.store_button.setToolTip(OWNED_STORE_TIP if owned else "Страница игры в магазине Steam")
         self.play_button.setText("Играть" if installed else "Установить")
         self.play_button.setIcon(FIF.PLAY if installed else FIF.DOWNLOAD)
         music_page = getattr(self.win, "music_page", None)
@@ -3560,7 +5326,7 @@ class LinkDialog(MessageBoxBase):
         text.setWordWrap(True)
         self.viewLayout.addWidget(text)
         self.remember_box = CheckBox("Больше не спрашивать", self)
-        self.remember_box.setToolTip("Поменять выбор можно в «Настройках» → «Ссылки»")
+        self.remember_box.setToolTip("Поменять выбор можно в «Настройках» → «Встроенный браузер»")
         self.viewLayout.addSpacing(4)
         self.viewLayout.addWidget(self.remember_box)
         self.widget.setMinimumWidth(460)
@@ -3585,6 +5351,21 @@ class WebView(QWebEngineView if QWebEngineView else QWidget):
         return self
 
 
+if QWebEngineView:
+    class StorePage(QWebEnginePage):
+        """Страница встроенного браузера. Ссылки steam:// («Установить» в магазине) Qt сам отдаёт Windows прямо
+        в потоке окна — пока Steam откликается, окно висит до 15–30 секунд. Поэтому такие ссылки перехватываем:
+        программа сама передаёт их в Steam в фоне — и только безопасные команды (MainWindow.open_steam_link)."""
+
+        steamLink = Signal(QUrl)
+
+        def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+            if url.scheme().lower() == "steam":
+                self.steamLink.emit(QUrl(url))
+                return False
+            return super().acceptNavigationRequest(url, nav_type, is_main_frame)
+
+
 _web_profile = None
 
 
@@ -3607,7 +5388,8 @@ def web_profile(widget):
 
 
 class BrowserPage(QWidget):
-    """Встроенный браузер на всю рабочую область — третий экран после рулетки и карточки игры.
+    """Встроенный браузер на всю рабочую область: третий экран после рулетки и карточки игры,
+    а с standalone — отдельная вкладка «Браузер» со строкой адреса и поиска.
 
     Движок браузера создаётся при запуске программы (см. preload). Куки и кэш сайтов хранятся
     в cache/web — второй раз страницы открываются быстрее, согласие на куки не спрашивают заново.
@@ -3615,13 +5397,17 @@ class BrowserPage(QWidget):
 
     backRequested = Signal()
     MUSIC_SPACE = 286  # справа поверх лежит мини-плеер
+    HOME_URL = "https://store.steampowered.com/"
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, standalone=False):
         super().__init__(parent)
         self.view = None
+        self.standalone = standalone
+        self._checkout_warned = False
 
         self.return_button = PrimaryPushButton("К карточке", self, FIF.RETURN)
         self.return_button.clicked.connect(self.backRequested)
+        self.return_button.setVisible(not standalone)
         outside = TransparentPushButton("Во внешнем браузере", self, FIF.GLOBE)
         outside.clicked.connect(self.open_outside)
         self.back_button = TransparentToolButton(FIF.LEFT_ARROW, self)
@@ -3630,8 +5416,19 @@ class BrowserPage(QWidget):
         self.forward_button.setToolTip("Вперёд")
         reload = TransparentToolButton(FIF.SYNC, self)
         reload.setToolTip("Обновить")
+        home = TransparentToolButton(FIF.HOME, self)
+        home.setToolTip("Магазин Steam")
+        home.clicked.connect(lambda: self.open(self.HOME_URL))
+        home.setVisible(standalone)
         self.title_label = StrongBodyLabel("", self)
         self.title_label.setMinimumWidth(80)
+        # Строка адреса и поиска — только на вкладке «Браузер»: со страницы игры открываются её ссылки
+        self.address = LineEdit(self)
+        self.address.setClearButtonEnabled(True)
+        self.address.setPlaceholderText("Адрес сайта или поиск в Google — и Enter")
+        self.address.returnPressed.connect(self._go)
+        self.address.setVisible(standalone)
+        self.title_label.setVisible(not standalone)
         self.bar = ProgressBar(self)
         self.bar.setFixedHeight(3)
         self.bar.hide()
@@ -3640,13 +5437,19 @@ class BrowserPage(QWidget):
         toolbar.setContentsMargins(20, 12, self.MUSIC_SPACE, 8)
         toolbar.setSpacing(6)
         toolbar.addWidget(self.return_button)
-        toolbar.addWidget(outside)
-        toolbar.addSpacing(8)
+        if not standalone:  # у карточки — как раньше: возврат и внешний браузер слева
+            toolbar.addWidget(outside)
+            toolbar.addSpacing(8)
         toolbar.addWidget(self.back_button)
         toolbar.addWidget(self.forward_button)
         toolbar.addWidget(reload)
+        toolbar.addWidget(home)
         toolbar.addSpacing(8)
         toolbar.addWidget(self.title_label, 1)
+        toolbar.addWidget(self.address, 1)
+        if standalone:  # на вкладке слева навигация, по центру адрес, справа внешний браузер
+            toolbar.addSpacing(8)
+            toolbar.addWidget(outside)
 
         self.page_box = QVBoxLayout(self)
         self.page_box.setContentsMargins(0, 0, 0, 0)
@@ -3671,7 +5474,9 @@ class BrowserPage(QWidget):
         if self.view:
             return
         self.view = WebView(parent or self)
-        self.view.setPage(QWebEnginePage(web_profile(self), self.view))
+        page = StorePage(web_profile(self), self.view)
+        page.steamLink.connect(self._on_steam_link)
+        self.view.setPage(page)
         self.view.titleChanged.connect(self._on_title)
         self.view.urlChanged.connect(self._update_nav)
         self.view.loadStarted.connect(lambda: (self.bar.setValue(0), self.bar.show()))
@@ -3681,9 +5486,14 @@ class BrowserPage(QWidget):
         self.forward_button.clicked.connect(self.view.forward)
         self._reload.clicked.connect(self.view.reload)
 
+    def _on_steam_link(self, url):
+        window = self.window()
+        if hasattr(window, "open_steam_link"):
+            window.open_steam_link(url)
+
     def open(self, url, back_text="К карточке"):
         self._ensure_view()
-        if self.view.parentWidget() is not self:  # заготовка с запуска — переносим на страницу
+        if self.page_box.indexOf(self.view) < 0:  # заготовка с запуска или новый движок — ставим на страницу
             self.page_box.addWidget(self.view, 1)
             self.view.show()
         self.return_button.setText(back_text)
@@ -3711,6 +5521,39 @@ class BrowserPage(QWidget):
         history = self.view.history() if self.view else None
         self.back_button.setEnabled(bool(history and history.canGoBack()))
         self.forward_button.setEnabled(bool(history and history.canGoForward()))
+        url = self.view.url() if self.view else QUrl()
+        if self.standalone and not self.address.hasFocus() and url.scheme() in ("http", "https"):
+            self.address.setText(url.toString())
+            self.address.setCursorPosition(0)
+        self._warn_checkout(url)
+
+    def _warn_checkout(self, url):
+        """Дошли до оплаты в магазине Steam — советуем платить не во встроенном браузере.
+
+        Встроенный браузер — часть программы, а программа с открытым кодом может оказаться чужой
+        изменённой копией. Данные карты безопаснее вводить там, где программа их точно не видит.
+        """
+        if self._checkout_warned or not url.host().endswith("steampowered.com"):
+            return
+        if not url.path().startswith("/checkout"):
+            return
+        self._checkout_warned = True
+        core.log.info("Встроенный браузер: открыта оплата в магазине Steam — советую клиент Steam или внешний браузер")
+        notify("warning", self.window(), "Оплату лучше завершить вне программы",
+               "Данные карты безопаснее вводить в клиенте Steam или в обычном браузере — нажмите "
+               "«Во внешнем браузере». При оплате кошельком Steam данные карты не нужны.", 12000)
+
+    def _go(self):
+        """Адрес из строки: похож на сайт — открываем его, иначе ищем в Google."""
+        text = self.address.text().strip()
+        if not text:
+            return
+        if " " not in text and "." in text:
+            url = QUrl.fromUserInput(text)
+        else:
+            url = QUrl(f"https://www.google.com/search?q={quote_plus(text)}")
+        self.address.clearFocus()
+        self.open(url.toString())
 
     def hideEvent(self, event):
         super().hideEvent(event)
@@ -3722,6 +5565,48 @@ class BrowserPage(QWidget):
         super().showEvent(event)
         if self.view:
             self.view.page().setAudioMuted(False)
+
+
+class WebPage(QWidget):
+    """Вкладка «Браузер»: встроенный браузер со строкой адреса, чтобы быстро что-то найти, не открывая
+    карточку игры. Профиль браузера общий с карточкой: вход в магазин Steam один на оба.
+
+    Свой движок создаётся при первом открытии вкладки — окно к этому времени уже работает через видеокарту
+    (браузер карточки создан при запуске), поэтому мигания нет.
+    """
+
+    def __init__(self, window):
+        super().__init__()
+        self.setObjectName("webPage")
+        self.win = window
+        self.browser = BrowserPage(self, standalone=True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.browser)
+        # Мини-плеер поверх, в правом верхнем углу — как на рулетке и в браузере карточки
+        self.mini_player = MiniPlayer(window, self)
+        self.mini_player.sizeChanged.connect(self._place_music_buttons)
+        window.music.trackChanged.connect(lambda: QTimer.singleShot(0, self._place_music_buttons))
+
+    def open(self, url):
+        self.browser.open(url)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self.browser.view:
+            self.browser.open(BrowserPage.HOME_URL)
+        QTimer.singleShot(0, self._place_music_buttons)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._place_music_buttons()
+
+    def _place_music_buttons(self):
+        right = HomePage.MARGINS[2]
+        size = self.mini_player.sizeHint()
+        y = 12 + max(0, (self.browser.address.sizeHint().height() - size.height()) // 2)  # на линии строки адреса
+        self.mini_player.setGeometry(self.width() - right - size.width(), y, size.width(), size.height())
+        self.mini_player.raise_()
 
 
 class FilmBackdrop(QWidget):
@@ -3885,6 +5770,7 @@ class HomePage(QWidget):
         # и над фоном рулетки, и над шапкой страницы игры, и над браузером
         self.title = TitleLabel("Во что сыграть дальше?", self)
         self.mini_player = MiniPlayer(self.win, self)
+        self.mini_player.sizeChanged.connect(self._place_music_buttons)  # раскрылся — встаёт у правого края
         # Кнопки «назад/вперёд» появляются и прячутся — ставим плеер на место, когда он уже обновился
         self.win.music.trackChanged.connect(lambda: QTimer.singleShot(0, self._place_music_buttons))
         self.count_label = CaptionLabel("", self)
@@ -3924,8 +5810,22 @@ class HomePage(QWidget):
         self.update_count()
         self.update_buttons()
 
+    NOTE_MS = 12000  # столько висит итог импорта над загрузкой обложек, потом исчезает
+
     def _build_loading_view(self):
         view = QWidget()
+        # Итог импорта — здесь, а не всплывающим уведомлением: оно легло бы поверх этих надписей.
+        # Ширина фиксированная: с переносом строк и выравниванием по центру Qt иначе даёт надписи высоту
+        # одной строки, и текст обрезался («Импорт завершён. Подходит под»)
+        self.loading_note = BodyLabel("", view)
+        self.loading_note.setTextColor(themeColor(), themeColor())
+        self.loading_note.setAlignment(Qt.AlignCenter)
+        self.loading_note.setWordWrap(True)
+        self.loading_note.setFixedWidth(560)
+        self.loading_note.hide()
+        self.note_timer = QTimer(self)
+        self.note_timer.setSingleShot(True)
+        self.note_timer.timeout.connect(lambda: self.set_loading_note(""))
         title = SubtitleLabel("Подготавливаем обложки", view)
         text = BodyLabel("Скачиваем картинки для ваших игр, чтобы барабан крутился красиво.\n"
                          "Это нужно один раз — дальше обложки берутся с диска.", view)
@@ -3933,16 +5833,16 @@ class HomePage(QWidget):
         self.progress_bar = ProgressBar(view)
         self.progress_bar.setFixedWidth(420)
         self.progress_label = CaptionLabel("", view)
-        skip = PushButton("Пропустить", view, FIF.RIGHT_ARROW)
-        skip.clicked.connect(self.show_reel)
+        # «Пропустить» здесь нет: без обложек барабан и плитка выглядят пустыми, а загрузка идёт один раз.
+        # Карточки игр и другие вкладки открываются и во время неё
 
         layout = QVBoxLayout(view)
         layout.setSpacing(14)
         layout.addStretch(1)
+        layout.addWidget(self.loading_note, 0, Qt.AlignHCenter)
+        layout.addSpacing(10)
         for widget in (title, text, self.progress_bar, self.progress_label):
             layout.addWidget(widget, 0, Qt.AlignHCenter)
-        layout.addSpacing(8)
-        layout.addWidget(skip, 0, Qt.AlignHCenter)
         layout.addStretch(1)
         return view
 
@@ -4046,7 +5946,16 @@ class HomePage(QWidget):
             return
         self._set_view(self.loading_view)
 
+    def set_loading_note(self, text):
+        """Строка над «Подготавливаем обложки» — например, итог импорта. Сама уходит через NOTE_MS. Пусто — убрать."""
+        self.note_timer.stop()
+        self.loading_note.setText(text)
+        self.loading_note.setVisible(bool(text))
+        if text:
+            self.note_timer.start(self.NOTE_MS)
+
     def show_reel(self):
+        self.set_loading_note("")
         if self.stack.currentWidget() is self.reel_view:
             return
         if self.current is None:
@@ -4056,6 +5965,14 @@ class HomePage(QWidget):
 
     def back_to_reel(self):
         self.show_reel()
+
+    def back_to_library(self):
+        """С карточки — на вкладку «Игры Steam», к этой игре. Карточка остаётся открытой на «Рулетке»."""
+        game = self.game_page.game
+        self.game_page.stop_video()
+        self.win.switchTo(self.win.library_page)
+        if game:
+            self.win.library_page.reveal(game)
 
     def open_game(self, game):
         """Страница игры — после прокрутки или из списка игр."""
@@ -4119,7 +6036,7 @@ class HomePage(QWidget):
         if self.reel.is_spinning():
             return
         if not games:
-            notify("warning", self.win, "Список пуст", "Добавьте игры на вкладке «Игры».")
+            notify("warning", self.win, "Список пуст", "Добавьте игры на вкладке «Игры Steam».")
             return
         # Не выдаём ту же игру два раза подряд
         candidates = [g for g in games if g is not self.current] or games
@@ -4162,24 +6079,168 @@ class HomePage(QWidget):
         notify("success", self.win, "Отличная работа!", f"«{name}» убрана из списка.")
 
     def choose_cover(self):
-        if not self.current:
-            return
-        path, _ = QFileDialog.getOpenFileName(self, "Выберите обложку", "",
-                                              "Изображения (*.png *.jpg *.jpeg *.webp)")
-        if not path:
-            return
-        try:
-            with open(path, "rb") as f:
-                core.save_cover_bytes(self.current["name"], f.read())
-        except OSError as e:
-            notify("error", self.win, "Не удалось сохранить обложку", str(e))
-            return
-        self.reel.refresh_cover(self.current["name"])
-        notify("success", self.win, "Обложка сохранена")
+        if self.current:
+            self.win.library_page.choose_cover(self.current)
 
 
 # --- Страница «Игры» --------------------------------------------------------
+class CoverThumbs(QObject):
+    """Уменьшенные обложки для плитки на вкладке «Игры». Читаются с диска в фоновом потоке, по мере того как
+    плитки появляются на экране, и хранятся в памяти не больше LIMIT штук: 800 полноразмерных обложек
+    заняли бы сотни мегабайт. get() → QPixmap, None (обложки нет) или LOADING (ещё читается)."""
+
+    LOADING = object()
+    LIMIT = 500
+    QUEUE_LIMIT = 120  # прокрутили далеко — старые просьбы уже не нужны
+    _loaded = Signal(str, object)  # название, QImage или None — из фонового потока
+
+    def __init__(self, size, parent=None):
+        super().__init__(parent)
+        self.size = size  # размер обложки на плитке в точках экрана
+        self.ratio = 1.0
+        self.updated = None  # что вызвать, когда обложка готова (перерисовать плитку)
+        self._cache = OrderedDict()
+        self._lock = threading.Lock()
+        self._queue, self._queued = [], set()
+        self._running = False
+        self._loaded.connect(self._on_loaded)
+
+    def get(self, name):
+        if name in self._cache:
+            self._cache.move_to_end(name)
+            return self._cache[name]
+        with self._lock:
+            if name not in self._queued:
+                self._queued.add(name)
+                self._queue.append(name)
+                for old in self._queue[:-self.QUEUE_LIMIT]:
+                    self._queued.discard(old)
+                del self._queue[:-self.QUEUE_LIMIT]
+            if self._running:
+                return self.LOADING
+            self._running = True
+        threading.Thread(target=self._run, daemon=True).start()
+        return self.LOADING
+
+    def forget(self, name):
+        """Обложка игры сменилась — перечитать её с диска."""
+        self._cache.pop(name, None)
+
+    def clear(self):
+        self._cache.clear()
+
+    def _run(self):
+        width, height = round(self.size.width() * self.ratio), round(self.size.height() * self.ratio)
+        while True:
+            with self._lock:
+                if not self._queue:
+                    self._running = False
+                    return
+                name = self._queue.pop()  # последние просьбы — то, что сейчас на экране
+                self._queued.discard(name)
+            path = core.find_cover(name)
+            image = QImage(path) if path else None
+            if image is not None and image.isNull():
+                image = None
+            if image is not None:
+                image = image.scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            try:
+                self._loaded.emit(name, image)
+            except RuntimeError:
+                return  # программу закрыли
+
+    def _on_loaded(self, name, image):
+        pixmap = None
+        if image is not None:
+            pixmap = QPixmap.fromImage(image)
+            pixmap.setDevicePixelRatio(self.ratio)
+        self._cache[name] = pixmap
+        while len(self._cache) > self.LIMIT:
+            self._cache.popitem(last=False)
+        if self.updated:
+            self.updated()
+
+
+class CoverTileDelegate(QStyledItemDelegate):
+    """Плитка игры: обложка со скруглёнными углами и название под ней. Выбранные — в рамке цвета темы."""
+
+    COVER = QSize(132, 198)
+    PAD = 8
+    TEXT_H = 38  # две строки названия
+
+    def __init__(self, thumbs, parent=None):
+        super().__init__(parent)
+        self.thumbs = thumbs
+
+    def sizeHint(self, option, index):
+        return QSize(self.COVER.width() + 2 * self.PAD, self.COVER.height() + self.TEXT_H + 2 * self.PAD)
+
+    def paint(self, painter, option, index):
+        name = index.data(Qt.UserRole) or ""
+        dark = isDarkTheme()
+        selected = bool(option.state & QStyle.State_Selected)
+        hover = bool(option.state & QStyle.State_MouseOver)
+        rect = QRectF(option.rect)
+        painter.save()
+        painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        if selected or hover:
+            painter.setPen(Qt.NoPen)
+            alpha = (22 if selected else 12) if dark else (14 if selected else 8)
+            painter.setBrush(QColor(255, 255, 255, alpha) if dark else QColor(0, 0, 0, alpha))
+            painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 10, 10)
+
+        cover = QRectF(rect.x() + (rect.width() - self.COVER.width()) / 2, rect.y() + self.PAD,
+                       self.COVER.width(), self.COVER.height())
+        path = QPainterPath()
+        path.addRoundedRect(cover, 8, 8)
+        pixmap = self.thumbs.get(name)
+        painter.save()
+        painter.setClipPath(path)
+        if isinstance(pixmap, QPixmap):
+            painter.drawPixmap(cover, pixmap, QRectF(pixmap.rect()))
+        else:
+            painter.fillRect(cover, QColor(255, 255, 255, 22) if dark else QColor(0, 0, 0, 14))
+            if pixmap is None:  # обложки нет — название на карточке, как на барабане
+                painter.setPen(QColor(255, 255, 255, 200) if dark else QColor(0, 0, 0, 180))
+                font = QFont(option.font)
+                font.setBold(True)
+                painter.setFont(font)
+                painter.drawText(cover.adjusted(10, 10, -10, -10), Qt.AlignCenter | Qt.TextWordWrap, name)
+        painter.restore()
+        painter.setBrush(Qt.NoBrush)
+        if selected:
+            painter.setPen(QPen(themeColor(), 3))
+            painter.drawRoundedRect(cover.adjusted(-1.5, -1.5, 1.5, 1.5), 9, 9)
+        else:
+            painter.setPen(QPen(QColor(255, 255, 255, 40) if dark else QColor(0, 0, 0, 30), 1))
+            painter.drawPath(path)
+
+        # Название — до двух строк под обложкой, не влезло — многоточие
+        text_rect = QRectF(rect.x() + 4, cover.bottom() + 6, rect.width() - 8, self.TEXT_H - 6)
+        painter.setFont(option.font)
+        painter.setPen(QColor(255, 255, 255, 230) if dark else QColor(0, 0, 0, 220))
+        painter.drawText(text_rect, Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap,
+                         two_lines(name, QFontMetrics(option.font), round(text_rect.width())))
+        painter.restore()
+
+
+def two_lines(text, metrics, width):
+    """Текст в две строки по ширине: что не влезло во вторую — многоточием."""
+    words, first = text.split(), ""
+    while words and metrics.horizontalAdvance((first + " " + words[0]).strip()) <= width:
+        first = (first + " " + words.pop(0)).strip()
+    if not first:  # первое слово длиннее строки
+        return metrics.elidedText(text, Qt.ElideRight, width)
+    rest = " ".join(words)
+    return first + ("\n" + metrics.elidedText(rest, Qt.ElideRight, width) if rest else "")
+
+
 class LibraryPage(QWidget):
+    """Вкладка «Игры»: список игр — строками или плиткой с обложками (выбор запоминается). Поиск, правый
+    клик (запуск, магазин, обложка, удаление), выделение нескольких игр и двойной клик — запуск — в обоих видах."""
+
+    VIEWS = ("list", "grid")
+
     def __init__(self, window):
         super().__init__()
         self.setObjectName("libraryPage")
@@ -4192,10 +6253,52 @@ class LibraryPage(QWidget):
         self.search.textChanged.connect(self.refresh)
 
         self.list = ListWidget(self)
-        self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.list.customContextMenuRequested.connect(self.show_menu)
-        self.list.itemDoubleClicked.connect(lambda item: self.win.launch_game(self.game_of(item)))
+        self.thumbs = CoverThumbs(CoverTileDelegate.COVER, self)
+        self.grid = QListWidget(self)
+        self.grid.setViewMode(QListView.IconMode)
+        self.grid.setResizeMode(QListView.Adjust)  # плитки переносятся по ширине окна
+        self.grid.setMovement(QListView.Static)
+        self.grid.setUniformItemSizes(True)
+        self.grid.setSpacing(4)
+        self.grid.setFrameShape(QFrame.NoFrame)
+        self.grid.setMouseTracking(True)  # подсветка плитки под мышью
+        self.grid.viewport().setMouseTracking(True)
+        self.grid.viewport().setAttribute(Qt.WA_Hover)
+        self.grid.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.grid.verticalScrollBar().setSingleStep(30)
+        self.grid.setItemDelegate(CoverTileDelegate(self.thumbs, self.grid))
+        self.grid.setStyleSheet("QListWidget {background: transparent; border: none; outline: none}")
+        if SmoothScrollDelegate:
+            self._grid_scroll = SmoothScrollDelegate(self.grid)  # полосы прокрутки как у остальных списков
+        self.thumbs.updated = self.grid.viewport().update
+        for view in (self.list, self.grid):
+            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            view.setContextMenuPolicy(Qt.CustomContextMenu)
+            view.customContextMenuRequested.connect(lambda pos, v=view: self.show_menu(v, pos))
+            view.itemDoubleClicked.connect(lambda item: self.win.launch_game(self.game_of(item)))
+            view.viewport().installEventFilter(self)  # клик мимо игр — снять выделение
+        # Esc снимает выделение (а в строке поиска — сначала стирает поиск)
+        escape = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        escape.setContext(Qt.WidgetWithChildrenShortcut)
+        escape.activated.connect(self._on_escape)
+        self.views = QStackedWidget(self)
+        self.views.addWidget(self.list)
+        self.views.addWidget(self.grid)
+
+        # Вид — двумя кнопками справа от поиска
+        self.list_button = TransparentToggleToolButton(FIF.MENU, self)
+        self.list_button.setToolTip("Списком")
+        self.list_button.clicked.connect(lambda: self.set_view("list"))
+        self.grid_button = TransparentToggleToolButton(FIF.PHOTO, self)
+        self.grid_button.setToolTip("Плиткой с обложками — сразу видно, у каких игр обложки нет или она не та. "
+                                    "Правый клик по игре → своя обложка или обложка из SteamGridDB")
+        self.grid_button.clicked.connect(lambda: self.set_view("grid"))
+        search_row = QHBoxLayout()
+        search_row.setSpacing(6)
+        search_row.addWidget(self.search, 1)
+        search_row.addSpacing(6)
+        search_row.addWidget(self.list_button)
+        search_row.addWidget(self.grid_button)
 
         self.import_button = PrimaryPushButton("Импорт из Steam", self, FIF.DOWNLOAD)
         self.import_button.clicked.connect(self.import_from_steam)
@@ -4203,7 +6306,7 @@ class LibraryPage(QWidget):
         self.sync_button.setToolTip("Повторить импорт с прошлым выбором коллекций — без окна настроек")
         self.sync_button.clicked.connect(self.quick_sync)
         self.add_button = PushButton("Добавить", self, FIF.ADD)
-        self.add_button.clicked.connect(self.add_games)
+        self.add_button.clicked.connect(lambda: self.add_games())
         self.delete_button = PushButton("Удалить выбранные", self, FIF.DELETE)
         self.delete_button.clicked.connect(self.delete_selected)
         self.clear_button = PushButton("Очистить список", self, FIF.BROOM)
@@ -4216,6 +6319,7 @@ class LibraryPage(QWidget):
         buttons.addStretch(1)
         buttons.addWidget(self.clear_button)
         self._quick = False
+        self._had_token = False  # при последней загрузке был вход в магазин Steam (семейная группа проверялась)
         self.set_import_busy(False)
 
         layout = QVBoxLayout(self)
@@ -4223,23 +6327,84 @@ class LibraryPage(QWidget):
         layout.setSpacing(12)
         layout.addWidget(self.title)
         layout.addWidget(self.count_label)
-        layout.addWidget(self.search)
-        layout.addWidget(self.list, 1)
+        layout.addLayout(search_row)
+        layout.addWidget(self.views, 1)
         layout.addLayout(buttons)
 
         self.win.libraryChanged.connect(self.refresh)
+        self.win.covers.coverReady.connect(self.cover_changed)
         self.refresh()
+        view = core.load_settings().get("library_view", "list")
+        self.set_view(view if view in self.VIEWS else "list", save=False)
+
+    def set_view(self, view, save=True):
+        self.views.setCurrentWidget(self.grid if view == "grid" else self.list)
+        self.list_button.setChecked(view == "list")
+        self.grid_button.setChecked(view == "grid")
+        if save:
+            core.save_settings(library_view=view)
+            core.log.info("Вкладка «Игры Steam»: вид — %s", "плиткой" if view == "grid" else "списком")
+
+    def current_view(self):
+        return self.views.currentWidget()
+
+    # --- Выделение ---
+    def clear_selection(self):
+        for view in (self.list, self.grid):
+            view.clearSelection()
+
+    def _on_escape(self):
+        if self.search.hasFocus() and self.search.text():
+            self.search.clear()
+            return
+        self.clear_selection()
+        self.current_view().setFocus()
+
+    def eventFilter(self, obj, event):
+        # Клик левой кнопкой по пустому месту списка или плитки (без Ctrl и Shift) — выделение снимается
+        if (event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton
+                and not event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)):
+            view = self.list if obj is self.list.viewport() else self.grid if obj is self.grid.viewport() else None
+            if view is not None and view.itemAt(event.position().toPoint()) is None:
+                view.clearSelection()
+        return super().eventFilter(obj, event)
+
+    def mousePressEvent(self, event):
+        # Клик по самой вкладке — мимо списка, кнопок и поиска
+        if event.button() == Qt.LeftButton:
+            self.clear_selection()
+        super().mousePressEvent(event)
+
+    def reveal(self, game):
+        """Вернулись с карточки игры — игра выделена и видна в списке, откуда её открыли."""
+        view = self.current_view()
+        for row in range(view.count()):
+            item = view.item(row)
+            if item.data(Qt.UserRole) == game["name"]:
+                view.clearSelection()
+                item.setSelected(True)
+                view.setCurrentItem(item)
+                view.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                break
+        view.setFocus()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        ratio = self.devicePixelRatioF()
+        if ratio != self.thumbs.ratio:  # окно перенесли на экран с другим масштабом — обложки резче
+            self.thumbs.ratio = ratio
+            self.thumbs.clear()
 
     def game_of(self, item):
-        return self.win.library.find(item.text()) if item else None
+        return self.win.library.find(item.data(Qt.UserRole) or item.text()) if item else None
 
-    def show_menu(self, pos):
-        item = self.list.itemAt(pos)
+    def show_menu(self, view, pos):
+        item = view.itemAt(pos)
         game = self.game_of(item)
         if not game:
             return
         if not item.isSelected():
-            self.list.clearSelection()
+            view.clearSelection()
             item.setSelected(True)
 
         menu = RoundMenu(parent=self)
@@ -4248,38 +6413,151 @@ class LibraryPage(QWidget):
             installed = core.is_installed(appid)
             launch = Action(FIF.PLAY if installed else FIF.DOWNLOAD, "Играть" if installed else "Установить", menu)
             launch.triggered.connect(lambda: self.win.launch_game(game))
-            store = Action(FIF.SHOPPING_CART, "Открыть в магазине Steam", menu)
+            owned = self.win.owns(appid)
+            store = Action(FIF.HEART if owned else FIF.SHOPPING_CART,
+                           OWNED_STORE_TEXT if owned else "Открыть в магазине Steam", menu)
+            store.setToolTip(OWNED_STORE_TIP if owned else "")
             store.triggered.connect(lambda: self.win.open_in_steam(f"steam://store/{appid}", game, "store"))
             menu.addActions([launch, store])
         else:
-            hint = Action(FIF.INFO, "Добавлена вручную — нет в Steam", menu)
-            hint.setEnabled(False)
-            menu.addAction(hint)
+            link = Action(FIF.SEARCH, "Найти в Steam", menu)
+            link.setToolTip("Добавлена вручную, без связи со Steam: найдите её в магазине, и появятся описание, "
+                            "трейлеры и установка")
+            link.triggered.connect(lambda: self.link_game(game))
+            menu.addAction(link)
 
         show = Action(FIF.GAME, "Открыть страницу игры", menu)
         show.triggered.connect(lambda: self.open_page(game))
         menu.addAction(show)
         menu.addSeparator()
-        count = len(self.list.selectedItems())
+        own_cover = Action(FIF.PHOTO, "Своя обложка…", menu)
+        own_cover.triggered.connect(lambda: self.choose_cover(game))
+        menu.addAction(own_cover)
+        if core.griddb_key():
+            grid_cover = Action(FIF.DOWNLOAD, "Обложка из SteamGridDB", menu)
+            grid_cover.setToolTip("Заменить обложку лучшей вертикальной из SteamGridDB — например, если Steam "
+                                  "собрал её из горизонтальной шапки")
+            grid_cover.triggered.connect(lambda: self.cover_from_griddb(game))
+            menu.addAction(grid_cover)
+        menu.addSeparator()
+        count = len(view.selectedItems())
         delete = Action(FIF.DELETE, "Удалить из списка" if count == 1 else f"Удалить выбранные ({count})", menu)
         delete.triggered.connect(self.delete_selected)
         menu.addAction(delete)
-        menu.exec(self.list.viewport().mapToGlobal(pos))
+        menu.exec(view.viewport().mapToGlobal(pos))
 
     def open_page(self, game):
         self.win.switchTo(self.win.home_page)
         self.win.home_page.open_game(game)
 
+    # --- Обложки ---
+    def cover_changed(self, name):
+        """Обложка игры появилась или сменилась — перерисовать её на плитке и на барабане."""
+        self.thumbs.forget(name)
+        self.grid.viewport().update()
+        self.win.home_page.reel.refresh_cover(name)
+
+    def choose_cover(self, game):
+        path, _ = QFileDialog.getOpenFileName(self, f"Обложка для «{game['name']}»", "",
+                                              "Изображения (*.png *.jpg *.jpeg *.webp)")
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                core.save_cover_bytes(game["name"], f.read())
+            core.mark_custom_cover(game["name"])  # выбранную вручную программа не заменит
+        except OSError as e:
+            notify("error", self.win, "Не удалось сохранить обложку", str(e))
+            return
+        core.log.info("Своя обложка для «%s»", game["name"])
+        self.cover_changed(game["name"])
+        notify("success", self.win, "Обложка сохранена", f"«{game['name']}»")
+
+    def cover_from_griddb(self, game):
+        name = game["name"]
+        worker = Worker(core.cover_from_griddb, dict(game), core.griddb_key(), parent=self)
+        worker.finished.connect(lambda path: self._on_griddb_cover(name, path))
+        worker.failed.connect(lambda message: notify("warning", self.win, "SteamGridDB не ответил",
+                                                     message.split(": ", 1)[-1], 6000))
+        worker.start()
+        notify("info", self.win, "Ищу обложку в SteamGridDB", f"«{name}»", 2500)
+
+    def _on_griddb_cover(self, name, path):
+        if not path:
+            notify("info", self.win, "В SteamGridDB обложки нет",
+                   f"«{name}»: вертикальной обложки там пока не выложили. Можно поставить свою.", 6000)
+            return
+        self.cover_changed(name)
+        notify("success", self.win, "Обложка заменена", f"«{name}» — из SteamGridDB.")
+
     def refresh(self):
         query = self.search.text().casefold().strip()
         self.list.clear()
+        self.grid.clear()
+        tile = CoverTileDelegate.COVER
         for game in sorted(self.win.library.games, key=lambda g: g["name"].casefold()):
             if query and query not in game["name"].casefold():
                 continue
-            self.list.addItem(QListWidgetItem(game["name"]))
-        self.count_label.setText(f"Всего игр: {len(self.win.library.games)}")
+            for view in (self.list, self.grid):
+                item = QListWidgetItem(game["name"] if view is self.list else "")
+                item.setData(Qt.UserRole, game["name"])
+                if view is self.grid:
+                    item.setToolTip(game["name"])
+                    item.setSizeHint(QSize(tile.width() + 2 * CoverTileDelegate.PAD,
+                                           tile.height() + CoverTileDelegate.TEXT_H + 2 * CoverTileDelegate.PAD))
+                view.addItem(item)
+        text = f"Всего игр: {len(self.win.library.games)}"
+        unlinked = sum(not game.get("appid") for game in self.win.library.games)
+        if unlinked:
+            text += f" · без связи со Steam: {unlinked} — правый клик по игре → «Найти в Steam»"
+        self.count_label.setText(text)
 
-    def add_games(self):
+    def add_games(self, term="", synced=False):
+        dialog = AddGameDialog(self.win, term=term, synced=synced)
+        core.log.info("Открыто окно «Добавить игру»")
+        accepted = dialog.exec()
+        choice, plain, bulk = dialog.choice, dialog.plain_name, dialog.bulk
+        want_owned, term = dialog.want_owned, dialog.search.text().strip()
+        dialog.deleteLater()
+        if not accepted:
+            return
+        if want_owned:
+            self._sync_owned(lambda: self.add_games(term, synced=True))
+        elif bulk:
+            self.add_list()
+        elif choice:
+            self._add_found(choice)
+        elif plain:
+            if self.win.library.add(plain) != "added":
+                notify("info", self.win, "Игра уже в списке", f"«{plain}»")
+                return
+            if self.win.save_library():
+                core.log.info("Добавлена игра без Steam: «%s»", plain)
+                self.win.libraryChanged.emit()
+                notify("success", self.win, "Игра добавлена", f"«{plain}» — без связи со Steam.")
+
+    def _add_found(self, choice):
+        """Игра из поиска Steam — с номером в Steam: у неё сразу будут описание, трейлеры и установка."""
+        name, appid = choice["name"], choice["appid"]
+        twin = next((g for g in self.win.library.games if g.get("appid") == appid), None)
+        if twin:
+            notify("info", self.win, "Игра уже в списке", f"«{twin['name']}»")
+            return
+        result = self.win.library.add(name, appid)
+        if not result:
+            notify("info", self.win, "Игра с таким названием уже в списке", f"«{name}»")
+            return
+        if not self.win.save_library():
+            return
+        core.log.info("%s игра из поиска Steam: «%s» (%s)", "Добавлена" if result == "added" else "Связана",
+                      name, appid)
+        self.win.covers.forget(name)
+        self.win.libraryChanged.emit()
+        notify("success", self.win, "Игра добавлена" if result == "added" else "Игра связана со Steam",
+               f"«{name}»: описание, трейлеры и обложка — из Steam.")
+
+    def add_list(self):
+        """Несколько игр списком — только названия, без поиска в Steam."""
         dialog = AddGamesDialog(self.win)
         if not dialog.exec():
             return
@@ -4292,8 +6570,82 @@ class LibraryPage(QWidget):
             notify("success", self.win, f"Добавлено игр: {len(added)}",
                    ", ".join(added[:5]) + ("…" if len(added) > 5 else ""))
 
+    def _sync_owned(self, then):
+        """Вход в магазин Steam (если нужен) и список того, что есть на аккаунте, — потом then(), здесь же."""
+        self.win.switchTo(self)
+        self.win.music_page.sync_steam(after=then, back_text="К играм", return_page=self)
+
+    def offer_owned_games(self):
+        """После входа в магазин без ключа: игры с аккаунта, которых ещё нет в списке, — предлагаем добавить.
+        Без ключа коллекций Steam не видно, поэтому выбор простой: все игры аккаунта или ни одной."""
+        owned = core.owned_apps()
+        if not owned:
+            return  # вход не прошёл или его отменили — об этом уже сказано
+        listed = {g.get("appid") for g in self.win.library.games}
+        new = [appid for appid in owned if appid not in listed]
+        if not new:
+            notify("success", self.win, "Вход в магазин Steam выполнен",
+                   "Все игры с вашего аккаунта уже в списке. В «Добавить» у найденных игр видно, какие уже ваши.", 6000)
+            return
+        worker = Worker(core.owned_games, new, parent=self)
+        worker.finished.connect(self._on_owned_games)
+        worker.failed.connect(lambda message: notify("warning", self.win, "Не удалось узнать игры аккаунта",
+                                                     "Магазин Steam не ответил. Игры можно добавить через «Добавить»."))
+        worker.start()
+
+    def _on_owned_games(self, games):
+        listed = {g.get("appid") for g in self.win.library.games}
+        games = [g for g in games if g["appid"] not in listed]
+        if not games:
+            notify("success", self.win, "Вход в магазин Steam выполнен",
+                   "Новых игр на аккаунте нет — только дополнения, саундтреки или то, что уже в списке.", 6000)
+            return
+        names = ", ".join(f"«{g['name']}»" for g in games[:5]) + (f" и ещё {len(games) - 5}" if len(games) > 5 else "")
+        if not confirm(self.win, "Добавить игры с аккаунта?",
+                       f"На вашем аккаунте Steam есть игры, которых нет в списке: {len(games)} — {names}.\n\n"
+                       "Добавить их? У каждой будут описание, трейлеры, обложка и установка через Steam. "
+                       "Коллекций Steam без ключа не видно — лишнее потом можно убрать из списка.", "Добавить"):
+            return
+        added = sum(self.win.library.add(g["name"], g["appid"]) == "added" for g in games)
+        if not self.win.save_library():
+            return
+        core.log.info("Игры с аккаунта без ключа: добавлено %d из %d", added, len(games))
+        self.win.libraryChanged.emit()
+        notify("success", self.win, f"Добавлено игр: {added}", "С вашего аккаунта Steam.", 6000)
+
+    def link_game(self, game, term="", synced=False):
+        """«Найти в Steam» для игры, добавленной вручную: найденный номер в Steam привязывается к ней."""
+        dialog = AddGameDialog(self.win, game, term=term, synced=synced)
+        core.log.info("Открыто окно «Найти в Steam» для «%s»", game["name"])
+        accepted = dialog.exec()
+        choice, want_owned, term = dialog.choice, dialog.want_owned, dialog.search.text().strip()
+        dialog.deleteLater()
+        if accepted and want_owned and game in self.win.library.games:
+            self._sync_owned(lambda: self.link_game(game, term, synced=True))
+            return
+        if not accepted or not choice or game not in self.win.library.games:
+            return
+        twin = next((g for g in self.win.library.games if g.get("appid") == choice["appid"] and g is not game), None)
+        if twin:
+            notify("warning", self.win, "Эта игра уже в списке",
+                   f"С этой страницей Steam уже связана «{twin['name']}».", 6000)
+            return
+        game["appid"] = choice["appid"]
+        if not self.win.save_library():
+            game["appid"] = None
+            return
+        core.log.info("«%s» связана со Steam: «%s» (%s)", game["name"], choice["name"], choice["appid"])
+        self.win.covers.forget(game["name"])  # с номером в Steam обложка может найтись
+        self.win.libraryChanged.emit()
+        game_page = self.win.home_page.game_page
+        if game_page.game is game:
+            game_page.show_game(game)  # карточка открыта — сразу с описанием и трейлерами
+        notify("success", self.win, "Игра связана со Steam",
+               f"«{game['name']}» → «{choice['name']}». Теперь у неё есть описание, трейлеры и установка через Steam.",
+               7000)
+
     def delete_selected(self):
-        names = [item.text() for item in self.list.selectedItems()]
+        names = [item.data(Qt.UserRole) or item.text() for item in self.current_view().selectedItems()]
         if not names:
             notify("info", self.win, "Ничего не выбрано", "Выделите игры в списке (Ctrl или Shift — несколько).")
             return
@@ -4326,6 +6678,7 @@ class LibraryPage(QWidget):
             except OSError as e:
                 notify("error", self.win, "Не все обложки удалось удалить", str(e))
             self.win.home_page.reel.clear_cache()
+            self.thumbs.clear()
         self.win.libraryChanged.emit()
         notify("success", self.win, "Список очищен", text + " Можно импортировать заново.", duration=6000)
 
@@ -4339,17 +6692,31 @@ class LibraryPage(QWidget):
         settings = core.load_settings()
         api_key, steam_id = settings["steam_api_key"], settings["steam_id"]
         if not api_key or not steam_id:
-            notify("warning", self.win, "Нужны ключ и SteamID", "Укажите их на вкладке «Настройки».")
-            self.win.switchTo(self.win.settings_page)
+            self.win.run_steam_setup()  # ключа нет — сначала подключаем Steam, импорт мастер запустит сам
             return
         self._quick = quick
         self.set_import_busy(True)
         self._progress_dialog = ImportProgressDialog(
             self.win, "Синхронизация со Steam" if quick else "Загружаю библиотеку Steam")
         self._progress_dialog.show()
+        if not QWebEngineView:
+            self._start_load(api_key, steam_id, None)
+            return
+        # Семейную группу Steam показывает только тому, кто вошёл в магазин: сначала берём токен входа
+        self._progress_dialog.set_progress("Проверяю вход в магазин Steam…", 2)
+        reader = SteamWebToken(self)
+        reader.finished.connect(lambda token: self._start_load(api_key, steam_id, token))
+        reader.failed.connect(lambda message: (core.log.warning("Токен магазина Steam не получен: %s", message),
+                                               self._start_load(api_key, steam_id, None)))
+        reader.start()
+
+    def _start_load(self, api_key, steam_id, token):
+        self._had_token = bool(token)
+        core.log.info("Загрузка библиотеки Steam: %s", "вход в магазин есть — проверяю семейную группу" if token
+                      else "входа в магазин нет — семейная группа не проверяется")
         relay = ProgressRelay(self)
         relay.progress.connect(self._on_progress)
-        worker = Worker(core.load_steam_library, api_key, steam_id, relay.report, parent=self)
+        worker = Worker(core.load_steam_library, api_key, steam_id, relay.report, token, parent=self)
         worker.finished.connect(self.on_library_loaded)
         worker.failed.connect(self.on_import_failed)
         worker.finished.connect(relay.deleteLater)
@@ -4384,22 +6751,47 @@ class LibraryPage(QWidget):
             notify("warning", self.win, "Не удалось прочитать коллекции Steam",
                    library["collections_error"], duration=6000)
 
+        library["store_login"] = self._had_token
         settings = core.load_settings()
         if self._quick:
-            choice = {key: settings[key] for key in
-                      ("import_include", "import_skip_hidden", "import_unplayed", "import_replace")}
-        else:
-            known_ids = {game["appid"] for game in library["games"]}
-            family_count = sum(game["family"] for game in library["games"])
-            dialog = ImportDialog(self.win, library["collections"], known_ids, family_count, settings)
-            if not dialog.exec():
-                return
-            choice = dialog.selection()
-            core.save_settings(import_done=True, **choice)
-            self.set_import_busy(False)
+            choice = {key: settings[key] for key in IMPORT_KEYS}
+            # Без входа в магазин семейную группу не проверить — игры не с вашего аккаунта из списка не убираем
+            self.apply_import(library, choice, keep_unverified=not library["family_checked"])
+            return
+        listed = {game["appid"] for game in self.win.library.games if game.get("appid")}
+        dialog = ImportDialog(self.win, library, settings, listed)
+        core.log.info("Открыто окно «Импорт из Steam»")
+        accepted = dialog.exec()
+        choice, want_login = dialog.selection(), dialog.want_login
+        dialog.deleteLater()
+        if want_login:
+            core.save_settings(**choice)  # окно откроется заново с тем же выбором
+            if library["store_login"]:
+                core.log.info("Импорт: вход в магазин есть, а Steam не ответил про семейную группу — пробую ещё раз")
+                self._load_library(False)
+            else:
+                core.log.info("Импорт: вход в магазин Steam, чтобы проверить семейную группу")
+                self.win.music_page.sync_steam(after=self._after_import_login, back_text="К импорту",
+                                               return_page=self, ask=False,
+                                               done_text="Проверяю покупки и семейную группу Steam — это до "
+                                                         "минуты. Окно импорта появится само.")
+            return
+        core.log.info("Окно «Импорт из Steam» закрыто: %s", "импорт" if accepted else "отмена")
+        if not accepted:
+            return
+        core.save_settings(import_done=True, **choice)
+        self.set_import_busy(False)
         self.apply_import(library, choice)
 
-    def apply_import(self, library, choice):
+    def _after_import_login(self):
+        """Вернулись из входа в магазин Steam (вошли или нет) — окно импорта открывается снова, само."""
+        core.log.info("Импорт: после входа в магазин Steam открываю окно импорта заново")
+        self.win.switchTo(self)
+        self._load_library(False)
+
+    def apply_import(self, library, choice, keep_unverified=False):
+        """keep_unverified — не убирать по «Заменить мой список» игры не с вашего аккаунта: семейную группу
+        не проверили, и неизвестно, доступны ли они ещё (так бывает при быстрой синхронизации без входа)."""
         selected, missing = core.select_games(library, choice)
         if choice["import_include"] and len(missing) == len(choice["import_include"]):
             # Ни одной выбранной коллекции больше нет — не импортируем всю библиотеку по ошибке
@@ -4412,28 +6804,41 @@ class LibraryPage(QWidget):
         for game in selected:
             added += self.win.library.add(game["name"], game["appid"]) == "added"
 
-        removed = 0
+        removed = kept = 0
         if choice["import_replace"]:
             keep = {game["appid"] for game in selected}
+            own = {game["appid"] for game in library["games"] if not game["family"]}
             for game in list(self.win.library.games):
-                if game.get("appid") and game["appid"] not in keep:  # без appid — добавлены вручную
-                    self.win.library.remove(game)
-                    removed += 1
+                appid = game.get("appid")
+                if not appid or appid in keep:  # без appid — добавлены вручную
+                    continue
+                if keep_unverified and appid not in own:
+                    kept += 1
+                    continue
+                self.win.library.remove(game)
+                removed += 1
 
         if not self.win.save_library():
             return
-        core.log.info("%s: выбор %s, подходит %d, добавлено %d, убрано %d",
-                      "Синхронизация" if self._quick else "Импорт", choice, len(selected), added, removed)
+        core.log.info("%s: выбор %s, подходит %d, добавлено %d, убрано %d, не убрано без проверки семьи %d",
+                      "Синхронизация" if self._quick else "Импорт", choice, len(selected), added, removed, kept)
         self.win.libraryChanged.emit()
         text = f"Подходит под выбор: {len(selected)}. Добавлено новых: {added}."
         if removed:
             text += f" Убрано из списка: {removed}."
+        if kept:
+            text += (f" Не убрано игр не с вашего аккаунта: {kept} — семейная группа не проверена "
+                     "(нет входа в магазин Steam).")
         if missing:
             text += f" Не найдено коллекций из прошлого выбора: {len(missing)}."
-        notify("success", self.win, "Синхронизация завершена" if self._quick else "Импорт завершён",
-               text, duration=7000)
-        if added >= LOADING_THRESHOLD:
-            self.win.switchTo(self.win.home_page)  # там уже идёт загрузка обложек
+        title = "Синхронизация завершена" if self._quick else "Импорт завершён"
+        home = self.win.home_page
+        if added >= LOADING_THRESHOLD and home.stack.currentWidget() is home.loading_view:
+            # Идёт загрузка обложек: итог — на её экране, уведомление закрыло бы надписи
+            home.set_loading_note(f"{title}. {text}")
+            self.win.switchTo(home)
+            return
+        notify("success", self.win, title, text, duration=7000)
 
     def on_import_failed(self, message):
         self.set_import_busy(False)
@@ -4444,6 +6849,7 @@ class LibraryPage(QWidget):
 
 # --- Страница «Музыка» ------------------------------------------------------
 STEAM_LOGIN_URL = "https://store.steampowered.com/login/"
+STEAM_SOUNDTRACKS_URL = "https://store.steampowered.com/soundtracks/"
 
 
 class SteamOwnedApps(QObject):
@@ -4466,7 +6872,8 @@ class SteamOwnedApps(QObject):
         self.page.loadFinished.connect(self._on_loaded)
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
-        self.timer.timeout.connect(lambda: self._finish(error="магазин Steam не ответил за 30 секунд"))
+        self.timer.timeout.connect(
+            lambda: self._finish(error=f"магазин Steam не ответил за {self.TIMEOUT_MS // 1000} секунд"))
 
     def start(self):
         self.timer.start(self.TIMEOUT_MS)
@@ -4501,6 +6908,29 @@ class SteamOwnedApps(QObject):
         else:
             self.finished.emit(owned)
         self.deleteLater()
+
+
+class SteamWebToken(SteamOwnedApps):
+    """Временный токен входа в магазин Steam — с ним Steam отвечает, какие игры семейной группы вам доступны.
+
+    Магазин выдаёт его тому, кто вошёл на сайт (вход хранится в куках встроенного браузера). Токен живёт
+    только в памяти на время импорта: программа не пишет его ни в лог, ни в файлы. finished(токен) или
+    finished(None) — вход в магазин не выполнен; failed(текст) — магазин не открылся.
+    """
+
+    URL = "https://store.steampowered.com/pointssummary/ajaxgetasyncconfig"
+    TIMEOUT_MS = 15000
+
+    def _on_text(self, text):
+        if self._done:
+            return
+        try:
+            data = json.loads(text)
+        except ValueError:
+            self._finish(error="магазин Steam не выдал токен входа")
+            return
+        token = ((data.get("data") or {}).get("webapi_token") if isinstance(data, dict) else None)
+        self._finish(token if isinstance(token, str) and token else None)  # без входа токена нет
 
 
 class AlbumBackdrop(QWidget):
@@ -4602,6 +7032,65 @@ class AlbumBackdrop(QWidget):
             painter.drawPixmap(0, 0, self._frame)
 
 
+def disk_size_text(size):
+    """Размер на диске по-русски: «1,4 ГБ», «230 МБ»."""
+    return (f"{size / 1024 ** 3:.1f} ГБ" if size >= 1024 ** 3 else f"{size / 1024 ** 2:.0f} МБ").replace(".", ",")
+
+
+class RemoveAlbumDialog(MessageBoxBase):
+    """«Удалить с ПК» для скачанного саундтрека. Steam запущен — удаляет сам Steam (он спросит и уберёт всё),
+    закрыт — программа кладёт папку альбома в Корзину. choice: "steam" | "trash"."""
+
+    def __init__(self, parent, album, owner_name=None):
+        super().__init__(parent)
+        self.choice = None
+        steam_on = core.steam_running()
+        can_steam = bool(album.get("appid")) and bool(core.find_steam_dir())
+        self.viewLayout.addWidget(SubtitleLabel("Удалить саундтрек с ПК?", self))
+        size = core.folder_size(album["folder"])
+        name = BodyLabel(f"«{album['name']}» — треков: {len(album['tracks'])}, освободится {disk_size_text(size)}.", self)
+        name.setWordWrap(True)
+        self.viewLayout.addWidget(name)
+        lines = []
+        if owner_name is not None:
+            lines.append((f"Этот альбом скачал аккаунт {owner_name}. Вернуть его сможет только этот аккаунт "
+                          "(бесплатные саундтреки — любой).", True))
+        elif album.get("appid"):
+            lines.append(("Он останется в вашей библиотеке Steam: скачать заново можно в любой момент — "
+                          "он появится в «Куплены, но не скачаны».", False))
+        if steam_on and can_steam:
+            lines.append(("Steam запущен — удалит сам Steam: он спросит ещё раз и уберёт и файлы, и свою запись "
+                          "об альбоме.", False))
+        else:
+            lines.append(("Программа переложит папку альбома в Корзину Windows — передумаете, восстановите оттуда. "
+                          "Steam для этого не нужен.", False))
+        for text, warning in lines:
+            label = CaptionLabel(text, self)
+            label.setWordWrap(True)
+            if warning:
+                label.setTextColor(*WARNING_TEXT)
+            self.viewLayout.addWidget(label)
+        self.widget.setMinimumWidth(480)
+
+        self.yesButton.clicked.disconnect()
+        if steam_on and can_steam:
+            self.yesButton.setText("Удалить через Steam")
+            self.yesButton.clicked.connect(lambda: self._choose("steam"))
+        else:
+            self.yesButton.setText("Удалить в Корзину")
+            self.yesButton.clicked.connect(lambda: self._choose("trash"))
+            if can_steam:  # Steam есть, но закрыт — можно и через него: он запустится
+                via_steam = PushButton("Через Steam", self.buttonGroup)
+                via_steam.setToolTip("Steam запустится и сам удалит альбом")
+                via_steam.clicked.connect(lambda: self._choose("steam"))
+                self.buttonLayout.insertWidget(1, via_steam, 1, Qt.AlignVCenter)
+        self.cancelButton.setText("Отмена")
+
+    def _choose(self, choice):
+        self.choice = choice
+        self.accept()
+
+
 class MusicPage(QWidget):
     """Вкладка «Саундтреки»: слева — скачанные и купленные саундтреки Steam,
     справа — треки выбранного альбома, внизу — плеер. Встроенная тема и своя музыка — в «Настройках».
@@ -4636,6 +7125,11 @@ class MusicPage(QWidget):
         self._last_scan = 0.0
         self._syncing = False
         self._awaiting_login = False
+        # Синхронизацию может попросить и другая вкладка («Добавить игру», мастер): куда вернуться и что сделать потом
+        self._after_sync = None
+        self._return_page = None
+        self._back_text = "К саундтрекам"
+        self._ask_login = True
         self._watch = {}  # appid альбома, который попросили скачать → когда
         self._mix_started = False  # «вперемешку» с прошлого запуска уже собрано
         self._drag_value = None
@@ -4650,9 +7144,14 @@ class MusicPage(QWidget):
         self.source_list.currentRowChanged.connect(self._on_source_row)
         self.source_list.itemDoubleClicked.connect(
             lambda item: self.play_source(self._source_of_row(self.source_list.row(item))))
+        self.source_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.source_list.customContextMenuRequested.connect(self._show_source_menu)
         self.sync_button = PushButton("Синхронизировать со Steam", self, FIF.SYNC)
         self.sync_button.setToolTip("Найти скачанные саундтреки и узнать, какие куплены, но ещё не скачаны")
-        self.sync_button.clicked.connect(self.sync_steam)
+        self.sync_button.clicked.connect(lambda: self.sync_steam())
+        self.buy_button = PushButton("Купить саундтреки", self, FIF.SHOPPING_CART)
+        self.buy_button.setToolTip("Раздел саундтреков в магазине Steam — на вкладке «Браузер»")
+        self.buy_button.clicked.connect(lambda: self.win.open_web(STEAM_SOUNDTRACKS_URL))
         self.watch_timer = QTimer(self)
         self.watch_timer.setInterval(self.WATCH_MS)
         self.watch_timer.timeout.connect(self._check_downloads)
@@ -4669,6 +7168,9 @@ class MusicPage(QWidget):
         self.listen_button.clicked.connect(lambda: self.play_source(self.shown))
         self.game_button = PushButton("Страница игры", self, FIF.GAME)
         self.game_button.clicked.connect(self.open_game)
+        self.remove_button = TransparentPushButton("Удалить с ПК", self, FIF.DELETE)
+        self.remove_button.setToolTip("Удалить скачанный альбом с этого компьютера — через Steam или в Корзину")
+        self.remove_button.clicked.connect(lambda: self.remove_album(self.shown))
         self.track_list = ListWidget(self)
         self.track_list.itemDoubleClicked.connect(self._on_track_double_clicked)
 
@@ -4719,12 +7221,14 @@ class MusicPage(QWidget):
         left.setSpacing(8)
         left.addWidget(self.source_list, 1)
         left.addWidget(self.sync_button)
+        left.addWidget(self.buy_button)
 
         actions = QHBoxLayout()
         actions.setSpacing(8)
         actions.addWidget(self.listen_button)
         actions.addWidget(self.game_button)
         actions.addStretch(1)
+        actions.addWidget(self.remove_button)
         info = QVBoxLayout()
         info.setSpacing(4)
         info.addWidget(self.album_title)
@@ -4815,9 +7319,10 @@ class MusicPage(QWidget):
         self.source_list.blockSignals(True)
         self.source_list.clear()
         self.row_sources = []
-        self._add_header("Скачанные")
-        for source in albums:
-            self._add_source_row(source)
+        for title, group in self._album_groups(albums):
+            self._add_header(title)
+            for source in group:
+                self._add_source_row(source)
         if not albums:
             self._add_header("   Ищу…" if self._scanning else "   Скачанных саундтреков нет")
         if store:
@@ -4837,9 +7342,38 @@ class MusicPage(QWidget):
         else:
             item.setIcon((FIF.DOWNLOAD if source["kind"] == "store" else FIF.MUSIC).icon())
         item.setSizeHint(QSize(0, self.LIST_ICON + 14))
-        item.setToolTip("Двойной клик — скачать в Steam" if source["kind"] == "store" else source["path"])
+        if source["kind"] == "store":
+            item.setToolTip("Двойной клик — скачать в Steam")
+        elif self.foreign(source["album"]):
+            item.setToolTip("Этот альбом скачал на этот ПК другой аккаунт Steam, не тот, что подключён к программе. "
+                            "Файлы лежат на диске, поэтому слушать его можно.\n" + source["path"])
+        else:
+            item.setToolTip(source["path"])
         self.source_list.addItem(item)
         self.row_sources.append(source)
+
+    def foreign(self, album):
+        """Альбом скачан на этот ПК другим аккаунтом Steam (по LastOwner в его appmanifest)."""
+        steam_id = self.win.my_steam_id()
+        return bool(album.get("owner") and steam_id and album["owner"] != steam_id)
+
+    def _album_groups(self, albums):
+        """Скачанные — разделами по аккаунтам Steam, которые их скачали: сначала ваш, потом остальные.
+        Имена аккаунтов — из клиента Steam на этом ПК; SteamID неизвестен или чужих нет — один раздел."""
+        steam_id = self.win.my_steam_id()
+        if not albums or not any(self.foreign(s["album"]) for s in albums):
+            return [("Скачанные", albums)]
+        names = core.steam_account_names()
+        groups = []
+        mine = [s for s in albums if not self.foreign(s["album"])]
+        if mine:
+            groups.append((f"Ваш аккаунт — {names.get(steam_id) or core.short_steam_id(steam_id)}", mine))
+        owners = sorted({s["album"]["owner"] for s in albums if self.foreign(s["album"])},
+                        key=lambda owner: (names.get(owner) or owner).casefold())
+        for owner in owners:
+            groups.append((f"Скачаны аккаунтом {names.get(owner) or core.short_steam_id(owner)}",
+                           [s for s in albums if s["album"].get("owner") == owner]))
+        return groups
 
     def _add_header(self, text):
         item = QListWidgetItem(text)
@@ -4900,17 +7434,20 @@ class MusicPage(QWidget):
         if not source:  # саундтреков нет совсем
             self.shown_tracks, self.shown_titles = [], []
             self.track_list.clear()
-            self.album_cover.setPixmap(self._placeholder(self.ALBUM_COVER))
+            self.album_cover.hide()  # пустой значок рядом с надписью ничего не говорит
             self.album_title.setText("Саундтреков пока нет")
             self.album_caption.setText("Скачайте саундтрек в Steam или нажмите «Синхронизировать со Steam» — "
                                        "появятся и купленные, но не скачанные. Встроенная тема и своя музыка — "
                                        "в «Настройках».")
             self.listen_button.hide()
             self.game_button.hide()
+            self.remove_button.hide()
             self._update_backdrop()
             return
         self.listen_button.show()
+        self.album_cover.show()
         store = source["kind"] == "store"
+        self.remove_button.setVisible(not store)
         if store:
             tracks, titles = [], []
         else:
@@ -4977,6 +7514,92 @@ class MusicPage(QWidget):
         game = self._library_game(self.shown) if self.shown else None
         if game:
             self.win.library_page.open_page(game)
+
+    # --- Удаление скачанного альбома ---
+    REMOVE_RECHECKS = (5, 15, 30, 60)  # секунд: Steam удаляет альбом после своего вопроса — смотрим, когда исчезнет
+
+    def _show_source_menu(self, pos):
+        item = self.source_list.itemAt(pos)
+        source = self._source_of_row(self.source_list.row(item)) if item else None
+        if not source:
+            return
+        self.select_source(source)
+        menu = RoundMenu(parent=self)
+        store = source["kind"] == "store"
+        listen = Action(FIF.DOWNLOAD if store else FIF.PLAY, "Скачать в Steam" if store else "Слушать", menu)
+        listen.triggered.connect(lambda: self.play_source(source))
+        menu.addAction(listen)
+        if self._library_game(source):
+            game = Action(FIF.GAME, "Страница игры", menu)
+            game.triggered.connect(self.open_game)
+            menu.addAction(game)
+        if not store:
+            menu.addSeparator()
+            remove = Action(FIF.DELETE, "Удалить с ПК", menu)
+            remove.triggered.connect(lambda: self.remove_album(source))
+            menu.addAction(remove)
+        menu.exec(self.source_list.viewport().mapToGlobal(pos))
+
+    def remove_album(self, source):
+        """«Удалить с ПК»: через Steam (он запущен) или в Корзину (Steam закрыт). Купленный альбом остаётся
+        на аккаунте — после удаления он появится в «Куплены, но не скачаны»."""
+        if not source or source["kind"] != "album":
+            return
+        album = source["album"]
+        owner = None
+        if self.foreign(album):
+            owner = core.steam_account_names().get(album["owner"]) or core.short_steam_id(album["owner"])
+        dialog = RemoveAlbumDialog(self.win, album, owner)
+        core.log.info("Открыто окно «Удалить саундтрек» для «%s»", album["name"])
+        accepted = dialog.exec()
+        choice = dialog.choice
+        dialog.deleteLater()
+        if not accepted or not choice:
+            return
+        if choice == "steam":
+            self._remove_via_steam(album)
+            return
+        if core.steam_running() and album.get("appid"):  # Steam успели запустить, пока было открыто окно
+            notify("warning", self.win, "Steam запущен",
+                   "Пока Steam работает, удалять альбом в обход него нельзя — он может скачать его заново. "
+                   "Нажмите «Удалить с ПК» ещё раз: удалит сам Steam.", 7000)
+            return
+        self._release_album(album)
+        worker = Worker(core.remove_soundtrack, dict(album), parent=self)
+        worker.finished.connect(lambda _: self._on_album_removed(album))
+        worker.failed.connect(lambda message: self._on_remove_failed(album, message))
+        worker.start()
+
+    def _release_album(self, album):
+        """Играет трек из этого альбома — переключаемся на встроенную тему, иначе Windows не отдаст файл."""
+        if self.music.release(album["folder"]):
+            if core.same_path(core.load_settings()["music_path"], album["folder"]):
+                core.save_settings(music_path="")
+            notify("info", self.win, "Музыка переключена на встроенную тему",
+                   f"Играл трек из «{album['name']}», а его удаляют.")
+
+    def _remove_via_steam(self, album):
+        url = f"steam://uninstall/{album['appid']}"
+        core.log.info("Удалить саундтрек «%s» через Steam: %s", album["name"], url)
+        self._release_album(album)
+        Worker(core.open_url, url, parent=self).start()  # Steam может отвечать несколько секунд
+        for seconds in self.REMOVE_RECHECKS:
+            QTimer.singleShot(seconds * 1000, lambda: self.reload_soundtracks(quiet=True))
+        notify("info", self.win, "Steam спросит, удалить ли альбом",
+               f"«{album['name']}». Когда Steam его удалит, альбом сам пропадёт из списка.", 7000)
+
+    def _on_album_removed(self, album):
+        self.reload_soundtracks()
+        text = "Вернуть его можно из Корзины Windows."
+        if album.get("appid") in {item["appid"] for item in self.owned}:
+            text += " Он остался на аккаунте — теперь он в «Куплены, но не скачаны», скачать заново можно оттуда."
+        notify("success", self.win, "Саундтрек удалён в Корзину", f"«{album['name']}». {text}", 7000)
+
+    def _on_remove_failed(self, album, message):
+        core.log.warning("Саундтрек «%s» не удалился: %s", album["name"], message)
+        notify("error", self.win, "Не удалось удалить саундтрек",
+               f"«{album['name']}»: {message}\nПодробности — на вкладке «Логи».", 8000)
+        self.reload_soundtracks(quiet=True)
 
     # --- Что играет ---
     def play_source(self, source, start=None):
@@ -5048,12 +7671,34 @@ class MusicPage(QWidget):
     def download(self, item):
         """Окно скачивания в Steam. Пока альбом качается, проверяем папки Steam и сами показываем его."""
         url = f"steam://install/{item['appid']}"
+        if not self.win.confirm_steam_account("скачает саундтрек"):
+            return
         core.log.info("Скачать саундтрек «%s»: %s", item["name"], url)
         Worker(core.open_url, url, parent=self).start()  # Steam может отвечать несколько секунд
         self._watch[item["appid"]] = time.monotonic()
         self.watch_timer.start()
         notify("info", self.win, "Steam откроет окно скачивания",
                f"«{item['name']}». Когда альбом скачается, он сам появится на вкладке «Саундтреки».", 6000)
+
+    def expect_install(self, appid):
+        """Из встроенного браузера в Steam ушла установка. Саундтрек ли это, узнаём у магазина в фоне:
+        если да — возвращаемся на эту вкладку и ждём альбом на диске, как при «Скачать в Steam»."""
+        worker = Worker(core.store_items, [appid], parent=self)
+        worker.finished.connect(lambda items: self._on_install_kind(appid, items))
+        worker.start()
+
+    def _on_install_kind(self, appid, items):
+        item = items.get(appid) or {}
+        if item.get("type") != core.STORE_TYPE_MUSIC:
+            return  # игра или дополнение — их ждать здесь незачем
+        name = item.get("name") or "Саундтрек"
+        core.log.info("Из встроенного браузера скачивается саундтрек «%s» (%s) — возвращаюсь к «Саундтрекам»",
+                      name, appid)
+        self._watch[appid] = time.monotonic()
+        self.watch_timer.start()
+        self.win.switchTo(self)
+        notify("info", self.win, "Саундтрек скачивается в Steam",
+               f"«{name}». Когда Steam его скачает, он сам появится в этом списке.", 7000)
 
     def _on_track(self):
         music = self.music
@@ -5157,11 +7802,12 @@ class MusicPage(QWidget):
                 if key in old:
                     album[key] = old[key]
         self.albums = albums
-        self.build_sources()
         if not albums:
-            self._finish_scan()
+            self._finish_scan()  # до перерисовки: иначе в пустом списке так и висело бы «Ищу…»
+            self.build_sources()
             self._refresh_game_page()
             return
+        self.build_sources()
         self._sync_album_info()
         # Картинки и привязка к играм — из магазина Steam и кэша клиента Steam, тоже в фоне
         worker = Worker(core.soundtrack_details, [dict(a) for a in albums], parent=self)
@@ -5213,20 +7859,43 @@ class MusicPage(QWidget):
             self.music.set_album(playing["path"], {"name": playing["name"], "image": playing.get("image")})
 
     # --- Купленные саундтреки ---
-    def sync_steam(self):
-        """Скачанные альбомы — с диска, купленные — из магазина Steam (нужен вход во встроенном браузере)."""
+    def sync_steam(self, after=None, back_text=None, return_page=None, ask=True, done_text=None):
+        """Скачанные альбомы — с диска, купленные — из магазина Steam (нужен вход во встроенном браузере).
+
+        after() — что сделать, когда синхронизация закончится (как угодно: успех, отказ, ошибка); return_page —
+        куда вернуться после входа в магазин; ask=False — не спрашивать «Войти?», об этом уже спросили;
+        done_text — что сказать, когда вход в магазин прошёл (например, «продолжаю импорт»).
+        """
+        if after or return_page:
+            self._after_sync, self._return_page = after, return_page
+            self._back_text = back_text or "К саундтрекам"
+            self._ask_login = ask
+            self._login_text = done_text
         if self._syncing:
             return
         self.reload_soundtracks()
         if not QWebEngineView:
             notify("warning", self.win, "Покупки Steam не узнать",
                    "Для этого нужен встроенный браузер (PySide6 с QtWebEngine). Скачанные саундтреки видны и так.")
+            self._finish_sync()
             return
         self._set_syncing(True, "Узнаю, что куплено…")
         reader = SteamOwnedApps(self)
         reader.finished.connect(self._on_owned_apps)
         reader.failed.connect(self._on_sync_failed)
         reader.start()
+
+    def _finish_sync(self):
+        """Синхронизация закончилась — возвращаем тому, кто её просил."""
+        hide_busy(self.win)
+        callback = self._after_sync
+        self._after_sync, self._return_page, self._back_text = None, None, "К саундтрекам"
+        self._ask_login = True
+        self._login_text = None
+        self._login_done = self._login_retried = False
+        if callback:
+            core.log.info("Синхронизация с магазином Steam закончена — возвращаюсь к тому, что её просило")
+            QTimer.singleShot(0, callback)
 
     def _set_syncing(self, syncing, text=""):
         """Пока идёт синхронизация, её ход пишется на самой кнопке."""
@@ -5235,22 +7904,95 @@ class MusicPage(QWidget):
         self.sync_button.setText(text if syncing else "Синхронизировать со Steam")
 
     def _on_owned_apps(self, owned):
+        if owned is None and getattr(self, "_login_done", False) and not getattr(self, "_login_retried", False):
+            # Вход только что прошёл, а магазин ещё отвечает «не вошли» (так бывает первые секунды после входа
+            # по QR-коду) — спрашиваем ещё раз, а не отправляем входить заново
+            self._login_retried = True
+            self._set_syncing(False)
+            core.log.info("Магазин Steam: вход только что прошёл, а покупки ещё не отдаёт — спрошу через 3 с")
+            QTimer.singleShot(3000, self.sync_steam)
+            return
         if owned is None:
+            hide_busy(self.win)  # дальше вопрос или браузер — ждать больше нечего
             self._set_syncing(False)
             core.log.info("Магазин Steam: вход не выполнен — предлагаю войти во встроенном браузере")
-            if confirm(self.win, "Войдите в магазин Steam",
-                       "Какие саундтреки куплены, Steam показывает только после входа на сайт магазина. "
-                       "Войдите один раз во встроенном браузере программы: пароль вводится на сайте Steam, "
-                       "программа его не видит. Потом нажмите «К саундтрекам».", "Войти"):
-                self._awaiting_login = True
-                self.win.switchTo(self.win.home_page)
-                self.win.home_page.open_browser(STEAM_LOGIN_URL, "К саундтрекам", self._back_from_login)
+            if not getattr(self, "_ask_login", True):
+                self._ask_login = True  # спросили заранее — второй раз только если вход не удастся
+                self._await_store_login()
+            elif confirm(self.win, "Войдите в магазин Steam",
+                         "Что есть на вашем аккаунте — игры и саундтреки, — Steam показывает только тому, кто вошёл "
+                         "в магазин. Вход в обычном браузере программе ничего не передаёт, поэтому войти нужно здесь, "
+                         "во встроенном браузере.\n\n"
+                         "Удобнее и безопаснее — по QR-коду: отсканируйте его в мобильном приложении Steam, и пароль "
+                         "в программу не вводится вовсе. Вход запомнится только на этом ПК, выйти можно в «Настройках» "
+                         "→ «Выйти из магазина Steam». Как только вход пройдёт, программа сама вернётся обратно.",
+                         "Войти"):
+                self._await_store_login()
+            else:
+                self._finish_sync()
             return
         self._set_syncing(True, "Ищу саундтреки среди покупок…")
         worker = Worker(core.owned_soundtracks, owned, parent=self)
         worker.finished.connect(self._on_owned_soundtracks)
         worker.failed.connect(self._on_sync_failed)
         worker.start()
+
+    # --- Вход в магазин во встроенном браузере ---
+    STORE_LOGIN_COOKIE = "steamLoginSecure"  # кука входа: Steam ставит её, когда вход прошёл
+
+    def _await_store_login(self):
+        hide_busy(self.win)  # снова нужен вход — браузер не должен оказаться под стеклом
+        self._awaiting_login = True
+        self._store_account = ""
+        self._cookie_store = web_profile(self).cookieStore()
+        self._cookie_store.cookieAdded.connect(self._on_store_cookie)
+        self.win.switchTo(self.win.home_page)
+        self.win.home_page.open_browser(STEAM_LOGIN_URL, self._back_text, self._back_from_login)
+
+    def _stop_cookie_watch(self):
+        store, self._cookie_store = getattr(self, "_cookie_store", None), None
+        if store:
+            try:
+                store.cookieAdded.disconnect(self._on_store_cookie)
+            except (RuntimeError, TypeError):
+                pass
+
+    def _on_store_cookie(self, cookie):
+        """Появилась кука входа в магазин — вход прошёл, возвращаемся к саундтрекам сами.
+
+        Из куки берём только номер аккаунта в её начале (чтобы сверить с подключённым). Саму куку
+        программа не хранит, не пишет в лог и никуда не отправляет — она остаётся в браузере.
+        """
+        if not self._awaiting_login or cookie.name().data().decode("ascii", "ignore") != self.STORE_LOGIN_COOKIE:
+            return
+        if not cookie.domain().lstrip(".").endswith("steampowered.com"):
+            return
+        match = re.match(r"(\d{17})", cookie.value().data().decode("ascii", "ignore"))
+        self._store_account = match.group(1) if match else ""
+        self._login_done = True
+        self._stop_cookie_watch()
+        core.log.info("Магазин Steam: вход выполнен (SteamID %s) — возвращаюсь к саундтрекам",
+                      core.short_steam_id(self._store_account))
+        QTimer.singleShot(1200, self._finish_store_login)  # даём магазину дорисовать страницу после входа
+
+    def _finish_store_login(self):
+        home = self.win.home_page
+        if home.browser and home.stack.currentWidget() is home.browser and home._browser_return == self._back_from_login:
+            home._leave_browser()  # само вызовет _back_from_login
+        elif self._awaiting_login:
+            self._back_from_login()
+        steam_id = self.win.my_steam_id()
+        if self._store_account and steam_id and self._store_account != steam_id:
+            notify("warning", self.win, "В магазин вошёл другой аккаунт",
+                   f"В магазине Steam вы вошли аккаунтом {core.short_steam_id(self._store_account)}, а к программе "
+                   f"подключён {core.short_steam_id(steam_id)}. Покупки будут показаны для аккаунта из магазина. "
+                   f"Сменить — «Настройки» → «Выйти из магазина Steam».", 10000)
+        elif self._after_sync:
+            # Дальше Steam разбирает покупки (это до минуты), а на экране ничего бы не происходило —
+            # показываем кружок ожидания под матовым стеклом, пока не вернём управление тому, кто просил
+            show_busy(self.win, "Вход в магазин Steam выполнен",
+                      getattr(self, "_login_text", None) or "Узнаю у Steam, что есть на вашем аккаунте. "
+                                                            "Это может занять до минуты.")
 
     def _on_owned_soundtracks(self, items):
         self.owned = items
@@ -5260,19 +8002,38 @@ class MusicPage(QWidget):
         self._refresh_game_page()
         downloaded = {a["appid"] for a in self.albums if a["appid"]}
         missing = sum(item["appid"] not in downloaded for item in items)
-        notify("success", self.win, "Синхронизировано со Steam",
-               f"Купленных саундтреков: {len(items)}, из них не скачано: {missing}.")
+        if not self._after_sync:  # синхронизацию попросила другая вкладка — итог покажет она сама
+            notify("success", self.win, "Синхронизировано со Steam",
+                   f"На аккаунте: {len(core.owned_apps())}. Купленных саундтреков: {len(items)}, "
+                   f"из них не скачано: {missing}.")
+        self._finish_sync()
 
     def _on_sync_failed(self, message):
         core.log.warning("Синхронизация саундтреков со Steam не удалась: %s", message)
         self._set_syncing(False)
         notify("warning", self.win, "Не удалось узнать покупки в Steam", message)
+        self._finish_sync()
 
     def _back_from_login(self):
-        self.win.switchTo(self)
+        self._stop_cookie_watch()  # вернулись кнопкой, не войдя, — больше не ждём
+        self.win.switchTo(self._return_page or self)
         if self._awaiting_login:
             self._awaiting_login = False
             QTimer.singleShot(0, self.sync_steam)
+        else:
+            if not self._syncing:
+                self._finish_sync()
+
+    def forget_store_login(self):
+        """«Выйти из магазина Steam»: стираем куки и кэш встроенного браузера и список покупок с прошлой синхронизации."""
+        profile = web_profile(self)
+        profile.cookieStore().deleteAllCookies()
+        profile.clearHttpCache()
+        core.forget_owned_soundtracks()
+        self.owned, self._synced = [], False
+        self.build_sources()
+        self._refresh_game_page()
+        core.log.info("Встроенный браузер: вход в магазин Steam и куки сайтов удалены")
 
     def _check_watched(self, albums):
         """Альбом, который попросили скачать, появился на диске — сообщаем."""
@@ -5317,22 +8078,39 @@ class SettingsPage(QWidget):
         self.win = window
         settings = self.win.settings
 
-        self.griddb_edit = LineEdit(self)
-        self.griddb_edit.setText(core.read_text(core.API_KEY_FILE))
+        self.griddb_edit = PasswordLineEdit(self)
+        self.griddb_edit.setText(settings["griddb_api_key"])
         self.steam_key_edit = PasswordLineEdit(self)
         self.steam_key_edit.setText(settings["steam_api_key"])
         self.steam_id_edit = LineEdit(self)
         self.steam_id_edit.setText(settings["steam_id"])
         self.save_button = PrimaryPushButton("Сохранить ключи", self, FIF.SAVE)
         self.save_button.clicked.connect(self.save_keys)
+        login_button = PushButton("Войти через Steam", self, FIF.PEOPLE)
+        login_button.setToolTip("Вход на сайте Steam в вашем браузере и ключ Steam Web API — по шагам")
+        login_button.clicked.connect(self.win.run_steam_setup)
+        forget_button = PushButton("Удалить ключ и выйти", self, FIF.DELETE)
+        forget_button.setToolTip("Стереть ключ Steam Web API и SteamID с этого компьютера")
+        forget_button.clicked.connect(self.forget_steam)
+        grid_button = PushButton("Ключ SteamGridDB", self, FIF.PHOTO)
+        grid_button.setToolTip("Что даёт ключ SteamGridDB и как его получить — по шагам, с проверкой ключа")
+        grid_button.clicked.connect(self.win.run_griddb_setup)
+        key_buttons = QHBoxLayout()
+        key_buttons.setSpacing(8)
+        for button in (self.save_button, login_button, grid_button, forget_button):
+            key_buttons.addWidget(button)
+        key_buttons.addStretch(1)
 
         keys = QGridLayout()
         keys.setHorizontalSpacing(16)
         keys.setVerticalSpacing(4)
         rows = [
-            ("SteamGridDB API key", self.griddb_edit, "steamgriddb.com → Preferences → API (обложки)"),
-            ("Steam Web API key", self.steam_key_edit, "steamcommunity.com/dev/apikey (импорт библиотеки)"),
-            ("SteamID64", self.steam_id_edit, "17 цифр, например 7656119…; можно узнать на steamid.io"),
+            ("SteamGridDB API key", self.griddb_edit,
+             "Обложки, фоны и живые фоны — необязательно; как получить — кнопка «Ключ SteamGridDB». "
+             "Хранится зашифрованным, только на этом ПК"),
+            ("Steam Web API key", self.steam_key_edit,
+             "steamcommunity.com/dev/apikey (импорт библиотеки). Хранится зашифрованным, только на этом ПК"),
+            ("SteamID64", self.steam_id_edit, "17 цифр, например 7656119…; проще — «Войти через Steam»"),
         ]
         for row, (label, edit, hint) in enumerate(rows):
             edit.setMinimumWidth(360)
@@ -5400,6 +8178,31 @@ class SettingsPage(QWidget):
         appearance.addWidget(self.theme_box)
         appearance.addStretch(1)
 
+        # Перевод описаний и отзывов: Google, а когда он не отвечает — модулем на этом ПК
+        self.translate_box = ComboBox(self)
+        self.translate_box.addItems(TRANSLATE_MODE_TITLES)
+        self.translate_box.setCurrentIndex(core.TRANSLATE_MODES.index(core.translate_mode()))
+        self.translate_box.currentIndexChanged.connect(self.change_translate_mode)
+        translate_row = QHBoxLayout()
+        translate_row.addWidget(BodyLabel("Переводить", self))
+        translate_row.addSpacing(16)
+        translate_row.addWidget(self.translate_box)
+        translate_row.addStretch(1)
+        self.model_button = PushButton("Скачать модуль перевода", self, FIF.DOWNLOAD)
+        self.model_button.clicked.connect(self.toggle_local_model)
+        self.model_bar = ProgressBar(self)
+        self.model_bar.setFixedWidth(320)
+        self.model_bar.hide()
+        model_row = QHBoxLayout()
+        model_row.setSpacing(12)
+        model_row.addWidget(self.model_button)
+        model_row.addWidget(self.model_bar)
+        model_row.addStretch(1)
+        self.model_status = CaptionLabel("", self)
+        self.model_status.setWordWrap(True)
+        self._model_busy = False
+        self.update_translator()
+
         # Где открывать ссылки с карточки игры (Metacritic, отзывы, обзоры)
         self.link_box = ComboBox(self)
         self.link_box.addItems(LINK_MODE_TITLES)
@@ -5414,6 +8217,14 @@ class SettingsPage(QWidget):
         if not QWebEngineView:
             self.link_box.setEnabled(False)
             links_hint.setText("Встроенный браузер недоступен — ссылки открываются во внешнем браузере")
+
+        # Встроенный браузер помнит вход в магазин Steam — даём его стереть
+        store_logout = PushButton("Выйти из магазина Steam", self, FIF.CLOSE)
+        store_logout.clicked.connect(self.forget_store_login)
+        store_logout.setEnabled(bool(QWebEngineView))
+        store_hint = CaptionLabel("Встроенный браузер помнит вход в магазин Steam: по нему программа узнаёт, какие "
+                                  "саундтреки вы купили. Кнопка стирает этот вход и куки всех сайтов браузера.", self)
+        store_hint.setWordWrap(True)
 
         # Настроек много — кладём их в прокручиваемую область
         content = QWidget()
@@ -5433,7 +8244,7 @@ class SettingsPage(QWidget):
         layout.addSpacing(8)
         layout.addWidget(StrongBodyLabel("Ключи", self))
         layout.addLayout(keys)
-        layout.addWidget(self.save_button, 0, Qt.AlignLeft)
+        layout.addLayout(key_buttons)
         layout.addSpacing(16)
         layout.addWidget(StrongBodyLabel("Звук", self))
         layout.addLayout(sound)
@@ -5442,10 +8253,28 @@ class SettingsPage(QWidget):
         layout.addWidget(StrongBodyLabel("Оформление", self))
         layout.addLayout(appearance)
         layout.addSpacing(16)
-        layout.addWidget(StrongBodyLabel("Ссылки", self))
+        layout.addWidget(StrongBodyLabel("Перевод описаний", self))
+        layout.addLayout(translate_row)
+        layout.addLayout(model_row)
+        layout.addWidget(self.model_status)
+        layout.addSpacing(16)
+        layout.addWidget(StrongBodyLabel("Встроенный браузер", self))
         layout.addLayout(links)
         layout.addWidget(links_hint)
+        layout.addSpacing(8)
+        layout.addWidget(store_logout, 0, Qt.AlignLeft)
+        layout.addWidget(store_hint)
         layout.addStretch(1)
+
+    def forget_store_login(self):
+        if not confirm(self.win, "Выйти из магазина Steam?",
+                       "Встроенный браузер забудет вход в магазин Steam и куки всех сайтов. Список купленных, но "
+                       "не скачанных саундтреков исчезнет до следующей синхронизации. Скачанные саундтреки, игры "
+                       "и ключи останутся.", "Выйти"):
+            return
+        self.win.music_page.forget_store_login()
+        notify("success", self.win, "Вы вышли из магазина Steam",
+               "Чтобы снова увидеть покупки, нажмите «Синхронизировать со Steam» на вкладке «Саундтреки».")
 
     def set_sounds_enabled(self, enabled):
         self.win.sounds.enabled = enabled
@@ -5519,18 +8348,48 @@ class SettingsPage(QWidget):
         if steam_id and not re.fullmatch(r"\d{17}", steam_id):
             notify("warning", self.win, "Неверный SteamID64", "Он должен состоять из 17 цифр.")
             return
+        if steam_key and not core.STEAM_KEY_RE.fullmatch(steam_key):
+            notify("warning", self.win, "Неверный ключ Steam Web API", "Это 32 знака из цифр и букв A–F.")
+            return
+        changes = {"steam_api_key": steam_key, "steam_id": steam_id, "griddb_api_key": griddb_key}
+        if steam_key and steam_id:
+            changes["steam_setup"] = "done"  # ключи введены вручную — мастер при запуске не нужен
+        grid_changed = griddb_key != core.griddb_key()
         try:
-            core.write_text(core.API_KEY_FILE, griddb_key)
-            core.save_settings(steam_api_key=steam_key, steam_id=steam_id)
+            core.save_settings(**changes)
         except OSError as e:
             notify("error", self.win, "Не удалось сохранить настройки", str(e))
             return
+        self.win.settings = core.load_settings()
         notify("success", self.win, "Ключи сохранены")
-        self.win.covers.retry(self.win.library.games)  # с новым ключом могут найтись обложки
+        if grid_changed:
+            self.win.on_griddb_key_changed()
+
+    def show_keys(self):
+        """Ключи и SteamID в полях — заново из settings.json (например, после мастера подключения)."""
+        settings = core.load_settings()
+        self.steam_key_edit.setText(settings["steam_api_key"])
+        self.steam_id_edit.setText(settings["steam_id"])
+        self.griddb_edit.setText(settings["griddb_api_key"])
+
+    def forget_steam(self):
+        if not confirm(self.win, "Удалить ключ и выйти?",
+                       "Ключ Steam Web API и SteamID будут стёрты с этого компьютера. Список игр, обложки и "
+                       "остальные настройки останутся. В самом Steam ключ продолжит действовать — чтобы отключить "
+                       "его совсем, на странице ключа нажмите «Revoke My Steam Web API Key».", "Удалить"):
+            return
         try:
-            core.clear_artwork_misses()  # …а также фоны и логотипы для страниц игр
-        except OSError:
-            pass
+            core.save_settings(steam_api_key="", steam_id="", steam_setup="")
+        except OSError as e:
+            notify("error", self.win, "Не удалось удалить ключ", str(e))
+            return
+        core.log.info("Ключ Steam Web API и SteamID удалены по кнопке «Удалить ключ и выйти»")
+        self.win.session_steam_id = ""  # и тот, что помнился только до закрытия программы
+        self.win.settings = core.load_settings()
+        self.show_keys()
+        self.win.music_page.build_sources()
+        notify("success", self.win, "Ключ и SteamID удалены",
+               "Подключить Steam снова — кнопка «Войти через Steam».")
 
     def change_theme(self, index):
         key = THEME_KEYS[index]
@@ -5547,6 +8406,103 @@ class SettingsPage(QWidget):
 
     def change_link_mode(self, index):
         core.save_settings(link_open=LINK_MODES[index])
+
+    # --- Перевод описаний ---
+    def change_translate_mode(self, index):
+        mode = core.TRANSLATE_MODES[index]
+        core.save_settings(translate_mode=mode)
+        core.log.info("Перевод описаний: %s", TRANSLATE_MODE_TITLES[index])
+        self.update_translator()
+
+    def update_translator(self):
+        """Что с модулем перевода на ПК: есть ли движок в программе, скачана ли модель — и что делает кнопка."""
+        if self._model_busy:
+            return
+        info = core.local_model_info()
+        local_only = core.translate_mode() == "local"
+        if not core.local_engine_available():
+            self.model_button.setEnabled(False)
+            text = ("Перевод на ПК недоступен: в этой сборке нет его движка (библиотек ctranslate2 и sentencepiece). "
+                    "Описания переводит Google.")
+            if local_only:
+                text += " Пока выбрано «Только на этом ПК», описания не переводятся."
+        elif info:
+            self.model_button.setEnabled(True)
+            self.model_button.setText("Удалить модуль перевода")
+            self.model_button.setIcon(FIF.DELETE)
+            text = (f"Модуль перевода скачан ({disk_size_text(info['size'])}). Он переводит прямо на этом ПК, без "
+                    "интернета: текст описаний никуда не отправляется. Качество чуть ниже, чем у Google.")
+        else:
+            self.model_button.setEnabled(True)
+            self.model_button.setText("Скачать модуль перевода")
+            self.model_button.setIcon(FIF.DOWNLOAD)
+            text = ("Google Переводчик иногда отказывает — тогда описание остаётся по-английски. Модуль перевода "
+                    "подстрахует его: переводит с английского прямо на этом ПК, без интернета. Скачивается один "
+                    "раз, около 190 МБ, с сайта открытого проекта Argos Translate.")
+            if local_only:
+                text += " Пока модуль не скачан, при «Только на этом ПК» описания не переводятся."
+        self.model_status.setText(text)
+
+    def toggle_local_model(self):
+        if core.local_model_info():
+            if not confirm(self.win, "Удалить модуль перевода?",
+                           "Модель перевода удалится с этого ПК. Уже переведённые описания останутся, а новые "
+                           "будет переводить только Google. Скачать модуль снова можно здесь же.", "Удалить"):
+                return
+            try:
+                core.remove_local_model()
+            except OSError as e:
+                notify("error", self.win, "Не удалось удалить модуль перевода",
+                       f"{e}. Закройте программу и удалите папку cache\\translate вручную.")
+                return
+            self.update_translator()
+            notify("success", self.win, "Модуль перевода удалён")
+            return
+        if not confirm(self.win, "Скачать модуль перевода?",
+                       "Около 190 МБ с argos-net.com — сайта открытого проекта Argos Translate. Это модель для "
+                       "перевода с английского на русский: только данные, не программа. Программа сверит её "
+                       "контрольную сумму, положит в папку cache\\translate рядом с собой и будет переводить "
+                       "описания и отзывы без интернета.",
+                       "Скачать"):
+            return
+        self._model_busy = True
+        self.model_button.setEnabled(False)
+        self.model_bar.setRange(0, 100)
+        self.model_bar.setValue(0)
+        self.model_bar.show()
+        self.model_status.setText("Подключаюсь…")
+        relay = ProgressRelay(self)
+        relay.progress.connect(self._on_model_progress)
+        worker = Worker(core.download_local_model, relay.report, parent=self)
+        worker.finished.connect(self._on_model_installed)
+        worker.failed.connect(self._on_model_failed)
+        worker.finished.connect(relay.deleteLater)
+        worker.failed.connect(relay.deleteLater)
+        worker.start()
+
+    def _on_model_progress(self, text, percent):
+        self.model_status.setText(text)
+        if percent >= 0:
+            self.model_bar.setValue(percent)
+
+    def _finish_model(self):
+        self._model_busy = False
+        self.model_bar.hide()
+        self.update_translator()
+
+    def _on_model_installed(self, info):
+        self._finish_model()
+        notify("success", self.win, "Модуль перевода установлен",
+               f"Теперь описания переводятся и без Google. Пробная фраза: «{info['sample']}»", 9000)
+
+    def _on_model_failed(self, message):
+        self._finish_model()
+        notify("error", self.win, "Модуль перевода не установлен",
+               message.split(": ", 1)[-1] + "\nПодробности — на вкладке «Логи».", 9000)
+
+
+# Перевод описаний — в том же порядке, что core.TRANSLATE_MODES
+TRANSLATE_MODE_TITLES = ("Google, при сбое — на этом ПК", "Только на этом ПК, без интернета", "Не переводить")
 
 
 # Где открывать ссылки с карточки игры
@@ -5610,6 +8566,127 @@ class AboutPage(QWidget):
         layout.addWidget(TitleLabel("О программе", self))
         layout.addSpacing(8)
         layout.addWidget(card_box)
+        layout.addStretch(1)
+
+
+# --- Страница «Игры Native Port's» (пока строится) --------------------------
+class RoadWorksArt(QWidget):
+    """Картинка «дорожные работы»: полосатый барьер с мигающим фонарём и дорожный конус. Рисуется сама —
+    без файлов и скачиваний, и в тёмной, и в светлой теме."""
+
+    ORANGE = QColor(255, 140, 0)
+    WHITE_STRIPE = QColor(250, 250, 250)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(360, 230)
+        self.lamp_on = True
+        self.timer = QTimer(self)
+        self.timer.setInterval(600)
+        self.timer.timeout.connect(self._blink)
+
+    def _blink(self):
+        self.lamp_on = not self.lamp_on
+        self.update()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.timer.start()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.timer.stop()  # на других вкладках фонарь не мигает
+
+    def _stripes(self, painter, rect):
+        """Доска барьера в косую оранжево-белую полосу."""
+        path = QPainterPath()
+        path.addRoundedRect(rect, 4, 4)
+        painter.save()
+        painter.setClipPath(path)
+        painter.fillRect(rect, self.WHITE_STRIPE)
+        painter.setBrush(self.ORANGE)
+        h, x = rect.height(), rect.left() - rect.height()
+        while x < rect.right():
+            painter.drawPolygon(QPolygonF([QPointF(x, rect.bottom()), QPointF(x + h, rect.top()),
+                                           QPointF(x + h + 16, rect.top()), QPointF(x + 16, rect.bottom())]))
+            x += 32
+        painter.restore()
+        painter.setPen(QPen(QColor(0, 0, 0, 60), 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(path)
+        painter.setPen(Qt.NoPen)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        dark = isDarkTheme()
+        painter.setBrush(QColor(0, 0, 0, 70 if dark else 35))  # тень на земле
+        painter.drawEllipse(QRectF(20, 200, 320, 22))
+
+        # Барьер: две стойки на ножках и две полосатые доски
+        post = QColor(90, 90, 98) if dark else QColor(120, 120, 128)
+        painter.setBrush(post)
+        for x in (62, 218):
+            painter.drawRoundedRect(QRectF(x, 70, 12, 138), 3, 3)
+            painter.drawRoundedRect(QRectF(x - 14, 202, 40, 8), 3, 3)
+        self._stripes(painter, QRectF(30, 88, 230, 34))
+        self._stripes(painter, QRectF(30, 138, 230, 26))
+
+        # Фонарь на левой стойке — мигает
+        painter.setBrush(post)
+        painter.drawRect(QRectF(63, 56, 10, 16))
+        lamp = QRectF(56, 34, 24, 24)
+        if self.lamp_on:
+            glow = QRadialGradient(lamp.center(), 34)
+            glow.setColorAt(0, QColor(255, 170, 0, 160))
+            glow.setColorAt(1, QColor(255, 170, 0, 0))
+            painter.setBrush(glow)
+            painter.drawEllipse(lamp.center(), 34, 34)
+        painter.setBrush(QColor(255, 176, 0) if self.lamp_on else QColor(150, 95, 20))
+        painter.drawEllipse(lamp)
+
+        # Конус с двумя белыми полосами
+        center, top, bottom = 308, 70, 200
+
+        def half(y):
+            return 6 + (y - top) / (bottom - top) * 24
+
+        painter.setBrush(self.ORANGE)
+        painter.drawPolygon(QPolygonF([QPointF(center - half(top), top), QPointF(center + half(top), top),
+                                       QPointF(center + half(bottom), bottom),
+                                       QPointF(center - half(bottom), bottom)]))
+        painter.setBrush(self.WHITE_STRIPE)
+        for y1, y2 in ((104, 120), (146, 162)):
+            painter.drawPolygon(QPolygonF([QPointF(center - half(y1), y1), QPointF(center + half(y1), y1),
+                                           QPointF(center + half(y2), y2), QPointF(center - half(y2), y2)]))
+        painter.setBrush(QColor(60, 60, 66))
+        painter.drawRoundedRect(QRectF(268, 198, 80, 10), 3, 3)
+
+
+class NativePortsPage(QWidget):
+    """Вкладка «Игры Native Port's» — пока заглушка: раздел появится в одной из следующих версий."""
+
+    def __init__(self, window):
+        super().__init__()
+        self.setObjectName("nativePortsPage")
+        self.win = window
+        art = RoadWorksArt(self)
+        title = TitleLabel("Coming Soon", self)
+        text = BodyLabel("Здесь будут игры Native Port's. Раздел ещё строится — он появится в одной из "
+                         "следующих версий.", self)
+        text.setAlignment(Qt.AlignCenter)
+        text.setWordWrap(True)
+        text.setMaximumWidth(460)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(36, 20, 36, 28)
+        layout.setSpacing(12)
+        layout.addStretch(1)
+        layout.addWidget(art, 0, Qt.AlignHCenter)
+        layout.addSpacing(12)
+        layout.addWidget(title, 0, Qt.AlignHCenter)
+        layout.addWidget(text, 0, Qt.AlignHCenter)
         layout.addStretch(1)
 
 
@@ -5703,6 +8780,7 @@ class MainWindow(MSFluentWindow):
             # Поэтому с браузером окно рисует обычный сплошной фон своей темы.
             self.setMicaEffectEnabled(False)
         self.settings = core.load_settings()
+        self.session_steam_id = ""  # SteamID из входа, когда запоминать его отказались: только до закрытия программы
         self.library = core.GameLibrary()
         self.load_message = self.library.load()
 
@@ -5715,14 +8793,19 @@ class MainWindow(MSFluentWindow):
 
         self.home_page = HomePage(self)
         self.library_page = LibraryPage(self)
+        self.native_page = NativePortsPage(self)
         self.music_page = MusicPage(self)
+        self.web_page = WebPage(self) if QWebEngineView else None
         self.settings_page = SettingsPage(self)
         self.logs_page = LogsPage(self)
         self.about_page = AboutPage(self)
         startup.mark("вкладки")
         self.addSubInterface(self.home_page, FIF.GAME, "Рулетка")
-        self.addSubInterface(self.library_page, FIF.LIBRARY, "Игры")
+        self.addSubInterface(self.library_page, FIF.LIBRARY, "Игры Steam")
+        self.addSubInterface(self.native_page, FIF.APPLICATION, "Игры Native Port's")
         self.addSubInterface(self.music_page, FIF.MUSIC, "Саундтреки")
+        if self.web_page:
+            self.addSubInterface(self.web_page, FIF.GLOBE, "Браузер")
         self.addSubInterface(self.logs_page, FIF.DOCUMENT, "Логи",
                              position=NavigationItemPosition.BOTTOM)
         self.addSubInterface(self.settings_page, FIF.SETTING, "Настройки",
@@ -5776,6 +8859,119 @@ class MainWindow(MSFluentWindow):
         self.set_music_enabled(bool(self.settings["music_enabled"]), save=False)
         if self.home_page.stack.currentWidget() is self.home_page.reel_view:
             self.home_page.reel.play_intro()
+        if core.griddb_key():
+            self.covers.upgrade(self.library.games)  # каждая обложка проверяется один раз, потом это мгновенно
+        if self.needs_steam_setup():
+            QTimer.singleShot(400, self.run_steam_setup)
+
+    @staticmethod
+    def needs_steam_setup():
+        """Первый запуск: Steam ещё не подключали, не нажимали «Пропустить» и не выбрали «Без ключа».
+        Кто обновился с ключом и SteamID, мастер не видит."""
+        settings = core.load_settings()
+        if settings["steam_api_key"] and settings["steam_id"]:
+            return False
+        return settings.get("steam_setup") not in ("done", "skipped", "no_key")
+
+    def run_steam_setup(self):
+        """Мастер подключения к Steam: при первом запуске, из «Настроек» и из «Импорт из Steam» без ключа."""
+        dialog = SteamSetupDialog(self)
+        core.log.info("Открыто окно «Подключение к Steam»")
+        dialog.exec()
+        connected, want_import, no_key = dialog.connected, dialog.want_import, dialog.no_key
+        repeated, session_id, grid_saved = dialog.repeated, dialog.session_id, dialog.grid_saved
+        core.log.info("Окно «Подключение к Steam» закрыто: %s",
+                      "подключено" if connected else "без ключа" if no_key else "без подключения")
+        dialog.deleteLater()
+        self.settings = core.load_settings()
+        if grid_saved:
+            self.on_griddb_key_changed()
+        if connected:
+            self.session_steam_id = ""
+        elif no_key:
+            self.session_steam_id = session_id  # SteamID не запомнили — помним только до закрытия программы
+        if no_key:
+            if repeated:
+                return  # «Без ключа» уже выбирали — всё как было, лишних уведомлений не нужно
+            self.settings_page.show_keys()
+            self.music_page.build_sources()  # разделы саундтреков по аккаунтам — по запомненному SteamID
+            if QWebEngineView and not core.owned_apps():
+                self.offer_store_login()
+            else:
+                notify("success", self, "Работаем без ключа",
+                       "Игры добавляются на вкладке «Игры Steam» → «Добавить» — с поиском по магазину Steam.", 7000)
+            return
+        if not connected:
+            if not (self.settings["steam_api_key"] and self.settings["steam_id"]) \
+                    and self.settings.get("steam_setup") != "no_key":  # «Без ключа» с прошлого раза остаётся
+                core.save_settings(steam_setup="skipped")  # при следующем запуске не навязываемся
+                self.show_steam_later()
+            return
+        self.settings_page.show_keys()
+        self.library_page.set_import_busy(False)
+        self.music_page.build_sources()  # пометки «скачан другим аккаунтом» — по новому SteamID
+        if want_import:
+            self.switchTo(self.library_page)
+            self.library_page.import_from_steam()
+        elif self.home_page.game_page.game and self.home_page.game_page.isVisible():
+            self.home_page.game_page.show_game(self.home_page.game_page.game)  # с ключом появятся достижения
+
+    def run_griddb_setup(self):
+        """«Настройки» → «Ключ SteamGridDB»: что даёт ключ, как его получить, проверка и сохранение."""
+        dialog = SteamGridDialog(self)
+        core.log.info("Открыто окно «Ключ SteamGridDB»")
+        dialog.exec()
+        saved = dialog.saved
+        dialog.deleteLater()
+        core.log.info("Окно «Ключ SteamGridDB» закрыто: %s", "ключ сохранён" if saved else "без изменений")
+        if saved:
+            self.on_griddb_key_changed()
+            notify("success", self, "Ключ SteamGridDB сохранён",
+                   "Обложки, фоны и живые фоны, которых нет в Steam, программа теперь возьмёт из SteamGridDB.", 6000)
+
+    def on_griddb_key_changed(self):
+        """Ключ SteamGridDB добавили, сменили или стёрли: игры без картинок ищутся заново."""
+        self.settings = core.load_settings()
+        self.settings_page.show_keys()
+        try:
+            core.clear_artwork_misses()
+            core.forget_cover_checks()  # обложки, собранные Steam из шапки, ищем в SteamGridDB заново
+        except OSError as e:
+            core.log.warning("Не удалось забыть ненайденные фоны и логотипы: %s", e)
+        if self.covers.retry(self.library.games) >= LOADING_THRESHOLD:
+            self.home_page.show_loading()
+        self.covers.upgrade(self.library.games)
+        game_page = self.home_page.game_page
+        if game_page.game and game_page.isVisible():
+            game_page.show_game(game_page.game)  # фон, логотип и живой фон — уже с новым ключом
+
+    def offer_store_login(self):
+        """После «Без ключа»: что есть на аккаунте, Steam без ключа показывает только после входа в магазин.
+        Шаг необязательный — можно войти позже прямо из окна «Добавить игру»."""
+        if not confirm(self, "Показать, что есть на вашем аккаунте?",
+                       "Без ключа Steam показывает ваши игры и саундтреки только тому, кто вошёл в магазин Steam — "
+                       "здесь, во встроенном браузере. Тогда при добавлении игр будет видно, какие уже есть на "
+                       "аккаунте, а в «Саундтреках» — купленные альбомы.\n\n"
+                       "Удобнее и безопаснее — по QR-коду в мобильном приложении Steam: пароль в программу не "
+                       "вводится вовсе. Вход запомнится только на этом ПК, стереть — «Настройки» → «Выйти из "
+                       "магазина Steam». Можно и позже: «Игры Steam» → «Добавить» → «Показать, что есть на моём аккаунте».",
+                       "Войти в магазин"):
+            notify("success", self, "Работаем без ключа",
+                   "Игры добавляются на вкладке «Игры Steam» → «Добавить» — с поиском по магазину Steam.", 7000)
+            return
+        self.switchTo(self.library_page)
+        self.music_page.sync_steam(after=self.library_page.offer_owned_games, back_text="К играм Steam",
+                                   return_page=self.library_page, ask=False)
+
+    def show_steam_later(self):
+        """Окно после «Пропустить»: что работает без Steam. «Добавить игру» — сразу к поиску игры."""
+        dialog = SteamLaterDialog(self)
+        core.log.info("Открыто окно «Steam можно подключить позже»")
+        add = bool(dialog.exec())
+        dialog.deleteLater()
+        if add:
+            self.switchTo(self.library_page)
+            self.library_page.add_games()
 
     def on_library_changed(self):
         if self.covers.enqueue(self.library.games) >= LOADING_THRESHOLD:
@@ -5818,11 +9014,68 @@ class MainWindow(MSFluentWindow):
         if not appid:
             return
         installed = core.is_installed(appid)
+        if not installed and not self.confirm_steam_account("установит игру"):
+            return
         core.log.info("%s «%s» (%s)", "Запуск" if installed else "Установка", game["name"], appid)
         if installed:
             self.open_in_steam(f"steam://run/{appid}", game, "run")
         else:
             self.open_in_steam(f"steam://install/{appid}", game, "install")
+
+    # Команды Steam, которые страница во встроенном браузере может передать: установка, запуск и страница
+    # в магазине — только с номером приложения и без параметров. Остальное (параметры запуска, удаление,
+    # прочие команды) программа не передаёт: так страница не заставит Steam сделать что-то за спиной пользователя.
+    STEAM_LINK_RE = re.compile(r"steam://(install|run|store|nav/games/details)/(\d+)/?", re.IGNORECASE)
+
+    def open_steam_link(self, url):
+        """Ссылка steam:// со страницы во встроенном браузере — например, «Установить» в магазине Steam."""
+        text = url.toString()
+        match = self.STEAM_LINK_RE.fullmatch(text)
+        if not match:
+            core.log.warning("Встроенный браузер: страница попросила Steam выполнить «%s» — не передаю", text[:120])
+            notify("warning", self, "Команда для Steam не передана",
+                   "Страница попросила Steam выполнить необычную команду. Из встроенного браузера программа "
+                   "передаёт Steam только установку, запуск и страницу в магазине. Если команда нужна — откройте "
+                   "страницу «Во внешнем браузере».", 9000)
+            return
+        action, appid = match.group(1).lower(), int(match.group(2))
+        if action == "install" and not self.confirm_steam_account("установит выбранное"):
+            return
+        core.log.info("Встроенный браузер: передаю в Steam %s", text)
+        if action == "install":
+            self.music_page.expect_install(appid)  # если это саундтрек — вернёмся к «Саундтрекам» и дождёмся его
+        worker = Worker(core.open_url, text, parent=self)  # в фоне: Steam может откликаться долго
+        worker.failed.connect(lambda message: notify("error", self, "Не удалось открыть Steam",
+                                                     "Проверьте, что Steam установлен."))
+        worker.start()
+
+    def my_steam_id(self):
+        """Ваш SteamID: запомненный в настройках или — если запоминать отказались — из входа в этом запуске."""
+        return self.settings.get("steam_id") or getattr(self, "session_steam_id", "")
+
+    def owns(self, appid):
+        """Игра есть на вашем аккаунте: по последней синхронизации покупок или потому, что её установил
+        на этот ПК ваш аккаунт (по файлам Steam — без ключа и без входа)."""
+        if appid in core.owned_apps():
+            return True
+        owner, mine = core.installed_owner(appid), self.my_steam_id()
+        return bool(owner and mine and owner == mine)
+
+    def confirm_steam_account(self, what):
+        """В клиент Steam на ПК вошёл не тот аккаунт, что подключён к программе, — спрашиваем, прежде чем
+        передавать ему команду: он выполнит её для себя. True — продолжать."""
+        other = core.other_steam_account(core.load_settings()["steam_id"] or getattr(self, "session_steam_id", ""))
+        if not other:
+            return True
+        core.log.info("В клиенте Steam вошёл другой аккаунт (SteamID %s), чем подключён к программе",
+                      core.short_steam_id(other))
+        name = core.steam_account_names().get(other)
+        who = f"«{name}», SteamID {core.short_steam_id(other)}" if name else f"SteamID {core.short_steam_id(other)}"
+        return confirm(self, "В Steam вошёл другой аккаунт",
+                       f"В Steam на этом ПК сейчас вошёл не тот аккаунт, что подключён к программе "
+                       f"(в Steam — {who}). Steam {what} для него, а если "
+                       f"у него этого нет — предложит купить. Чтобы получить в свой аккаунт, сначала войдите "
+                       f"в Steam им.", "Всё равно открыть Steam")
 
     def set_music_enabled(self, enabled, save=True):
         self.music.set_enabled(enabled)  # кнопки плееров обновятся по сигналу stateChanged
@@ -5838,6 +9091,14 @@ class MainWindow(MSFluentWindow):
         if playing:
             self.music_page.select_source(playing)
         self.switchTo(self.music_page)
+
+    def open_web(self, url):
+        """Открыть адрес на вкладке «Браузер»; без встроенного браузера — во внешнем."""
+        if not self.web_page:
+            QDesktopServices.openUrl(QUrl(url))
+            return
+        self.web_page.open(url)
+        self.switchTo(self.web_page)
 
     def play_pause(self):
         """Кнопка ▶/❚❚: выключенную музыку включает, иначе ставит на паузу или продолжает."""

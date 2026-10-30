@@ -14,6 +14,7 @@ venv/
 *.tmp
 games.json.broken
 covers_not_found.json
+covers_checked.json
 steam_app_names.json
 steam_details.json
 steam_reviews.json

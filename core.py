@@ -1,8 +1,11 @@
 """Логика без интерфейса: список игр, обложки, Steam, настройки."""
 
+import base64
 import functools
 import hashlib
+import hmac
 import html
+import http.server
 import io
 import json
 import logging
@@ -10,6 +13,7 @@ import math
 import os
 import random
 import re
+import secrets
 import struct
 import sys
 import tempfile
@@ -18,7 +22,7 @@ import time
 import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from logging.handlers import RotatingFileHandler
-from urllib.parse import quote, urljoin
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit
 
 import requests
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
@@ -69,6 +73,7 @@ REQUEST_TIMEOUT = 10  # секунд
 
 DEFAULT_SETTINGS = {
     "steam_api_key": "",
+    "griddb_api_key": "",  # ключ SteamGridDB (обложки, фоны, логотипы); до 2.3 лежал открытым в api_key.txt
     "steam_id": "",
     "music_enabled": True,
     "music_volume": 40,  # 0–100
@@ -78,12 +83,21 @@ DEFAULT_SETTINGS = {
     "music_repeat": "all",  # all — папка по кругу, one — повторять один трек
     "sounds_enabled": True,  # щелчки барабана и звук остановки
     "theme": "auto",  # auto | light | dark
+    # Подключение к Steam при первом запуске: "" — ещё не было, done — подключено, skipped — «Пропустить»,
+    # no_key — вошли, но Steam не выдал ключ, и выбрали «Без ключа» (SteamID — только если разрешили запомнить)
+    "steam_setup": "",
     # Последний выбор в окне импорта — по нему работает быстрая синхронизация
     "import_done": False,
     "import_include": [],  # id коллекций Steam
     "import_skip_hidden": True,
     "import_unplayed": False,
     "import_replace": False,
+    "import_family": True,  # брать игры семейной группы, подтверждённые Steam
+    "import_unverified": False,  # и «семейные» из своих коллекций, которые Steam не подтвердил (без входа в магазин)
+    "library_view": "list",  # вкладка «Игры»: list — списком, grid — плиткой с обложками
+    # Перевод описаний и отзывов: auto — Google, а когда он не отвечает — модулем на этом ПК;
+    # local — только модулем на ПК (текст не уходит в интернет); off — не переводить
+    "translate_mode": "auto",
 }
 
 
@@ -146,8 +160,9 @@ def is_steam_music(path):
 # --- Логи -------------------------------------------------------------------
 log = logging.getLogger("MySteamRandom")
 
-# Ключи API попадают в адреса запросов (…?key=…) и тексты ошибок — в логах их прячем
-_SECRET_RE = re.compile(r"(key=|Bearer\s+)[^&\s'\"]+", re.IGNORECASE)
+# Ключи API и временный токен входа попадают в адреса запросов (…?key=…, …?access_token=…) и тексты ошибок —
+# в логах их прячем
+_SECRET_RE = re.compile(r"(key=|access_token=|webapi_token\"?:\s*\"?|Bearer\s+)[^&\s'\"]+", re.IGNORECASE)
 
 
 def mask_secrets(text):
@@ -235,20 +250,129 @@ def save_json(path, data):
     os.replace(tmp_path, path)
 
 
-def load_settings():
-    settings = dict(DEFAULT_SETTINGS)
+# --- Шифрование ключей ------------------------------------------------------
+# Ключи Steam Web API и SteamGridDB хранятся в settings.json не открытым текстом, а зашифрованными средствами
+# Windows (DPAPI): расшифровать их может только эта учётная запись Windows на этом ПК. Скопированный на другой
+# компьютер settings.json ключей не выдаст. Остальной код ничего об этом не знает: load_settings отдаёт ключи уже
+# расшифрованными, а save_settings сам шифрует их перед записью.
+SECRET_FIELDS = {"steam_api_key": "steam_api_key_protected", "griddb_api_key": "griddb_api_key_protected"}
+_DPAPI_ENTROPY = b"Backlog Roulette: Steam Web API key"
+_unprotected = {}  # расшифрованные ключи: load_settings вызывается часто, DPAPI каждый раз не дёргаем
+_settings_lock = threading.RLock()
+
+
+def _dpapi(data, protect):
+    import ctypes
+    from ctypes import wintypes
+
+    class DataBlob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    def blob(raw):
+        buffer = ctypes.create_string_buffer(raw, len(raw))
+        return DataBlob(len(raw), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char))), buffer
+
+    data_in, keep_in = blob(data)
+    entropy, keep_entropy = blob(_DPAPI_ENTROPY)
+    data_out = DataBlob()
+    crypt32 = ctypes.windll.crypt32
+    function = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    ui_forbidden = 0x1  # никаких окон Windows: ошибка — значит ошибка
+    if not function(ctypes.byref(data_in), None, ctypes.byref(entropy), None, None, ui_forbidden,
+                    ctypes.byref(data_out)):
+        raise OSError(ctypes.WinError())
+    try:
+        return ctypes.string_at(data_out.pbData, data_out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(ctypes.cast(data_out.pbData, ctypes.c_void_p))
+
+
+def can_protect_secrets():
+    return sys.platform == "win32"
+
+
+def protect_secret(text):
+    return base64.b64encode(_dpapi(text.encode("utf-8"), protect=True)).decode("ascii")
+
+
+def unprotect_secret(stored):
+    """Расшифрованный ключ или "" — если он зашифрован на другом ПК или другой учётной записью Windows."""
+    if stored in _unprotected:
+        return _unprotected[stored]
+    try:
+        text = _dpapi(base64.b64decode(stored), protect=False).decode("utf-8")
+    except (OSError, ValueError) as e:
+        log.warning("Ключ из settings.json не расшифровался (%s): похоже, файл перенесли с другого ПК. "
+                    "Введите ключи заново: «Настройки» → «Войти через Steam» и поле SteamGridDB", e)
+        text = ""
+    _unprotected[stored] = text
+    return text
+
+
+def _read_settings_file():
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as f:
-            settings.update(json.load(f))
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError):
-        pass
+        return {}
+
+
+def _write_settings(settings):
+    data = dict(settings)
+    for field, protected in SECRET_FIELDS.items():
+        key = data.pop(field, "")
+        data.pop(protected, None)
+        if key and can_protect_secrets():
+            data[protected] = protect_secret(key)
+            data[field] = ""
+        else:
+            data[field] = key
+    save_json(SETTINGS_FILE, data)
+
+
+def load_settings():
+    with _settings_lock:  # обложки качаются в нескольких потоках — переносить ключ должен кто-то один
+        return _load_settings()
+
+
+def _load_settings():
+    settings = dict(DEFAULT_SETTINGS)
+    settings.update(_read_settings_file())
+    rewrite = False
+    for field, protected in SECRET_FIELDS.items():
+        stored = settings.pop(protected, "")
+        if stored:
+            settings[field] = unprotect_secret(stored)
+        elif settings[field] and can_protect_secrets():
+            rewrite = True  # до 2.3 ключ Steam лежал открытым текстом — перешифровываем на месте
+    # До 2.3 ключ SteamGridDB лежал открытым текстом в api_key.txt — переносим его в settings.json зашифрованным
+    legacy = read_text(API_KEY_FILE) if not settings["griddb_api_key"] and can_protect_secrets() else ""
+    if legacy:
+        settings["griddb_api_key"] = legacy
+        rewrite = True
+    if rewrite:
+        try:
+            _write_settings(settings)
+            if legacy:
+                os.remove(API_KEY_FILE)
+            log.info("Ключи теперь хранятся в settings.json зашифрованными%s",
+                     " (api_key.txt с открытым ключом SteamGridDB удалён)" if legacy else "")
+        except OSError as e:
+            log.warning("Не удалось зашифровать ключи: %s", e)
     return settings
 
 
+def griddb_key():
+    """Ключ SteamGridDB (пусто — не задан). Можно вызывать из фоновых потоков."""
+    return load_settings()["griddb_api_key"]
+
+
 def save_settings(**changes):
-    settings = load_settings()
-    settings.update(changes)
-    save_json(SETTINGS_FILE, settings)
+    with _settings_lock:
+        settings = _load_settings()
+        settings.update(changes)
+        _write_settings(settings)
 
 
 # Очистка названия: Steam иногда присылает его с HTML-кодами («Assassin&apos;s Creed») — раскрываем их,
@@ -392,19 +516,26 @@ def clear_covers():
                 os.remove(os.path.join(COVERS_DIR, file_name))
                 removed += 1
     save_not_found(set())
+    forget_cover_checks(keep_custom=False)
     return removed
+
+
+NOT_FOUND_VERSION = 2  # 2: ищем и по настоящим адресам картинок Steam — прежний список ненайденных забываем
 
 
 def load_not_found():
     try:
         with open(NOT_FOUND_FILE, encoding="utf-8") as f:
-            return set(json.load(f))
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("version") == NOT_FOUND_VERSION:
+            return set(data.get("names") or [])
     except (FileNotFoundError, json.JSONDecodeError, TypeError):
-        return set()
+        pass
+    return set()
 
 
 def save_not_found(names):
-    save_json(NOT_FOUND_FILE, sorted(names))
+    save_json(NOT_FOUND_FILE, {"version": NOT_FOUND_VERSION, "names": sorted(names)})
 
 
 def delete_cover(name):
@@ -431,14 +562,14 @@ def fetch(url, **kwargs):
     return response
 
 
-def download_from_steamgriddb(name, api_key):
+def download_from_steamgriddb(game, api_key):
+    """Вертикальная обложка игры из SteamGridDB (байты) или None. Игру ищем по номеру в Steam, иначе по названию."""
     headers = {"Authorization": f"Bearer {api_key}"}
-    search_url = f"{STEAMGRIDDB_API_URL}/search/autocomplete/{quote(name, safe='')}"
-    found = fetch(search_url, headers=headers).json().get("data", [])
-    if not found:
+    game_id = _griddb_game_id(game, api_key)
+    if not game_id:
         return None
 
-    grids_url = f"{STEAMGRIDDB_API_URL}/grids/game/{found[0]['id']}"
+    grids_url = f"{STEAMGRIDDB_API_URL}/grids/game/{game_id}"
     # Сначала просим вертикальные обложки 600x900, затем любые
     grids = fetch(grids_url, headers=headers, params={"dimensions": "600x900"}).json().get("data", [])
     if not grids:
@@ -448,43 +579,466 @@ def download_from_steamgriddb(name, api_key):
     return fetch(grids[0]["url"]).content
 
 
+def cover_detail(image):
+    """Сколько мелких деталей в верхней четверти, в середине и в нижней четверти обложки: (верх, середина, низ)."""
+    edges = image.convert("L").resize((60, 90)).filter(ImageFilter.FIND_EDGES)
+
+    def detail(top, bottom):
+        values = list(edges.crop((2, top, 58, bottom)).getdata())  # у самых краёв FIND_EDGES даёт ложные линии
+        return sum(values) / len(values)
+
+    return detail(2, 22), detail(36, 54), detail(68, 88)
+
+
+# Пороги для looks_generated. Steam собирает обложку тремя способами:
+# 1) шапка по центру, сверху и снизу размытое продолжение — верх и низ гладкие, середина детальная
+#    (Final Fantasy IV: верх 0.1, середина 48.8, низ 0.0);
+# 2) шапка вверху, ниже — её размытое продолжение: верх детальный, середина уже наполовину размыта, низ совсем
+#    гладкий (Back to the Future Ep 2–5: верх ≈20, середина ≈15, низ ≈1.5; Beyond Good & Evil: 13.7 / 5.9 / 1.2;
+#    F.E.A.R.: 13.7 / 18.4 / 1.3; Singularity: 6.0 / 7.9 / 1.1; Murdered: Soul Suspect: 6.8 / 7.6 / 1.3).
+#    У настоящих обложек с тёмным низом середина детальнее верха в разы (Borderlands 4: 5.6 / 73.0 / 0.3,
+#    Watch_Dogs: 6.8 / 27.7 / 1.6) — их второе правило не трогает;
+# 3) шапка внизу, выше — гладкая заливка: верх пустой, середина и низ детальные, низ заметно спокойнее середины
+#    (Alone in the Dark: 0.0 / 36.5 / 7.1; Dino Crisis: 0.4 / 44.3 / 14.1).
+GENERATED_EDGE_MAX = 5  # способ 1: верх и низ — размытое продолжение шапки, деталей почти нет
+GENERATED_MIDDLE_MIN = 3.5
+GENERATED_RATIO = 3  # середина хотя бы втрое детальнее верха и низа
+GENERATED_TOP_BOTTOM_MAX = 2.5  # способ 2: низ гладкий…
+GENERATED_TOP_MIN = 5  # …верх детальный…
+GENERATED_TOP_MIDDLE = 1.4  # …и середина детальнее верха не больше чем на 40 %
+GENERATED_EMPTY_TOP = 1  # способ 3: верх почти пустой…
+GENERATED_BOTTOM_RATIO = 3  # …а середина хотя бы втрое детальнее низа
+
+
+def looks_generated(image):
+    """Обложку собрал сам Steam из горизонтальной шапки игры: шапка по центру, вверху или внизу, а остальное —
+    её размытое продолжение или заливка. Так Steam делает обложки старым играм, у которых настоящей вертикальной
+    нет. Узнаём их по гладкой (без мелких деталей) верхней и нижней четверти при обычной середине, по гладкому
+    низу при детальном верхе — или по пустому верху при детальной середине."""
+    top, middle, bottom = cover_detail(image)
+    edge = max(top, bottom)
+    if edge < GENERATED_EDGE_MAX and middle >= max(GENERATED_MIDDLE_MIN, edge * GENERATED_RATIO):
+        return True
+    if bottom < GENERATED_TOP_BOTTOM_MAX and top >= GENERATED_TOP_MIN and middle <= top * GENERATED_TOP_MIDDLE:
+        return True
+    return (top < GENERATED_EMPTY_TOP and middle >= GENERATED_MIDDLE_MIN
+            and middle >= bottom * GENERATED_BOTTOM_RATIO)
+
+
+def _content_generated(content):
+    try:
+        with Image.open(io.BytesIO(content)) as image:
+            return looks_generated(image)
+    except (OSError, ValueError):
+        return False
+
+
 def download_cover(game, steamgriddb_key):
     """Возвращает (путь к обложке или None, список ошибок)."""
     errors = []
 
-    # 1. Официальная обложка Steam — не требует ключа, нужен только appid
+    # 1. Официальная обложка Steam — не требует ключа, нужен только appid. Сначала по старому адресу,
+    # а у новых игр (и демоверсий) — по настоящему адресу из магазина
+    steam_content = None
     if game.get("appid"):
         try:
-            content = fetch(STEAM_COVER_URL.format(appid=game["appid"])).content
-            return save_cover_bytes(game["name"], content), errors
-        except (requests.RequestException, OSError) as e:
+            steam_content = fetch(STEAM_COVER_URL.format(appid=game["appid"])).content
+        except requests.RequestException as e:
             errors.append(f"Steam: {e}")
+            steam_content = _steam_asset(game["appid"], "cover")
+    # Обложку собрал Steam из шапки — с ключом сначала ищем настоящую в SteamGridDB
+    if steam_content and not (steamgriddb_key and _content_generated(steam_content)):
+        try:
+            return save_cover_bytes(game["name"], steam_content), errors
+        except OSError as e:
+            errors.append(f"Steam: {e}")
+            steam_content = None
 
-    # 2. SteamGridDB — поиск по названию
+    # 2. SteamGridDB
     if not steamgriddb_key:
         errors.append("SteamGridDB: не задан API-ключ")
         return None, errors
     try:
-        content = download_from_steamgriddb(game["name"], steamgriddb_key)
+        content = download_from_steamgriddb(game, steamgriddb_key)
         if content:
             return save_cover_bytes(game["name"], content), errors
         errors.append("SteamGridDB: игра не найдена")
     except (requests.RequestException, OSError, ValueError, KeyError) as e:
-        errors.append(f"SteamGridDB: {e}")
+        errors.append(f"SteamGridDB: {mask_secrets(e)}")
+    if steam_content:  # в SteamGridDB ничего — остаётся обложка, собранная Steam
+        try:
+            return save_cover_bytes(game["name"], steam_content), errors
+        except OSError as e:
+            errors.append(f"Steam: {e}")
     return None, errors
 
 
+# Обложки, скачанные раньше: какие уже проверены на «собрана Steam из шапки» и какие выбраны вручную
+# (их программа не заменяет никогда). После смены ключа SteamGridDB проверка начинается заново.
+COVER_CHECKS_FILE = os.path.join(BASE_DIR, "covers_checked.json")
+COVER_CHECKS_VERSION = 4  # 4: мягче пороги и шапка внизу — все проверяются заново (выбранные вручную — нет)
+_cover_checks_lock = threading.Lock()
+
+
+def _load_cover_checks():
+    try:
+        with open(COVER_CHECKS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            fresh = data.get("version") == COVER_CHECKS_VERSION
+            return {"checked": set(data.get("checked") or []) if fresh else set(),
+                    "custom": set(data.get("custom") or [])}
+    except (FileNotFoundError, json.JSONDecodeError, TypeError):
+        pass
+    return {"checked": set(), "custom": set()}
+
+
+def _save_cover_checks(checks):
+    save_json(COVER_CHECKS_FILE, {"version": COVER_CHECKS_VERSION, "checked": sorted(checks["checked"]),
+                                  "custom": sorted(checks["custom"])})
+
+
+def mark_custom_cover(name):
+    """Обложку выбрали вручную — её программа больше не трогает."""
+    with _cover_checks_lock:
+        checks = _load_cover_checks()
+        checks["custom"].add(clean_name(name))
+        _save_cover_checks(checks)
+
+
+def forget_cover_checks(keep_custom=True):
+    """Ключ SteamGridDB сменился — собранные Steam обложки проверяем заново (выбранные вручную — нет)."""
+    with _cover_checks_lock:
+        checks = _load_cover_checks()
+        _save_cover_checks({"checked": set(), "custom": checks["custom"] if keep_custom else set()})
+
+
+def upgrade_generated_covers(games, api_key, on_replaced=None):
+    """Уже скачанные обложки, которые Steam собрал из шапки, — заменить настоящими из SteamGridDB.
+
+    Каждая обложка проверяется один раз (список — в covers_checked.json). on_replaced(название) — обложка
+    заменена. Вызывается в фоновом потоке. Возвращает, сколько заменено.
+    """
+    if not api_key:
+        return 0
+    with _cover_checks_lock:
+        checks = _load_cover_checks()
+    found, missing, replaced, failed, checked = 0, [], 0, 0, 0
+    near = []  # не прошли проверку, но ближе всех к порогу — в лог, чтобы было видно, как работает проверка
+    try:
+        for game in games:
+            name = clean_name(game["name"])
+            if name in checks["checked"] or name in checks["custom"]:
+                continue
+            path = find_cover(name)
+            if not path:
+                continue
+            checks["checked"].add(name)
+            checked += 1
+            try:
+                with Image.open(path) as image:
+                    top, middle, bottom = cover_detail(image)
+                    generated = looks_generated(image)
+            except (OSError, ValueError):
+                continue
+            if not generated:
+                near.append((middle / max(top, bottom, 0.5), name, top, middle, bottom))
+                continue
+            found += 1
+            try:
+                content = download_from_steamgriddb(game, api_key)
+            except (requests.RequestException, ValueError, KeyError) as e:
+                log.warning("Обложка «%s» из SteamGridDB не скачалась: %s", name, mask_secrets(e))
+                checks["checked"].discard(name)  # нет связи — попробуем при следующем запуске
+                failed += 1
+                continue
+            if not content:
+                missing.append(name)
+                continue
+            save_cover_bytes(name, content)
+            replaced += 1
+            log.info("Обложка «%s» была собрана Steam из шапки (верх %.1f, середина %.1f, низ %.1f) — "
+                     "заменена из SteamGridDB", name, top, middle, bottom)
+            if on_replaced:
+                on_replaced(game["name"])
+    finally:
+        with _cover_checks_lock:
+            custom = _load_cover_checks()["custom"]  # пока мы работали, обложку могли выбрать вручную
+            _save_cover_checks({"checked": checks["checked"], "custom": custom | checks["custom"]})
+    if checked:
+        near.sort(reverse=True)
+        log.info("Обложки, собранные Steam из шапки игры: проверено %d, похожих %d, заменено из SteamGridDB %d, "
+                 "не скачалось %d, в SteamGridDB нет: %s. Ближе всех к порогу, но не заменены: %s", checked, found,
+                 replaced, failed, (", ".join(missing[:30]) + (" …" if len(missing) > 30 else "")) or "—",
+                 "; ".join(f"«{n}» (верх {t:.1f}, середина {m:.1f}, низ {b:.1f})" for _, n, t, m, b in near[:8])
+                 or "—")
+    return replaced
+
+
+class ServiceBusy(Exception):
+    """Сайт (SteamGridDB, Google) сейчас не отвечает или отвечает пустотой. Текст — для пользователя."""
+
+
+GRIDDB_RETRY_PAUSE = 3  # секунд: SteamGridDB порой минуту отвечает пустыми страницами, потом снова работает
+
+
+def cover_from_griddb(game, api_key):
+    """Заменить обложку игры лучшей вертикальной из SteamGridDB — по просьбе пользователя. Путь или None — там нет.
+    Такую обложку программа потом не трогает, как и выбранную вручную. Сайт не ответил и со второго раза —
+    ServiceBusy."""
+    name = clean_name(game["name"])
+    old = find_cover(name)
+    if old:
+        # Цифры проверки «собрана Steam из шапки» для старой обложки — по ним подстраивается порог
+        try:
+            with Image.open(old) as image:
+                top, middle, bottom = cover_detail(image)
+                generated = looks_generated(image)
+            log.info("Обложка «%s» до замены: верх %.1f, середина %.1f, низ %.1f — %s", name, top, middle, bottom,
+                     "похожа на собранную Steam" if generated else "проверка не сочла её собранной Steam")
+        except (OSError, ValueError):
+            pass
+    content, error = None, None
+    for attempt in range(2):
+        if attempt:
+            time.sleep(GRIDDB_RETRY_PAUSE)
+        try:
+            content = download_from_steamgriddb(game, api_key)
+            error = None
+            break
+        except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+            error = e
+    if error is not None:
+        log.warning("Обложка «%s»: SteamGridDB не ответил и со второго раза: %s", name, mask_secrets(error))
+        raise ServiceBusy("SteamGridDB сейчас не отвечает. Так бывает минуту-другую — попробуйте чуть позже.")
+    if not content:
+        log.info("Обложка «%s»: в SteamGridDB вертикальной обложки нет", game["name"])
+        return None
+    path = save_cover_bytes(game["name"], content)
+    mark_custom_cover(game["name"])
+    log.info("Обложка «%s» заменена из SteamGridDB по просьбе пользователя", game["name"])
+    return path
+
+
 # --- Steam ------------------------------------------------------------------
-def fetch_owned_games(api_key, steam_id):
+def fetch_owned_games(api_key, steam_id, free=True):
+    """Игры аккаунта из Web API. free — и бесплатные, в которые играли (без них Steam отдаёт только купленное)."""
     params = {
         "key": api_key,
         "steamid": steam_id,
         "include_appinfo": 1,
-        "include_played_free_games": 1,
+        "include_played_free_games": 1 if free else 0,
         "format": "json",
     }
     data = fetch(STEAM_OWNED_GAMES_URL, params=params).json()
     return data.get("response", {}).get("games", [])
+
+
+def _drop_free_non_games(games, api_key, steam_id):
+    """Среди бесплатных, в которые играли, Steam присылает и моды (Killing Floor Mod: Defence Alliance 2 и т. п.)
+    — это не игры из библиотеки. Бесплатные оставляем, только если магазин Steam знает их как игру.
+    Магазин не ответил — оставляем всё как есть. Возвращает appid убранных."""
+    try:
+        paid = {g.get("appid") for g in fetch_owned_games(api_key, steam_id, free=False)}
+        free = [appid for appid in games if appid not in paid]
+        if not free:
+            return []
+        items = store_items(free)
+    except (requests.RequestException, ValueError) as e:
+        log.warning("Бесплатные игры не проверены (моды могут попасть в список): %s", e)
+        return []
+    dropped = [appid for appid in free
+               if appid not in items or items[appid]["type"] not in (None, STORE_TYPE_GAME)]
+    for appid in dropped:
+        log.info("Не игра, убрана из своих: «%s» (%s) — %s", games[appid]["name"], appid,
+                 "магазин её не знает" if appid not in items else f"тип в магазине {items[appid]['type']}")
+        del games[appid]
+    return dropped
+
+
+# --- Вход через Steam -------------------------------------------------------
+# Вход идёт через официальный вход Steam (OpenID) в обычном браузере пользователя — не во встроенном:
+# программа, внутри которой открыта страница входа, технически может прочитать всё, что туда вводят.
+# Во внешнем браузере пароль, коды Steam Guard и сессия программе недоступны вовсе. Она получает
+# только SteamID, а чтобы его нельзя было подделать, ответ перепроверяется прямым запросом к Steam.
+STEAM_OPENID_URL = "https://steamcommunity.com/openid/login"
+STEAM_OPENID_ID_RE = re.compile(r"https://steamcommunity\.com/openid/id/(\d{17})")
+OPENID_NS = "http://specs.openid.net/auth/2.0"
+OPENID_SELECT = "http://specs.openid.net/auth/2.0/identifier_select"
+STEAM_API_KEY_PAGE = "https://steamcommunity.com/dev/apikey"
+STEAM_PRIVACY_PAGE = "https://steamcommunity.com/my/edit/settings"
+STEAM_PLAYER_SUMMARIES_URL = "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
+STEAM_KEY_RE = re.compile(r"[0-9A-Fa-f]{32}")
+LOGIN_TIMEOUT = 300  # секунд на вход в браузере
+
+
+class SteamLoginError(Exception):
+    pass
+
+
+def short_steam_id(steam_id):
+    """SteamID для логов: только последние цифры — логи пользователи присылают другим людям."""
+    return f"…{str(steam_id)[-4:]}" if steam_id else "нет"
+
+
+_LOGIN_PAGE = """<!doctype html><html lang="ru"><meta charset="utf-8"><title>Backlog Roulette</title>
+<body style="font-family:Segoe UI,sans-serif;background:#202020;color:#fff;display:flex;align-items:center;
+justify-content:center;height:100vh;margin:0"><div style="text-align:center;max-width:460px">
+<h2>{title}</h2><p style="color:#ccc">{text}</p></div></body></html>"""
+
+
+class SteamLogin:
+    """Один вход через Steam. Создаётся в главном потоке, wait() ждёт ответа в фоновом.
+
+    Steam возвращает пользователя на адрес программы на этом же ПК: маленький сервер слушает только
+    127.0.0.1 (из сети к нему не подключиться) на случайном порту и принимает ответ, только если в нём
+    случайная метка этого входа. Затем ответ проверяется у самого Steam (check_authentication).
+    """
+
+    def __init__(self):
+        self.state = secrets.token_urlsafe(24)
+        self.steam_id = None
+        self.error = None
+        login = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            timeout = 5  # браузер может открыть соединение заранее и молчать — не ждём его вечно
+
+            def do_GET(self):
+                login._on_request(self)
+
+            def log_message(self, *args):
+                pass  # адреса с ответом Steam в лог не пишем
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.server.timeout = 0.5
+        self.return_to = f"http://127.0.0.1:{self.server.server_address[1]}/steam-login?state={self.state}"
+
+    def url(self):
+        params = {
+            "openid.ns": OPENID_NS,
+            "openid.mode": "checkid_setup",
+            "openid.return_to": self.return_to,
+            "openid.realm": f"http://127.0.0.1:{self.server.server_address[1]}/",
+            "openid.identity": OPENID_SELECT,
+            "openid.claimed_id": OPENID_SELECT,
+        }
+        return f"{STEAM_OPENID_URL}?{urlencode(params)}"
+
+    def wait(self, cancelled):
+        """SteamID после входа; None — окно закрыли. Не вошли за LOGIN_TIMEOUT или Steam не подтвердил — ошибка."""
+        deadline = time.monotonic() + LOGIN_TIMEOUT
+        try:
+            while self.steam_id is None and self.error is None:
+                if cancelled():
+                    return None
+                if time.monotonic() > deadline:
+                    raise SteamLoginError("вход не завершён за 5 минут. Нажмите «Войти через Steam» ещё раз")
+                self.server.handle_request()
+        finally:
+            self.server.server_close()
+        if self.error:
+            raise SteamLoginError(self.error)
+        log.info("Вход через Steam: подтверждён, SteamID %s", short_steam_id(self.steam_id))
+        return self.steam_id
+
+    def _on_request(self, request):
+        parts = urlsplit(request.path)
+        query = {k: v[0] for k, v in parse_qs(parts.query, keep_blank_values=True).items()}
+        if parts.path != "/steam-login" or not hmac.compare_digest(query.get("state", ""), self.state):
+            self._reply(request, 404, "Страница не найдена", "")
+            return
+        if query.get("openid.mode") == "cancel":
+            self.error = "вход отменён на странице Steam"
+            self._reply(request, 200, "Вход отменён", "Вернитесь в Backlog Roulette.")
+            return
+        try:
+            self.steam_id = verify_steam_login(query, self.return_to)
+        except (SteamLoginError, requests.RequestException) as e:
+            self.error = mask_secrets(e) if isinstance(e, SteamLoginError) else f"Steam не ответил: {mask_secrets(e)}"
+            log.warning("Вход через Steam не подтверждён: %s", self.error)
+            self._reply(request, 200, "Вход не удался", "Вернитесь в Backlog Roulette и попробуйте ещё раз.")
+            return
+        self._reply(request, 200, "Готово!", "Вход подтверждён. Эту вкладку можно закрыть и вернуться в Backlog Roulette.")
+
+    @staticmethod
+    def _reply(request, status, title, text):
+        body = _LOGIN_PAGE.format(title=html.escape(title), text=html.escape(text)).encode("utf-8")
+        request.send_response(status)
+        request.send_header("Content-Type", "text/html; charset=utf-8")
+        request.send_header("Content-Length", str(len(body)))
+        request.send_header("Cache-Control", "no-store")
+        request.end_headers()
+        request.wfile.write(body)
+
+
+def verify_steam_login(params, return_to):
+    """SteamID из ответа Steam — только если ответ наш, пришёл от Steam и Steam его подтвердил."""
+    if params.get("openid.ns") != OPENID_NS or params.get("openid.mode") != "id_res":
+        raise SteamLoginError("Steam прислал непонятный ответ")
+    if params.get("openid.op_endpoint") != STEAM_OPENID_URL or params.get("openid.return_to") != return_to:
+        raise SteamLoginError("ответ пришёл не от Steam или не на этот вход")
+    match = STEAM_OPENID_ID_RE.fullmatch(params.get("openid.claimed_id", ""))
+    if not match or params.get("openid.identity") != params.get("openid.claimed_id"):
+        raise SteamLoginError("в ответе Steam нет номера аккаунта")
+    # Главная проверка: спрашиваем сам Steam, выдавал ли он этот ответ. Подделку он не подтвердит
+    check = dict(params, **{"openid.mode": "check_authentication"})
+    check.pop("state", None)
+    response = requests.post(STEAM_OPENID_URL, data=check, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    if "is_valid:true" not in response.text.splitlines():
+        raise SteamLoginError("Steam не подтвердил вход")
+    return match.group(1)
+
+
+def check_steam_key(api_key, steam_id):
+    """Проверка ключа одним запросом: {"name": имя в Steam, "games": сколько игр, "private": игры скрыты}."""
+    if not STEAM_KEY_RE.fullmatch(api_key or ""):
+        raise SteamLoginError("ключ — это 32 знака из цифр и букв A–F. Скопируйте его со страницы целиком")
+    try:
+        response = requests.get(STEAM_OWNED_GAMES_URL, timeout=REQUEST_TIMEOUT,
+                                params={"key": api_key, "steamid": steam_id, "format": "json",
+                                        "include_played_free_games": 1})  # считаем так же, как импорт
+    except requests.RequestException as e:
+        raise SteamLoginError(f"Steam не ответил: {mask_secrets(e)}") from None
+    if response.status_code in (401, 403):
+        raise SteamLoginError("Steam не принял ключ. Проверьте, что скопировали его целиком")
+    if not response.ok:
+        raise SteamLoginError(f"Steam ответил ошибкой {response.status_code}, попробуйте через минуту")
+    data = (response.json() or {}).get("response") or {}
+    name = ""
+    try:
+        players = fetch(STEAM_PLAYER_SUMMARIES_URL, params={"key": api_key, "steamids": steam_id}).json()
+        name = ((players.get("response") or {}).get("players") or [{}])[0].get("personaname", "")
+    except (requests.RequestException, ValueError, IndexError, AttributeError):
+        pass  # имя только для красоты
+    private = "game_count" not in data  # игры скрыты в приватности профиля — Steam присылает пустой ответ
+    log.info("Ключ Steam Web API проверен: SteamID %s, игр %s", short_steam_id(steam_id),
+             "скрыты" if private else data.get("game_count", 0))
+    return {"name": name, "games": data.get("game_count", 0), "private": private}
+
+
+STEAMGRIDDB_KEY_PAGE = "https://www.steamgriddb.com/profile/preferences/api"
+STEAMGRIDDB_KEY_RE = re.compile(r"[0-9A-Za-z]{20,64}")
+
+
+def check_griddb_key(api_key):
+    """Проверка ключа SteamGridDB одним поиском. Ошибка — SteamLoginError с понятной причиной."""
+    key = (api_key or "").strip()
+    if not STEAMGRIDDB_KEY_RE.fullmatch(key):
+        raise SteamLoginError("ключ SteamGridDB — строка из латинских букв и цифр без пробелов. "
+                              "Скопируйте его со страницы целиком")
+    try:
+        response = requests.get(f"{STEAMGRIDDB_API_URL}/search/autocomplete/portal",
+                                headers={"Authorization": f"Bearer {key}"}, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as e:
+        raise SteamLoginError(f"SteamGridDB не ответил: {mask_secrets(e)}") from None
+    if response.status_code in (401, 403):
+        raise SteamLoginError("SteamGridDB не принял ключ. Проверьте, что скопировали его целиком")
+    if not response.ok:
+        raise SteamLoginError(f"SteamGridDB ответил ошибкой {response.status_code}, попробуйте через минуту")
+    log.info("Ключ SteamGridDB проверен")
+    return key
 
 
 # --- Коллекции Steam --------------------------------------------------------
@@ -539,6 +1093,16 @@ def is_installed(appid):
                for d in steam_library_dirs())
 
 
+def installed_owner(appid):
+    """Кем установлена игра на этом ПК: SteamID64 аккаунта (LastOwner в appmanifest), "" — неизвестно кем,
+    None — не установлена. Ключ и вход не нужны — это файлы Steam на диске."""
+    for library in steam_library_dirs():
+        path = os.path.join(library, "steamapps", f"appmanifest_{appid}.acf")
+        if os.path.exists(path):
+            return _acf_values(path).get("lastowner", "")
+    return None
+
+
 def _steam_registry_value(name, subkey=""):
     if sys.platform != "win32":
         return None
@@ -559,6 +1123,88 @@ def steam_running():
 def running_app_id():
     """appid игры, которая сейчас запущена через Steam (0 — ни одной)."""
     return _steam_registry_value("RunningAppID") or 0
+
+
+def steam_client_account():
+    """SteamID64 аккаунта, который вошёл в клиент Steam на этом ПК, или None — узнать не вышло.
+
+    Пока Steam запущен, реестр хранит номер вошедшего аккаунта (ActiveUser). Steam закрыт — берём
+    последний вошедший аккаунт из config/loginusers.vdf (отметка MostRecent).
+    """
+    active = _steam_registry_value("ActiveUser", r"\ActiveProcess")
+    if active:
+        return str(STEAMID64_BASE + int(active))
+    for steam_id, block in _login_users():
+        if re.search(r'"MostRecent"\s+"1"', block, re.IGNORECASE):
+            return steam_id
+    return None
+
+
+def _login_users():
+    """Аккаунты, которые входили в клиент Steam на этом ПК (config/loginusers.vdf): [(SteamID64, блок), ...]."""
+    steam_dir = find_steam_dir()
+    if not steam_dir:
+        return []
+    try:
+        with open(os.path.join(steam_dir, "config", "loginusers.vdf"), encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+    except OSError:
+        return []
+    return [(m.group(1), m.group(2)) for m in re.finditer(r'"(\d{17})"\s*\{([^}]*)\}', text)]
+
+
+def steam_account_names():
+    """Имена в Steam аккаунтов, которые входили в клиент Steam на этом ПК: {SteamID64: имя}.
+
+    Берём только видимое всем имя профиля (PersonaName) — логин аккаунта из файла не читаем.
+    """
+    names = {}
+    for steam_id, block in _login_users():
+        persona = re.search(r'"PersonaName"\s+"([^"]*)"', block, re.IGNORECASE)
+        if persona and persona.group(1).strip():
+            names[steam_id] = persona.group(1).strip()
+    return names
+
+
+def steam_persona_name(steam_id):
+    """Имя профиля Steam по SteamID — без ключа. Сначала из клиента Steam на этом ПК, иначе с открытой
+    страницы профиля в Steam (её XML-версия; имя видно всем, даже у закрытого профиля). None — не узнали."""
+    if not re.fullmatch(r"\d{17}", steam_id or ""):
+        return None
+    name = steam_account_names().get(steam_id)
+    if name:
+        return name
+    try:
+        text = fetch(f"https://steamcommunity.com/profiles/{steam_id}/", params={"xml": 1}).text
+    except Exception as e:  # noqa: BLE001 — без имени покажем только SteamID
+        log.warning("Имя профиля Steam (SteamID %s) не узнать: %s", short_steam_id(steam_id), e)
+        return None
+    match = re.search(r"<steamID>\s*(?:<!\[CDATA\[(.*?)\]\]>|([^<]*))\s*</steamID>", text, re.DOTALL)
+    name = ((match.group(1) or match.group(2) or "").strip()) if match else ""
+    return name or None
+
+
+def other_steam_account(steam_id):
+    """SteamID64 аккаунта в клиенте Steam, если это не тот, что подключён к программе. None — тот же или не узнать.
+
+    Клиент Steam ставит игры, качает саундтреки и хранит коллекции для того, кто в нём вошёл,
+    а программа может быть подключена к другому аккаунту.
+    """
+    client = steam_client_account()
+    return client if client and steam_id and client != str(steam_id) else None
+
+
+def collections_hint(steam_id):
+    """Почему коллекций не нашлось — подсказка для окна импорта."""
+    if not find_steam_dir():
+        return "Коллекции программа читает из клиента Steam, а он на этом ПК не найден."
+    other = other_steam_account(steam_id)
+    if other:
+        return (f"Коллекции программа читает из клиента Steam на этом ПК, а в нём вошёл другой аккаунт "
+                f"(SteamID {short_steam_id(other)}). Войдите в Steam аккаунтом, подключённым к программе, "
+                f"и повторите импорт.")
+    return ("Коллекции программа читает из клиента Steam на этом ПК, а этим аккаунтом в него ещё не входили. "
+            "Войдите в Steam этим аккаунтом и повторите импорт.")
 
 
 def open_url(url):
@@ -612,13 +1258,64 @@ def read_steam_collections(steam_id):
     return collections
 
 
-# --- Библиотека целиком: свои игры + семейные из коллекций ---------------------
-# GetOwnedGames отдаёт только купленные вами игры. Игры семейной библиотеки Steam
-# через обычный ключ API не получить, но их appid лежат в ваших коллекциях —
-# названия для них берём из общего списка игр магазина Steam.
+# --- Библиотека целиком: свои игры + семейная группа ---------------------------
+# GetOwnedGames отдаёт только купленные вами игры. Игры семейной группы Steam отдаёт IFamilyGroupsService —
+# ему нужен токен входа в магазин Steam (его выдаёт сам магазин во встроенном браузере, ключ тут не годится).
+# Без входа семейные игры не проверить. Раньше программа считала семейными все игры из коллекций, которых нет
+# среди покупок, — туда попадали и «Скрытые» (тысячи бесплатных лицензий и демо), и игры, доступ к которым
+# давно пропал. Теперь без входа «семейными» считаются только игры из ваших собственных коллекций, и они
+# помечаются как неподтверждённые: в импорт по умолчанию не идут.
 SHORTCUT_APPID_MIN = 2 ** 31  # у сторонних игр, добавленных в Steam вручную, appid начинаются отсюда
 APP_DETAILS_LIMIT = 40  # сколько игр, которых нет в списке магазина, проверяем по одной
 MAX_STORE_APPID = 4_500_000  # примерный самый большой appid в магазине — для полосы прогресса
+STEAM_FAMILY_GROUP_URL = "https://api.steampowered.com/IFamilyGroupsService/GetFamilyGroupForUser/v1/"
+STEAM_FAMILY_APPS_URL = "https://api.steampowered.com/IFamilyGroupsService/GetSharedLibraryApps/v1/"
+FAMILY_APP_TYPE_GAME = 1  # тип «игра» в ответе семейной библиотеки (программы, инструменты и видео — другие)
+LOG_APPIDS = 40  # сколько номеров приложений перечислять в логе в одной строке
+
+
+def fetch_family_games(token, steam_id):
+    """Игры семейной группы, доступные вам (без ваших собственных): [{"appid", "name", "owners"}].
+
+    None — вы не состоите в семейной группе. token — временный токен входа в магазин Steam: живёт только
+    в памяти на время этого запроса, в лог и в файлы не попадает (в текстах ошибок он скрывается).
+    """
+    group = (fetch(STEAM_FAMILY_GROUP_URL, params={"access_token": token, "steamid": steam_id}).json()
+             .get("response") or {})
+    group_id = str(group.get("family_groupid") or "0")
+    if group.get("is_not_member_of_any_group") or group_id == "0":
+        return None
+    data = (fetch(STEAM_FAMILY_APPS_URL, params={
+        "access_token": token, "family_groupid": group_id, "steamid": steam_id, "include_own": "false",
+        "include_excluded": "false", "include_free": "false", "include_non_games": "false",
+        "language": "russian", "max_apps": 50000}).json().get("response") or {})
+    games, kinds, excluded = [], {}, 0
+    for app in data.get("apps") or []:
+        appid = int(app.get("appid") or 0)
+        owners = [str(o) for o in app.get("owner_steamids") or []]
+        kind = app.get("app_type", FAMILY_APP_TYPE_GAME)
+        kinds[kind] = kinds.get(kind, 0) + 1
+        if not appid or str(steam_id) in owners:
+            continue
+        if app.get("exclude_reason"):  # владелец закрыл игру для семьи или её нельзя давать другим
+            excluded += 1
+            continue
+        if kind != FAMILY_APP_TYPE_GAME:
+            continue
+        games.append({"appid": appid, "name": clean_name(app.get("name") or ""), "owners": owners})
+    unnamed = [g["appid"] for g in games if not g["name"]]
+    if unnamed:  # имя иногда не приходит — берём его из магазина
+        try:
+            items = store_items(unnamed)
+            for game in games:
+                if not game["name"]:
+                    game["name"] = clean_name((items.get(game["appid"]) or {}).get("name") or "")
+        except (requests.RequestException, ValueError) as e:
+            log.warning("Названия %d семейных игр не узнать: %s", len(unnamed), e)
+    games = [g for g in games if g["name"]]
+    log.info("Семейная группа Steam: игр доступно %d, недоступно (закрыто владельцем) %d, все типы в ответе: %s",
+             len(games), excluded, kinds)
+    return games
 
 
 def _report(progress, text, percent):
@@ -710,45 +1407,107 @@ def resolve_app_names(api_key, appids, progress=None):
     return {a: cached[a] for a in appids if a in cached}
 
 
-def load_steam_library(api_key, steam_id, progress=None):
-    """Собирает всё для окна импорта: игры, коллекции и ошибку чтения коллекций (если была).
+def load_steam_library(api_key, steam_id, progress=None, family_token=None):
+    """Собирает всё для окна импорта: игры, коллекции и сведения о семейной группе.
 
-    Игры: [{"appid", "name", "playtime" (минуты или None — неизвестно), "family": bool}, ...]
+    Игры: [{"appid", "name", "playtime" (минуты или None — неизвестно), "family": bool, "verified": bool}, ...]
+    family_token — токен входа в магазин Steam (из встроенного браузера); без него семейная группа не проверяется.
     progress(текст, проценты) — необязательная функция для окна прогресса; вызывается из фонового потока.
     """
     _report(progress, "Получаю ваши игры из Steam…", 5)
     games = {}
     for game in fetch_owned_games(api_key, steam_id):
         if game.get("appid") and game.get("name"):
-            games[game["appid"]] = {"appid": game["appid"], "name": game["name"],
-                                    "playtime": game.get("playtime_forever", 0), "family": False}
+            games[game["appid"]] = {"appid": game["appid"], "name": clean_name(game["name"]),
+                                    "playtime": game.get("playtime_forever", 0), "family": False, "verified": True}
+    _drop_free_non_games(games, api_key, steam_id)
+    own_count = len(games)
 
-    _report(progress, f"Ваших игр: {len(games)}. Читаю коллекции Steam…", 15)
+    # family: None — не проверяли (нет входа в магазин) или Steam не ответил; [] — не в семейной группе
+    family, family_member, family_error = None, None, ""
+    if family_token:
+        _report(progress, f"Ваших игр: {own_count}. Проверяю семейную группу Steam…", 12)
+        try:
+            family = fetch_family_games(family_token, steam_id)
+            family_member = family is not None
+            family = family or []
+        except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+            family_error = mask_secrets(e)
+            log.warning("Семейную группу Steam проверить не удалось: %s", family_error)
+            family = None
+    for game in family or []:
+        games.setdefault(game["appid"], {"appid": game["appid"], "name": game["name"], "playtime": None,
+                                         "family": True, "verified": True})
+
+    _report(progress, "Читаю коллекции Steam…", 20)
     try:
         collections = read_steam_collections(steam_id)
         collections_error = None
     except (OSError, ValueError) as e:
         collections, collections_error = None, str(e)
 
-    extra = set()
-    for collection in collections or []:
-        extra |= {a for a in collection["apps"] if isinstance(a, int) and 0 < a < SHORTCUT_APPID_MIN}
-    extra -= games.keys()
-
-    if extra:
-        _report(progress, f"Ищу названия семейных игр: {len(extra)}…", 20)
-        names = resolve_app_names(api_key, extra, progress)
+    unverified = set()
+    if family is None:
+        # Семейную группу не проверили — «семейными» считаем только игры из своих коллекций (не из служебных
+        # «Скрытых» и «Избранного»): их Steam не подтвердил, и в импорт они по умолчанию не идут
+        for collection in collections or []:
+            if collection["id"] not in SPECIAL_COLLECTIONS:
+                unverified |= {a for a in collection["apps"] if isinstance(a, int) and 0 < a < SHORTCUT_APPID_MIN}
+        unverified -= games.keys()
+    if unverified:
+        _report(progress, f"Ищу названия игр из ваших коллекций: {len(unverified)}…", 25)
+        names = resolve_app_names(api_key, unverified, progress)
         for appid, name in names.items():
-            # Время игры в семейных играх через API не узнать
-            games[appid] = {"appid": appid, "name": name, "playtime": None, "family": True}
+            games[appid] = {"appid": appid, "name": clean_name(name), "playtime": None, "family": True,
+                            "verified": False}
     _report(progress, "Готово!", 100)
 
-    log.info("Библиотека Steam: своих игр %d, семейных найдено %d из %d, коллекций %s",
-             sum(not g["family"] for g in games.values()), sum(g["family"] for g in games.values()),
-             len(extra), "не найдено" if collections is None else len(collections))
+    _log_library(games, own_count, family, family_member, collections, unverified)
+    twins = {}
+    for game in games.values():
+        twins.setdefault(game["name"].casefold(), []).append(game["appid"])
+    twins = {name: ids for name, ids in twins.items() if len(ids) > 1}
+    if twins:
+        log.info("Одно название у нескольких игр Steam (в список попадёт одна, своя): %s",
+                 "; ".join(f"«{name}» — {', '.join(map(str, ids))}" for name, ids in list(twins.items())[:20]))
     if collections_error:
         log.warning("Не удалось прочитать коллекции Steam: %s", collections_error)
-    return {"games": list(games.values()), "collections": collections, "collections_error": collections_error}
+    hint = collections_hint(steam_id) if collections is None and not collections_error else None
+    return {"games": list(games.values()), "collections": collections, "collections_error": collections_error,
+            "collections_hint": hint, "family_checked": family is not None, "family_member": family_member,
+            "family_error": family_error}
+
+
+def _appid_list(appids):
+    appids = sorted(appids)
+    text = ", ".join(map(str, appids[:LOG_APPIDS]))
+    return text + (f" … и ещё {len(appids) - LOG_APPIDS}" if len(appids) > LOG_APPIDS else "") if appids else "—"
+
+
+def _log_library(games, own_count, family, family_member, collections, unverified):
+    """Подробно в лог: что программа нашла и почему. Номера приложений не секретные — по ним в магазине Steam
+    видно, что это за игра (store.steampowered.com/app/<номер>), и так сверяются цифры с клиентом Steam."""
+    family_count = sum(g["family"] and g["verified"] for g in games.values())
+    if family is None:
+        family_text = "не проверена (нет входа в магазин Steam во встроенном браузере)"
+    elif not family_member:
+        family_text = "вы не состоите в семейной группе"
+    else:
+        family_text = f"{family_count} игр подтверждено Steam"
+    log.info("Библиотека Steam: ваших игр %d, семейная группа — %s, неподтверждённых из коллекций %d, коллекций %s",
+             own_count, family_text, sum(not g["verified"] for g in games.values()),
+             "не найдено" if collections is None else len(collections))
+    for collection in collections or []:
+        apps = {a for a in collection["apps"] if isinstance(a, int)}
+        own = {a for a in apps if a in games and not games[a]["family"]}
+        shared = {a for a in apps if a in games and games[a]["family"] and games[a]["verified"]}
+        guessed = {a for a in apps if a in games and not games[a]["verified"]}
+        other = apps - own - shared - guessed
+        log.info("Коллекция «%s»: номеров %d — ваших игр %d, семейных %d, неподтверждённых %d, "
+                 "нет среди доступных игр %d (дополнения, программы, демо, бывшие семейные или чужие лицензии): %s",
+                 collection["name"], len(apps), len(own), len(shared), len(guessed), len(other), _appid_list(other))
+    if unverified:
+        log.info("Неподтверждённые «семейные» (из ваших коллекций): %s", _appid_list(unverified))
 
 
 def select_games(library, choice):
@@ -769,14 +1528,28 @@ def select_games(library, choice):
     skip = set()
     if choice["import_skip_hidden"] and "hidden" in collections:
         skip = collections["hidden"]["apps"]
+    # У одной игры бывает два номера в Steam (Civilization IV: 3900 и 34440 — старое и новое издание). Скрыли
+    # одно — второе с тем же названием тоже не берём, иначе скрытая игра всё равно попадёт в список
+    hidden_names = {clean_name(g["name"]).casefold() for g in library["games"] if g["appid"] in skip}
 
     selected = [
         game for game in library["games"]
         if (not include_ids or game["appid"] in include)
         and game["appid"] not in skip
+        and clean_name(game["name"]).casefold() not in hidden_names
         and not (choice["import_unplayed"] and (game["playtime"] or 0) > 0)
+        and (not game["family"] or (choice.get("import_unverified", False) if not game.get("verified", True)
+                                    else choice.get("import_family", True)))
     ]
-    return selected, missing
+    # Две игры Steam с одним названием (своя и семейная, переиздание под тем же именем) в списке игр — одна
+    # строка, поэтому и здесь оставляем одну, свою: иначе «подходит» на одну больше, чем добавится
+    unique, names = [], set()
+    for game in sorted(selected, key=lambda g: g["family"]):
+        name = clean_name(game["name"]).casefold()
+        if name not in names:
+            names.add(name)
+            unique.append(game)
+    return unique, missing
 
 
 # --- Карточка игры ----------------------------------------------------------
@@ -827,18 +1600,283 @@ def _is_russian(text):
 
 
 def translate_to_russian(text):
-    """Перевод описания через бесплатный адрес Google Translate. None — не получилось.
-
-    Официального бесплатного API у переводчиков нет, а этот адрес без ключа используют многие программы.
-    Если Google его закроет, описание просто останется на языке оригинала.
-    """
-    try:
-        data = fetch(TRANSLATE_URL, params={"client": "gtx", "sl": "auto", "tl": "ru", "dt": "t", "q": text}).json()
-        translated = "".join(part[0] for part in data[0] if part and part[0])
-        return translated.strip() or None
-    except (requests.RequestException, ValueError, TypeError, IndexError) as e:
-        log.warning("Не удалось перевести описание: %s", e)
+    """Перевод на русский как выбрано в «Настройках»: Google, а если он не ответил — модулем на этом ПК
+    (или только модулем). None — не получилось, текст остаётся на языке оригинала."""
+    mode = translate_mode()
+    if mode == "off":
         return None
+    if mode == "auto":
+        started = time.monotonic()
+        translated = _google_translate(text)
+        if translated:
+            log.info("Переведено Google: %d знаков за %.1f с", len(text), time.monotonic() - started)
+            return translated
+    return local_translate(text)
+
+
+TRANSLATE_MODES = ("auto", "local", "off")
+
+
+def translate_mode():
+    mode = load_settings().get("translate_mode", "auto")
+    return mode if mode in TRANSLATE_MODES else "auto"
+
+
+def translation_enabled():
+    """Переводить ли вообще: выключено в «Настройках» или «только на ПК» без скачанного модуля — нет."""
+    mode = translate_mode()
+    return mode == "auto" or (mode == "local" and local_model_info() is not None and local_engine_available())
+
+
+# Бесплатные адреса Google Translate без ключа: официального бесплатного API у переводчиков нет, а этими
+# пользуются многие программы. Google время от времени отказывает («слишком много запросов») — тогда
+# повторяем через полторы секунды, потом пробуем второй адрес, а если молчат оба — пару минут не ждём
+# Google вовсе и сразу переводим модулем на ПК.
+TRANSLATE_BACKUP_URL = "https://clients5.google.com/translate_a/t"
+TRANSLATE_RETRY_PAUSE = 1.5
+GOOGLE_REST = 120  # секунд
+_google_rest_until = 0.0
+_google_first = None  # адрес Google, который ответил последним (None — основной)
+
+
+def _gtx(text):
+    data = fetch(TRANSLATE_URL, params={"client": "gtx", "sl": "auto", "tl": "ru", "dt": "t", "q": text}).json()
+    return "".join(part[0] for part in data[0] if part and part[0]).strip()
+
+
+def _google_backup(text):
+    data = fetch(TRANSLATE_BACKUP_URL, params={"client": "dict-chrome-ex", "sl": "auto", "tl": "ru", "q": text}).json()
+    while isinstance(data, list) and data and isinstance(data[0], list):
+        data = data[0]  # [["перевод", "en"]] → ["перевод", "en"]
+    return data[0].strip() if isinstance(data, list) and data and isinstance(data[0], str) else ""
+
+
+def _google_translate(text):
+    global _google_rest_until, _google_first
+    if time.monotonic() < _google_rest_until:
+        return None
+    # Первым — адрес, который ответил в прошлый раз: если основной адрес Google сейчас отказывает,
+    # каждое описание не ждёт его дважды
+    first, second = (_google_backup, _gtx) if _google_first is _google_backup else (_gtx, _google_backup)
+    errors = []
+    for method, pause in ((first, 0), (first, TRANSLATE_RETRY_PAUSE), (second, 0)):
+        time.sleep(pause)
+        try:
+            translated = method(text)
+            if translated:
+                if method is not _google_first:
+                    log.info("Google Переводчик: отвечает %s адрес%s", "запасной" if method is _google_backup
+                             else "основной", f" (до этого: {'; '.join(errors)})" if errors else "")
+                    _google_first = method
+                return translated
+            errors.append("пустой ответ")
+        except (requests.RequestException, ValueError, TypeError, IndexError, AttributeError) as e:
+            errors.append(str(e).split("?", 1)[0][:160])  # в адресе ошибки — весь текст описания, в лог он не нужен
+    local = local_model_info() is not None
+    if local:  # есть чем подменить Google — пару минут его не ждём; нет — пусть пробует при каждом описании
+        _google_rest_until = time.monotonic() + GOOGLE_REST
+    log.warning("Google Переводчик не ответил (%s)%s", "; ".join(errors),
+                " — перевожу модулем на этом ПК" if local else "")
+    return None
+
+
+# --- Перевод на этом ПК ---------------------------------------------------------
+# Модель перевода с английского на русский из открытого проекта Argos Translate (лицензии MIT / CC0),
+# движок — CTranslate2 от OpenNMT. Всё считается на этом ПК: текст описаний никуда не отправляется.
+# Модель скачивается один раз по кнопке в «Настройках» — только с адреса, зашитого здесь, только по HTTPS,
+# с проверкой размера и состава архива. Из архива берутся только файлы модели — это данные, не программы.
+LOCAL_MODEL_URL = "https://argos-net.com/v1/translate-en_ru-1_9.argosmodel"
+# Контрольная сумма SHA-256 файла модели — снята с файла, скачанного автором 30.10.2026 (187 МБ). Файл с другой
+# суммой (подменённый, битый или выложенный заново) программа не поставит. Сменится модель — сменить и сумму
+LOCAL_MODEL_SHA256 = "591d743ae103752b88ffc38785c50421320f4eff93c8967e0d3d2e14d4e27811"
+LOCAL_MODEL_DIR = os.path.join(CACHE_DIR, "translate", "en_ru")
+LOCAL_MODEL_MAX_BYTES = 600 * 1024 * 1024  # больше — значит, это не та модель
+LOCAL_MODEL_MAX_FILES = 300
+LOCAL_SENTENCE_RE = re.compile(r"(?<=[.!?…])\s+(?=[\"«“(\[A-ZА-ЯЁ0-9])")
+_local_engine = {}  # загруженная модель: {"translator", "tokenizer", "prefix"}
+_local_lock = threading.Lock()
+
+
+def local_engine_available():
+    """Есть ли в программе движок перевода (библиотеки ctranslate2 и sentencepiece). Сами библиотеки
+    при этом не загружаются — это долго, а нужно только при первом переводе."""
+    import importlib.util
+    try:
+        return all(importlib.util.find_spec(name) is not None for name in ("ctranslate2", "sentencepiece"))
+    except (ImportError, ValueError):
+        return False
+
+
+def local_model_info():
+    """Модуль перевода скачан: {"size": байт на диске, "sha256", "installed": когда}. None — не скачан."""
+    if not os.path.exists(os.path.join(LOCAL_MODEL_DIR, "model", "model.bin")):
+        return None
+    try:
+        with open(os.path.join(LOCAL_MODEL_DIR, "source.json"), encoding="utf-8") as f:
+            info = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        info = {}
+    return {"size": folder_size(LOCAL_MODEL_DIR), "sha256": info.get("sha256", ""),
+            "installed": info.get("installed", 0)}
+
+
+def _model_members(archive):
+    """Какие файлы взять из архива модели: {путь внутри папки модуля: запись архива}. Странный архив — ValueError."""
+    members = archive.infolist()
+    if len(members) > LOCAL_MODEL_MAX_FILES or sum(m.file_size for m in members) > LOCAL_MODEL_MAX_BYTES * 2:
+        raise ValueError("архив модели больше ожидаемого")
+    wanted = {}
+    for member in members:
+        name = member.filename.replace("\\", "/")
+        parts = [p for p in name.split("/") if p]
+        if name.startswith("/") or ":" in name or ".." in parts:
+            raise ValueError("в архиве модели странные пути — не распаковываю")
+        if member.is_dir() or len(parts) < 2:
+            continue
+        inner = parts[1:]  # всё лежит в папке вида translate-en_ru-1_9/
+        if len(inner) == 2 and inner[0] == "model" and re.fullmatch(r"[\w.-]+", inner[1]):
+            wanted["model/" + inner[1]] = member
+        elif len(inner) == 1 and inner[0] in ("sentencepiece.model", "metadata.json"):
+            wanted[inner[0]] = member
+    if "model/model.bin" not in wanted or "sentencepiece.model" not in wanted:
+        raise ValueError("в архиве нет модели перевода — формат не тот")
+    return wanted
+
+
+def download_local_model(progress=None):
+    """Скачать и поставить модуль перевода. progress(текст, проценты) — по ходу дела. Вызывается в фоновом потоке.
+    Возвращает {"size", "sha256", "sample"} — sample: пробный перевод, которым проверено, что модуль работает."""
+    import shutil
+    import zipfile
+
+    os.makedirs(os.path.dirname(LOCAL_MODEL_DIR), exist_ok=True)
+    archive_path = LOCAL_MODEL_DIR + ".download"
+    staging = LOCAL_MODEL_DIR + ".new"
+    digest, done = hashlib.sha256(), 0
+    try:
+        with requests.get(LOCAL_MODEL_URL, timeout=REQUEST_TIMEOUT * 3, stream=True) as response:
+            response.raise_for_status()
+            if not response.url.startswith("https://"):
+                raise ValueError("модель пришла не по защищённому адресу — не ставлю")
+            total = int(response.headers.get("Content-Length") or 0)
+            if total > LOCAL_MODEL_MAX_BYTES:
+                raise ValueError("файл модели больше ожидаемого — не ставлю")
+            with open(archive_path, "wb") as f:
+                for chunk in response.iter_content(512 * 1024):
+                    done += len(chunk)
+                    if done > LOCAL_MODEL_MAX_BYTES:
+                        raise ValueError("файл модели больше ожидаемого — не ставлю")
+                    digest.update(chunk)
+                    f.write(chunk)
+                    if progress:
+                        mb = f"{done / 2 ** 20:.0f}" + (f" из {total / 2 ** 20:.0f}" if total else "")
+                        progress(f"Скачиваю модуль перевода… {mb} МБ", done * 90 // total if total else -1)
+        sha256 = digest.hexdigest()
+        if LOCAL_MODEL_SHA256 and not hmac.compare_digest(sha256, LOCAL_MODEL_SHA256):
+            raise ValueError("контрольная сумма файла не совпала: он подменён или повреждён — модуль не поставлен")
+        if progress:
+            progress("Распаковываю модуль перевода…", 92)
+        shutil.rmtree(staging, ignore_errors=True)
+        with zipfile.ZipFile(archive_path) as archive:
+            for inner, member in _model_members(archive).items():
+                target = os.path.join(staging, *inner.split("/"))
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with archive.open(member) as source, open(target, "wb") as out:
+                    shutil.copyfileobj(source, out, 1024 * 1024)
+        save_json(os.path.join(staging, "source.json"),
+                  {"url": LOCAL_MODEL_URL, "sha256": sha256, "bytes": done, "installed": time.time()})
+        _unload_local_engine()
+        shutil.rmtree(LOCAL_MODEL_DIR, ignore_errors=True)
+        os.replace(staging, LOCAL_MODEL_DIR)
+    finally:
+        if os.path.exists(archive_path):
+            os.remove(archive_path)
+        shutil.rmtree(staging, ignore_errors=True)
+    log.info("Модуль перевода скачан: %s, %.0f МБ, SHA-256 %s%s", LOCAL_MODEL_URL, done / 2 ** 20, sha256,
+             " — совпала с зашитой в программу" if LOCAL_MODEL_SHA256
+             else " (сумма ещё не зашита в программу — пришлите эту строку автору)")
+    if progress:
+        progress("Проверяю перевод…", 96)
+    sample = local_translate("The adventure begins. Explore the world and save your friends.")
+    if not sample or not _is_russian(sample):
+        raise ValueError("модуль скачан, но перевести пробную фразу не смог — подробности в логе")
+    log.info("Модуль перевода работает: «%s»", sample)
+    return {"size": folder_size(LOCAL_MODEL_DIR), "sha256": sha256, "sample": sample}
+
+
+def remove_local_model():
+    import shutil
+
+    _unload_local_engine()
+    shutil.rmtree(LOCAL_MODEL_DIR)
+    log.info("Модуль перевода удалён")
+
+
+def _unload_local_engine():
+    with _local_lock:
+        translator = _local_engine.pop("translator", None)
+        _local_engine.clear()
+    if translator is not None:
+        try:
+            translator.unload_model()  # иначе Windows не даст удалить файл модели
+        except (AttributeError, RuntimeError):
+            pass
+
+
+def _load_local_engine():
+    with _local_lock:
+        if _local_engine:
+            return _local_engine
+        import ctranslate2
+        import sentencepiece
+
+        started = time.monotonic()
+        threads = max(1, min(4, (os.cpu_count() or 2) - 1))
+        translator = ctranslate2.Translator(os.path.join(LOCAL_MODEL_DIR, "model"), device="cpu",
+                                            inter_threads=1, intra_threads=threads)
+        tokenizer = sentencepiece.SentencePieceProcessor(
+            model_file=os.path.join(LOCAL_MODEL_DIR, "sentencepiece.model"))
+        try:
+            with open(os.path.join(LOCAL_MODEL_DIR, "metadata.json"), encoding="utf-8") as f:
+                prefix = (json.load(f) or {}).get("target_prefix") or ""
+        except (OSError, json.JSONDecodeError, AttributeError):
+            prefix = ""
+        _local_engine.update(translator=translator, tokenizer=tokenizer, prefix=prefix)
+        log.info("Модуль перевода загружен за %.1f с (потоков: %d)", time.monotonic() - started, threads)
+        return _local_engine
+
+
+def local_translate(text):
+    """Перевод с английского на русский модулем на этом ПК. None — модуль не скачан или не справился."""
+    if not text.strip() or local_model_info() is None or not local_engine_available():
+        return None
+    started = time.monotonic()
+    try:
+        engine = _load_local_engine()
+        translator, tokenizer, prefix = engine["translator"], engine["tokenizer"], engine["prefix"]
+        lines = []
+        for paragraph in text.split("\n"):
+            sentences = [s for s in LOCAL_SENTENCE_RE.split(paragraph.strip()) if s.strip()]
+            if not sentences:
+                lines.append("")
+                continue
+            batch = [tokenizer.encode(sentence, out_type=str) for sentence in sentences]
+            results = translator.translate_batch(
+                batch, beam_size=2, max_batch_size=16, replace_unknowns=True, length_penalty=0.2,
+                max_decoding_length=300, target_prefix=[[prefix]] * len(batch) if prefix else None)
+            words = []
+            for result in results:
+                tokens = list(result.hypotheses[0])
+                if prefix and tokens and tokens[0] == prefix:
+                    tokens = tokens[1:]
+                words.append(tokenizer.decode(tokens))
+            lines.append(" ".join(words))
+    except Exception as e:  # noqa: BLE001 — движок на C++ бросает разное; без перевода программа работает
+        log.warning("Модуль перевода не справился: %s", e)
+        return None
+    translated = "\n".join(lines).strip()
+    log.info("Переведено на этом ПК: %d знаков за %.1f с", len(text), time.monotonic() - started)
+    return translated or None
 
 
 TRANSLATE_CHUNK = 1500  # символов за один запрос: длинный адрес переводчик не принимает
@@ -1071,6 +2109,8 @@ def fetch_game_details(appid):
         "screenshots": [{"thumb": s.get("path_thumbnail"), "full": s["path_full"]}
                         for s in (d.get("screenshots") or [])[:MAX_SCREENSHOTS] if s.get("path_full")],
         "movies": movies[:MAX_MOVIES],
+        # У демоверсии — appid полной игры: если у демо нет своих скриншотов, показываем её
+        "fullgame": int((d.get("fullgame") or {}).get("appid") or 0) or None,
         "fetched": time.time(),
     }
 
@@ -1114,7 +2154,11 @@ def translate_details(details):
     result["translated"] = True
     with _details_lock:
         cache = _load_details_cache()
-        cache[str(details["appid"])] = result
+        # В кэш — только перевод: скриншоты полной игры у демо (media_from) туда не попадают
+        entry = dict(cache.get(str(details["appid"])) or details)
+        entry.pop("media_from", None)
+        entry.update(description=result["description"], about=result["about"], translated=True)
+        cache[str(details["appid"])] = entry
         try:
             save_json(DETAILS_CACHE_FILE, cache)
         except OSError:
@@ -1122,14 +2166,16 @@ def translate_details(details):
     return result
 
 
-def get_game_details(appid):
+def get_game_details(appid, _parent=True):
     """Карточка из кэша steam_details.json, а если её нет или она старше двух недель — из магазина."""
     key = str(appid)
     with _details_lock:
         cached = _load_details_cache().get(key)
-    if (cached and cached.get("version") == DETAILS_VERSION
+    # До 2.3 у карточек не было "fullgame" — карточку без скриншотов (обычно демо) перезапрашиваем
+    stale = cached and "fullgame" not in cached and not cached.get("screenshots")
+    if (cached and not stale and cached.get("version") == DETAILS_VERSION
             and time.time() - cached.get("fetched", 0) < _details_ttl(cached)):
-        return cached
+        return _with_parent_media(cached) if _parent else cached
     try:
         details = fetch_game_details(appid)
     except (requests.RequestException, ValueError):
@@ -1145,7 +2191,24 @@ def get_game_details(appid):
                 save_json(DETAILS_CACHE_FILE, cache)
             except OSError:
                 log.exception("Не удалось сохранить кэш карточек игр")
-    return details
+    return _with_parent_media(details) if details and _parent else details
+
+
+def _with_parent_media(details):
+    """У демоверсии нет своих скриншотов и трейлеров — берём их у полной игры. В кэш это не пишется."""
+    parent = details.get("fullgame")
+    if details.get("screenshots") or not parent or parent == details.get("appid"):
+        return details
+    try:
+        full = get_game_details(parent, _parent=False)
+    except (requests.RequestException, ValueError) as e:
+        log.info("Скриншоты полной игры %s для демо %s не загрузились: %s", parent, details.get("appid"), e)
+        return details
+    if not full or not full.get("screenshots"):
+        return details
+    log.info("У демо %s нет своих скриншотов — показываю скриншоты полной игры %s", details.get("appid"), parent)
+    return dict(details, screenshots=full["screenshots"], movies=details.get("movies") or full.get("movies") or [],
+                media_from=full.get("name") or "")
 
 
 def get_achievements(appid, api_key, steam_id):
@@ -1156,7 +2219,7 @@ def get_achievements(appid, api_key, steam_id):
     Возвращает None, если у игры нет достижений.
     """
     if not api_key:
-        return {"error": "Чтобы показать достижения, введите ключ Steam Web API в настройках."}
+        return {"error": "Достижения Steam отдаёт только с ключом Steam Web API.", "no_key": True}
     schema = fetch(STEAM_SCHEMA_URL, params={"key": api_key, "appid": appid, "l": "russian"}).json()
     items = ((schema.get("game") or {}).get("availableGameStats") or {}).get("achievements") or []
     if not items:
@@ -1170,9 +2233,9 @@ def get_achievements(appid, api_key, steam_id):
     except (requests.RequestException, ValueError, KeyError) as e:
         log.warning("Нет статистики достижений для %s: %s", appid, e)
 
-    mine, progress_note = None, ""
+    mine, progress_note, private = None, "", False
     if steam_id:
-        mine, progress_note = _player_achievements(appid, api_key, steam_id)
+        mine, progress_note, private = _player_achievements(appid, api_key, steam_id)
     else:
         progress_note = "Чтобы видеть свой прогресс, укажите SteamID64 в настройках."
 
@@ -1193,11 +2256,12 @@ def get_achievements(appid, api_key, steam_id):
     # Сначала полученные (свежие выше), потом остальные — от самых частых к редким
     result.sort(key=lambda a: (not a["unlocked"], -a["unlocked_at"], -(a["percent"] or 0)))
     unlocked = sum(a["unlocked"] for a in result) if mine is not None else None
-    return {"items": result, "unlocked": unlocked, "progress_note": progress_note}
+    return {"items": result, "unlocked": unlocked, "progress_note": progress_note, "private": private}
 
 
 def _player_achievements(appid, api_key, steam_id):
-    """Полученные достижения: ({api-имя в нижнем регистре: время получения}, "") или (None, почему не узнали).
+    """Полученные достижения: ({api-имя в нижнем регистре: время получения}, "", False) или
+    (None, почему не узнали, закрыт ли профиль).
 
     Web API отказывает (403) в играх не с этого аккаунта — например, из семейной библиотеки, — хотя
     достижения в них ваши и видны на странице профиля. Тогда берём их оттуда: страница отдаёт XML
@@ -1210,7 +2274,7 @@ def _player_achievements(appid, api_key, steam_id):
         stats = data.get("playerstats") or {}
         if stats.get("success"):
             return {a["apiname"].casefold(): a.get("unlocktime", 0) for a in stats.get("achievements") or []
-                    if a.get("achieved") and a.get("apiname")}, ""
+                    if a.get("achieved") and a.get("apiname")}, "", False
         reason = stats.get("error") or "Steam не прислал прогресс"
     except requests.HTTPError as e:
         try:
@@ -1222,16 +2286,19 @@ def _player_achievements(appid, api_key, steam_id):
         reason = mask_secrets(e)
 
     mine = _profile_achievements(appid, steam_id)
-    if mine is not None:
+    private = "not public" in reason.casefold()
+    # Web API сказал «профиль закрыт», а страница профиля вернула пустой список — это не «ничего не получено»,
+    # а тоже закрытый профиль: не показываем ложное «0 из N»
+    if mine is not None and not (private and not mine):
         log.info("Прогресс достижений для %s: Web API отказал (%s), взял со страницы профиля — получено %d",
                  appid, reason, len(mine))
-        return mine, ""
+        return mine, "", False
     log.info("Прогресс достижений для %s недоступен: Web API — %s, страница профиля тоже не отдала", appid, reason)
-    if "not public" in reason.casefold():
+    if private:
         return None, ("Steam не отдаёт ваш прогресс: в настройках приватности профиля закрыта "
-                      "«Игровая информация». Откройте её — и прогресс появится.")
+                      "«Игровая информация». Откройте её — и прогресс появится."), True
     return None, ("Steam не отдаёт ваш прогресс в этой игре — обычно так бывает с играми из семейной "
-                  "библиотеки или не с этого аккаунта.")
+                  "библиотеки или не с этого аккаунта."), False
 
 
 STEAM_PROFILE_ACHIEVEMENTS_URL = "https://steamcommunity.com/profiles/{steam_id}/stats/{appid}/achievements/"
@@ -1272,6 +2339,13 @@ def fetch_image(url):
 HERO_WIDTH = 1920
 LOGO_SIZE = (800, 320)
 ART_KINDS = ("hero", "logo")
+# Отметка «картинки нет» помнит, по каким правилам искали. До 2.3 настоящие адреса картинок Steam
+# не спрашивались, и у новых игр фон с логотипом считались ненайденными — такие отметки ищем заново.
+MISS_VERSION = "2"
+
+
+def _known_missing(marker):
+    return os.path.exists(marker) and read_text(marker) == MISS_VERSION
 
 
 def _art_path(game, kind):
@@ -1313,13 +2387,17 @@ def _griddb_game_id(game, api_key):
 
 
 def _download_art(game, kind, api_key):
-    """Байты фона или логотипа: из Steam, иначе из SteamGridDB. None — нигде нет."""
+    """Байты фона или логотипа: из Steam (по старому адресу, затем по настоящему из магазина),
+    иначе из SteamGridDB. None — нигде нет."""
     if game.get("appid"):
         url = (STEAM_HERO_URL if kind == "hero" else STEAM_LOGO_URL).format(appid=game["appid"])
         try:
             return fetch(url).content
         except requests.RequestException:
-            pass  # у новых игр Steam хранит картинки по другим адресам — идём в SteamGridDB
+            pass  # у новых игр Steam хранит картинки по другим адресам — спрашиваем их у магазина
+        content = _steam_asset(game["appid"], kind)
+        if content:
+            return content
     if not api_key:
         return None
     game_id = _griddb_game_id(game, api_key)
@@ -1359,7 +2437,7 @@ def get_artwork(game, kind, api_key=""):
         return _trimmed_logo(path) if kind == "logo" else path
     missing = path + ".none"
     image = None
-    if not os.path.exists(missing):
+    if not _known_missing(missing):
         try:
             content = _download_art(game, kind, api_key)
             if content:
@@ -1367,7 +2445,7 @@ def get_artwork(game, kind, api_key=""):
                 image.load()
             else:
                 os.makedirs(os.path.dirname(missing), exist_ok=True)
-                write_text(missing, "")
+                write_text(missing, MISS_VERSION)
         except (requests.RequestException, OSError, ValueError, KeyError) as e:
             log.warning("Не удалось получить %s для «%s»: %s", kind, game["name"], mask_secrets(e))
 
@@ -1390,29 +2468,80 @@ def get_artwork(game, kind, api_key=""):
     return None
 
 
-def _animated_path(game):
-    return _art_path(game, "hero")[:-4] + "_anim.webp"
+def _animated_path(game, index=None):
+    """Выбранный живой фон игры (index None) или просмотренный вариант номер index — пока его не выбрали."""
+    base = _art_path(game, "hero")[:-4] + "_anim"
+    return base + (".webp" if index is None else f"_{index}.webp")
+
+
+def _animated_list_path(game):
+    return _animated_path(game)[:-5] + ".json"
+
+
+ANIMATED_MAX = 30  # больше вариантов живого фона не показываем
+
+
+def _load_animated_list(game):
+    """{"urls": [адреса вариантов], "chosen": номер выбранного или None} или None — список ещё не спрашивали."""
+    try:
+        with open(_animated_list_path(game), encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("urls"), list):
+            chosen = data.get("chosen")
+            return {"urls": [u for u in data["urls"] if isinstance(u, str)],
+                    "chosen": chosen if isinstance(chosen, int) else None}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
+def _save_animated_list(game, data):
+    os.makedirs(os.path.dirname(_animated_list_path(game)), exist_ok=True)
+    save_json(_animated_list_path(game), data)
+
+
+def discard_animated_variants(game):
+    """Удалить просмотренные, но не выбранные варианты живого фона. Возвращает, сколько байт освободилось."""
+    base = os.path.basename(_animated_path(game))[:-5] + "_"
+    folder = os.path.dirname(_animated_path(game))
+    freed = 0
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return 0
+    for name in names:
+        if name.startswith(base) and (name.endswith(".webp") or name.endswith(".webp.tmp")):
+            path = os.path.join(folder, name)
+            try:
+                size = os.path.getsize(path)
+                os.remove(path)
+                freed += size
+            except OSError:
+                pass  # файл ещё открыт — удалится в следующий раз
+    return freed
 
 
 def find_animated_hero(game, api_key):
-    """Есть ли у игры живой фон в SteamGridDB (анимированный WebP): {"path": скачанный файл или None,
-    "url": адрес для скачивания} или None — ключа нет или живого фона у игры нет.
+    """Есть ли у игры живые фоны в SteamGridDB (анимированный WebP): {"path": выбранный и скачанный файл
+    или None, "urls": адреса всех вариантов, "chosen": номер выбранного или None} или None — ключа нет или
+    живого фона у игры нет.
 
-    Сам файл здесь не качается — только по кнопке на странице игры (download_animated_hero): живые фоны
-    весят до 50 МБ. Ответ запоминается рядом с фонами: «.url» — адрес живого фона, «.none» — его нет
-    (забывается после смены ключа SteamGridDB, как и для обычных фонов).
+    Сами файлы здесь не качаются — только по кнопке на странице игры (download_animated_hero): живые фоны
+    весят до 50 МБ. Список вариантов запоминается рядом с фонами («_anim.json»), «.none» — живого фона нет
+    (забывается после смены ключа SteamGridDB, как и для обычных фонов). Просмотренные, но не выбранные
+    варианты, оставшиеся с прошлого раза, здесь же удаляются.
     """
     if not api_key:
         return None
+    discard_animated_variants(game)
     path = _animated_path(game)
-    if os.path.exists(path):
-        return {"path": path, "url": None}
+    kept = path if os.path.exists(path) else None
+    data = _load_animated_list(game)
+    if data and data["urls"]:
+        return {"path": kept, "urls": data["urls"], "chosen": data["chosen"] if kept else None}
     url_file, missing = path + ".url", path + ".none"
-    if os.path.exists(missing):
+    if os.path.exists(missing) and not kept:
         return None
-    url = read_text(url_file)
-    if url:
-        return {"path": None, "url": url}
     try:
         game_id = _griddb_game_id(game, api_key)
         items = []
@@ -1421,21 +2550,39 @@ def find_animated_hero(game, api_key):
             items = fetch(f"{STEAMGRIDDB_API_URL}/heroes/game/{game_id}",
                           headers={"Authorization": f"Bearer {api_key}"},
                           params={"types": "animated", "mimes": "image/webp"}).json().get("data", [])
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        if not items:
+        urls = list(dict.fromkeys(item["url"] for item in items if item.get("url")))[:ANIMATED_MAX]
+    except (requests.RequestException, OSError, ValueError, KeyError, TypeError) as e:
+        log.warning("Не удалось узнать про живой фон для «%s»: %s", game["name"], mask_secrets(e))
+        return {"path": kept, "urls": [], "chosen": None} if kept else None
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not urls:
+        if not kept:
             write_text(missing, "")
             return None
-        write_text(url_file, items[0]["url"])
-        return {"path": None, "url": items[0]["url"]}
-    except (requests.RequestException, OSError, ValueError, KeyError) as e:
-        log.warning("Не удалось узнать про живой фон для «%s»: %s", game["name"], mask_secrets(e))
-        return None
+        return {"path": kept, "urls": [], "chosen": None}
+    chosen = None
+    if kept:  # до 2.3 скачивался только первый вариант, его адрес лежал в «.url»
+        old = read_text(url_file)
+        chosen = urls.index(old) if old in urls else 0
+    _save_animated_list(game, {"urls": urls, "chosen": chosen})
+    for stale in (url_file, missing):
+        if os.path.exists(stale):
+            os.remove(stale)
+    log.info("Живой фон для «%s»: вариантов в SteamGridDB — %d", game["name"], len(urls))
+    return {"path": kept, "urls": urls, "chosen": chosen}
 
 
-def download_animated_hero(game, url, progress=None, cancelled=None):
-    """Скачать живой фон. progress(проценты или -1, если сервер не сказал размер) — по ходу загрузки,
-    cancelled() → True — бросить (открыли другую игру). Путь к файлу или None, если загрузку бросили."""
-    path = _animated_path(game)
+def download_animated_hero(game, index, url, progress=None, cancelled=None):
+    """Скачать вариант живого фона номер index. Первый скачанный сразу становится выбранным, остальные лежат
+    отдельными файлами, пока пользователь не выберет (keep_animated_hero) или не уйдёт со страницы игры.
+    progress(проценты или -1, если сервер не сказал размер) — по ходу загрузки, cancelled() → True — бросить
+    (открыли другую игру). Путь к файлу или None, если загрузку бросили."""
+    data = _load_animated_list(game) or {"urls": [url], "chosen": None}
+    kept = _animated_path(game)
+    if os.path.exists(kept) and data["chosen"] == index:
+        return kept
+    first = not os.path.exists(kept)
+    path = kept if first else _animated_path(game, index)
     if os.path.exists(path):
         return path
     tmp_path = path + ".tmp"
@@ -1455,8 +2602,30 @@ def download_animated_hero(game, url, progress=None, cancelled=None):
         os.remove(tmp_path)
         return None
     os.replace(tmp_path, path)
-    log.info("Живой фон для «%s»: %d КБ", game["name"], done // 1024)
+    if first:
+        data["chosen"] = index
+        _save_animated_list(game, data)
+    log.info("Живой фон для «%s», вариант %d: %d КБ%s", game["name"], index + 1, done // 1024,
+             " — выбран" if first else "")
     return path
+
+
+def keep_animated_hero(game, index):
+    """Оставить вариант живого фона номер index, остальные просмотренные удалить.
+    Возвращает {"path": выбранный файл, "freed": сколько байт освободилось}."""
+    data = _load_animated_list(game) or {"urls": [], "chosen": None}
+    kept = _animated_path(game)
+    variant = _animated_path(game, index)
+    freed = 0
+    if data["chosen"] != index and os.path.exists(variant):
+        if os.path.exists(kept):
+            freed += os.path.getsize(kept)
+        os.replace(variant, kept)
+        data["chosen"] = index
+        _save_animated_list(game, data)
+    freed += discard_animated_variants(game)
+    log.info("Живой фон для «%s»: оставлен вариант %d, освобождено %d КБ", game["name"], index + 1, freed // 1024)
+    return {"path": kept, "freed": freed}
 
 
 def make_backdrop(hero_path):
@@ -1497,27 +2666,30 @@ COVER_RATIO = (0.6, 1.4)  # обложка альбома — квадратна
 STEAM_STORE_ITEMS_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/"
 STEAM_ASSETS_URL = "https://shared.akamai.steamstatic.com/store_item_assets/"
 STORE_TYPE_MUSIC = 11  # тип «саундтрек» в ответе магазина
+STORE_TYPE_GAME = 0  # тип «игра»; нулевое значение магазин иногда не присылает вовсе
 STORE_ITEMS_BATCH = 100  # столько appid в одном запросе — адрес не выходит слишком длинным
 STATE_FULLY_INSTALLED = 4  # флаг StateFlags в appmanifest: скачано целиком
 _soundtracks_lock = threading.Lock()
 
 
 def _acf_values(path):
-    """appid, name, installdir и StateFlags из appmanifest_*.acf (первые встреченные — они в начале файла)."""
+    """appid, name, installdir, StateFlags и LastOwner (SteamID64 аккаунта, который скачал приложение)
+    из appmanifest_*.acf — первые встреченные, они в начале файла."""
     try:
         with open(path, encoding="utf-8", errors="ignore") as f:
             text = f.read()
     except OSError:
         return {}
     values = {}
-    for key, value in re.findall(r'^\s*"(appid|name|installdir|stateflags)"\s+"([^"]*)"', text,
+    for key, value in re.findall(r'^\s*"(appid|name|installdir|stateflags|lastowner)"\s+"([^"]*)"', text,
                                  re.MULTILINE | re.IGNORECASE):
         values.setdefault(key.lower(), value)
     return values
 
 
 def find_soundtracks(log_result=True):
-    """Скачанные саундтреки Steam: [{"appid" (или None), "name", "folder", "tracks": [путь, ...]}, ...]."""
+    """Скачанные саундтреки Steam: [{"appid" (или None), "name", "folder", "tracks": [путь, ...],
+    "owner": SteamID64 скачавшего аккаунта или ""}, ...]."""
     albums, seen = [], set()
     for library in steam_library_dirs():
         steamapps = os.path.join(library, "steamapps")
@@ -1550,7 +2722,8 @@ def find_soundtracks(log_result=True):
                 continue  # папка пустая
             appid = manifest.get("appid", "")
             albums.append({"appid": int(appid) if appid.isdigit() else None,
-                           "name": manifest.get("name") or entry, "folder": folder, "tracks": tracks})
+                           "name": manifest.get("name") or entry, "folder": folder, "tracks": tracks,
+                           "owner": manifest.get("lastowner", "")})
     albums.sort(key=lambda a: natural_key(a["name"]))
     if log_result:
         log.info("Саундтреки Steam: %d%s", len(albums),
@@ -1559,7 +2732,8 @@ def find_soundtracks(log_result=True):
 
 
 def store_items(appids):
-    """Сведения магазина о приложениях: {appid: {"type", "name", "parent", "header"}}. Чего нет в магазине — нет и тут."""
+    """Сведения магазина о приложениях: {appid: {"type", "name", "parent", "header", "assets"}}.
+    Чего нет в магазине — нет и тут. "assets" — адреса картинок {"cover", "hero", "logo"}, какие есть."""
     ids = sorted(set(appids))
     items = {}
     for start in range(0, len(ids), STORE_ITEMS_BATCH):
@@ -1572,12 +2746,67 @@ def store_items(appids):
             if not appid or item.get("success") != 1:
                 continue
             assets = item.get("assets") or {}
-            header = ""
-            if assets.get("asset_url_format") and assets.get("header"):
-                header = STEAM_ASSETS_URL + assets["asset_url_format"].replace("${FILENAME}", assets["header"])
+            urls = {}
+            if assets.get("asset_url_format"):
+                for kind, names in STORE_ASSET_NAMES.items():
+                    name = next((assets[n] for n in names if assets.get(n)), None)
+                    if name:
+                        urls[kind] = STEAM_ASSETS_URL + assets["asset_url_format"].replace("${FILENAME}", name)
             items[appid] = {"type": item.get("type"), "name": item.get("name") or "",
-                            "parent": (item.get("related_items") or {}).get("parent_appid"), "header": header}
+                            "parent": (item.get("related_items") or {}).get("parent_appid"),
+                            "header": urls.get("header", ""), "assets": urls}
     return items
+
+
+def owned_games(appids):
+    """Игры среди приложений аккаунта — без дополнений, саундтреков, демо и программ: [{"appid", "name"}].
+    Для импорта без ключа: что есть на аккаунте, известно после входа в магазин во встроенном браузере."""
+    games = [{"appid": appid, "name": clean_name(item["name"])} for appid, item in store_items(appids).items()
+             if item["type"] in (None, STORE_TYPE_GAME) and clean_name(item["name"])]
+    return sorted(games, key=lambda g: natural_key(g["name"]))
+
+
+# Какие картинки магазина нам нужны и как они называются в ответе GetItems (сначала крупные)
+STORE_ASSET_NAMES = {
+    "header": ("header",),
+    "cover": ("library_capsule_2x", "library_capsule"),
+    "hero": ("library_hero_2x", "library_hero"),
+    "logo": ("library_logo_2x", "library_logo"),
+}
+_assets_cache = {}  # appid → адреса картинок: за время работы программы они не меняются
+_assets_lock = threading.Lock()
+
+
+def steam_assets(appid, _depth=0):
+    """Официальные картинки Steam для игры: {"cover", "hero", "logo"} — какие нашлись.
+
+    У игр последних лет картинки лежат по адресам с хэшем, и старые адреса вида
+    steam/apps/<appid>/library_hero.jpg для них не работают. Настоящие адреса отдаёт магазин
+    (IStoreBrowseService/GetItems, ключ не нужен). У демоверсии своих картинок часто нет —
+    тогда недостающие берём у основной игры (parent_appid).
+    """
+    with _assets_lock:
+        if appid in _assets_cache:
+            return _assets_cache[appid]
+    item = store_items([appid]).get(appid) or {}
+    urls = dict(item.get("assets") or {})
+    parent = item.get("parent")
+    if parent and parent != appid and _depth == 0 and not all(k in urls for k in ("cover", "hero", "logo")):
+        for kind, url in steam_assets(parent, _depth=1).items():
+            urls.setdefault(kind, url)
+    with _assets_lock:
+        _assets_cache[appid] = urls
+    return urls
+
+
+def _steam_asset(appid, kind):
+    """Байты картинки kind из магазина Steam по настоящему адресу или None."""
+    try:
+        url = steam_assets(appid).get(kind)
+        return fetch(url).content if url else None
+    except (requests.RequestException, ValueError) as e:
+        log.info("Магазин Steam не отдал %s для %s: %s", kind, appid, e)
+        return None
 
 
 def _load_soundtrack_cache():
@@ -1898,6 +3127,7 @@ def owned_soundtracks(owned_appids):
     _describe_music(owned, cache)
     cache["owned"] = [appid for appid in owned
                       if str(appid) in cache["albums"] and not cache["albums"][str(appid)].get("failed")]
+    cache["owned_apps"] = owned  # всё, что есть на аккаунте: по нему поиск игр отмечает уже купленные
     cache["synced"] = time.time()
     _save_soundtrack_cache(cache)
     log.info("Куплено в Steam: %d, из них саундтреков: %d", len(owned), len(cache["owned"]))
@@ -1911,6 +3141,111 @@ def cached_owned_soundtracks():
 
 def soundtracks_synced():
     return bool(_load_soundtrack_cache().get("synced"))
+
+
+def forget_owned_soundtracks():
+    """Выход из магазина: список покупок был того, кто вошёл, — забываем его (сведения об альбомах остаются)."""
+    cache = _load_soundtrack_cache()
+    cache["owned"] = []
+    cache["owned_apps"] = []
+    cache.pop("synced", None)
+    _save_soundtrack_cache(cache)
+
+
+def owned_apps():
+    """appid всего, что есть на аккаунте Steam, — с прошлой синхронизации покупок (вход в магазин
+    во встроенном браузере). Пусто — синхронизации ещё не было."""
+    return set(_load_soundtrack_cache().get("owned_apps") or [])
+
+
+# --- Удаление скачанного саундтрека -------------------------------------------
+# Скачанный саундтрек — обычное приложение Steam: папка в steamapps\music и appmanifest_<appid>.acf рядом
+# с играми. Удалить его можно через сам Steam (steam://uninstall — Steam спросит и уберёт всё сам) или без Steam:
+# программа кладёт папку и appmanifest в Корзину Windows, откуда их можно вернуть. Без Steam — только когда он
+# закрыт: запущенный Steam держит сведения об альбоме в памяти и может начать качать его заново.
+def soundtrack_paths(album):
+    """Что удалить вместе с альбомом: [папка альбома, appmanifest (если есть)]. Только папки прямо внутри
+    <библиотека>\\steamapps\\music — всё остальное программа не трогает (OSError)."""
+    folder = os.path.normpath(album["folder"])
+    music = os.path.dirname(folder)
+    steamapps = os.path.dirname(music)
+    if (os.path.basename(music).lower() != "music" or os.path.basename(steamapps).lower() != "steamapps"
+            or not os.path.isdir(folder)):
+        raise OSError(f"это не папка саундтрека Steam: {folder}")
+    paths = [folder]
+    manifest = os.path.join(steamapps, f"appmanifest_{album['appid']}.acf") if album.get("appid") else ""
+    if manifest and os.path.isfile(manifest):
+        paths.append(manifest)
+    return paths
+
+
+def folder_size(folder):
+    total = 0
+    for root, _, names in os.walk(folder):
+        for name in names:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def _to_recycle_bin(paths):
+    """Файлы и папки — в Корзину Windows (SHFileOperation с «можно отменить»), без окон Windows."""
+    import ctypes
+    from ctypes import wintypes
+
+    class FileOp(ctypes.Structure):
+        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", ctypes.c_void_p),
+                    ("pTo", ctypes.c_void_p), ("fFlags", ctypes.c_uint16), ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", ctypes.c_void_p)]
+
+    fo_delete, allow_undo, no_confirmation, silent, no_error_ui = 3, 0x40, 0x10, 0x4, 0x400
+    names = ctypes.create_unicode_buffer("\0".join(paths) + "\0\0")  # список путей кончается двумя нулями
+    op = FileOp(None, fo_delete, ctypes.cast(names, ctypes.c_void_p), None,
+                allow_undo | no_confirmation | silent | no_error_ui, False, None, None)
+    result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if result or op.fAnyOperationsAborted:
+        raise OSError(f"Windows не переместила файлы в Корзину (код {result}). Возможно, трек сейчас открыт")
+
+
+def remove_soundtrack(album):
+    """Удалить скачанный альбом без Steam — в Корзину. Возвращает, сколько файлов и папок убрано."""
+    if sys.platform != "win32":
+        raise OSError("удаление в Корзину работает только в Windows")
+    paths = soundtrack_paths(album)
+    _to_recycle_bin(paths)
+    log.info("Саундтрек «%s» (%s) удалён в Корзину: %s", album["name"], album.get("appid") or "без appid",
+             ", ".join(paths))
+    return len(paths)
+
+
+# --- Поиск игры в магазине Steam ----------------------------------------------
+# Открытый поиск магазина: ключ и вход не нужны. Найденный номер игры (appid) — это всё, что нужно
+# для описания, скриншотов, трейлеров, обложек и установки через Steam.
+STEAM_STORE_SEARCH_URL = "https://store.steampowered.com/api/storesearch/"
+STORE_SEARCH_LIMIT = 10
+
+
+def search_store(term):
+    """Игры магазина Steam по названию: [{"appid", "name", "image"}, ...]. Вместо названия можно вставить
+    номер игры или ссылку на её страницу в магазине."""
+    term = term.strip()
+    if not term:
+        return []
+    match = re.search(r"store\.steampowered\.com/app/(\d+)", term) or re.fullmatch(r"(\d{1,8})", term)
+    if match:
+        appid = int(match.group(1))
+        item = store_items([appid]).get(appid)
+        found = [{"appid": appid, "name": clean_name(item["name"]), "image": item.get("header") or ""}] \
+            if item and item.get("name") else []
+    else:
+        data = fetch(STEAM_STORE_SEARCH_URL, params={"term": term, "l": "russian", "cc": "US"}).json()
+        found = [{"appid": int(item["id"]), "name": clean_name(item["name"]), "image": item.get("tiny_image") or ""}
+                 for item in (data or {}).get("items") or []
+                 if item.get("type") == "app" and item.get("id") and item.get("name")][:STORE_SEARCH_LIMIT]
+    log.info("Поиск в магазине Steam «%s»: найдено %d", term, len(found))
+    return found
 
 
 # --- Фон рулетки: обложки на «фотоплёнке» -----------------------------------
@@ -1988,6 +3323,15 @@ TRAILER_THREADS = 6  # кусочков качаем одновременно
 
 class TrailerCancelled(Exception):
     """Трейлер закрыли, пока он скачивался."""
+
+
+_previews = 0  # сколько «быстрых стартов» качается прямо сейчас
+_previews_lock = threading.Lock()
+
+
+def _previews_running():
+    with _previews_lock:
+        return _previews > 0
 
 
 def _playlist_lines(url):
@@ -2358,10 +3702,18 @@ def trailer_file(master_url, progress=None, cancelled=None, preview=False):
     urls = [url for init, segments in playlists for url in (init, *segments)]
 
     def download(url):
+        # Пока качается быстрый старт, 1080p ждёт: вместе они делят скорость интернета, и быстрый старт
+        # переставал быть быстрым — оба трейлера приходили одновременно
+        while not preview and _previews_running() and not (cancelled and cancelled()):
+            time.sleep(0.05)
         if cancelled and cancelled():
             raise TrailerCancelled()
         return fetch(url).content
 
+    global _previews
+    if preview:
+        with _previews_lock:
+            _previews += 1
     parts = {}
     pool = ThreadPoolExecutor(TRAILER_THREADS)
     try:
@@ -2374,6 +3726,9 @@ def trailer_file(master_url, progress=None, cancelled=None, preview=False):
                 progress(height, len(parts) * 100 // len(urls))
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
+        if preview:
+            with _previews_lock:
+                _previews -= 1
 
     temp = path + ".tmp"
     try:
