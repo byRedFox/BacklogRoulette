@@ -98,6 +98,17 @@ DEFAULT_SETTINGS = {
     # Перевод описаний и отзывов: auto — Google, а когда он не отвечает — модулем на этом ПК;
     # local — только модулем на ПК (текст не уходит в интернет); off — не переводить
     "translate_mode": "auto",
+    # Что крутит рулетка: источники через «+» — steam, ports, discs («steam+ports», «discs»…)
+    "roulette_pool": "steam",
+    "ports_root": "", "discs_root": "",  # папки, в которых у каждой игры своя папка: туда смотрит «Найти новые»
+    # Порядок игр на вкладках: name — по алфавиту, name_desc — с конца алфавита, new — сначала добавленные
+    # последними, old — сначала давние; у портов и дисковых ещё played — больше наиграно, recent — недавно запускали
+    "library_sort": "name", "ports_sort": "name", "discs_sort": "name",
+    "ports_view": "grid", "discs_view": "grid",  # вид на вкладках портов и дисковых игр: list | grid
+    # Фон рулетки: film — ленты из обложек едут, still — те же ленты стоят, custom — своя картинка
+    "roulette_backdrop": "film",
+    "selection_backdrop": True,  # выделили игры — за списком их обложки под матовым стеклом
+    "collections_style": "glass",  # вид плиток коллекций: glass | case
 }
 
 
@@ -379,6 +390,14 @@ def save_settings(**changes):
 # затем убираем символы, недопустимые в имени файла (и значки ™ ®)
 def clean_name(text):
     text = re.sub(r'[<>:"/\\|?*™®©]', "", html.unescape(str(text)))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def title_name(text):
+    """Название порта или дисковой игры, как его вписали: «James Bond: Blood Stone» — с двоеточием и прочими
+    знаками, по нему точнее ищутся SteamGridDB, Википедия и Steam. Убираются только служебные символы и ™ ® ©.
+    Обложки и картинки всё равно хранятся под clean_name — для имени файла знаки убираются там."""
+    text = re.sub(r"[\x00-\x1f\x7f™®©]", "", html.unescape(str(text)))
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -783,9 +802,9 @@ GRIDDB_RETRY_PAUSE = 3  # секунд: SteamGridDB порой минуту от
 
 
 def cover_from_griddb(game, api_key):
-    """Заменить обложку игры лучшей вертикальной из SteamGridDB — по просьбе пользователя. Путь или None — там нет.
-    Такую обложку программа потом не трогает, как и выбранную вручную. Сайт не ответил и со второго раза —
-    ServiceBusy."""
+    """Заменить обложку игры вертикальной из SteamGridDB — по просьбе пользователя. Каждое нажатие — следующий
+    вариант 600×900 (next_griddb_art). {"path", "index", "count"} или None — там нет. Такую обложку программа
+    потом не трогает, как и выбранную вручную. Сайт не ответил и со второго раза — ServiceBusy."""
     name = clean_name(game["name"])
     old = find_cover(name)
     if old:
@@ -798,26 +817,7 @@ def cover_from_griddb(game, api_key):
                      "похожа на собранную Steam" if generated else "проверка не сочла её собранной Steam")
         except (OSError, ValueError):
             pass
-    content, error = None, None
-    for attempt in range(2):
-        if attempt:
-            time.sleep(GRIDDB_RETRY_PAUSE)
-        try:
-            content = download_from_steamgriddb(game, api_key)
-            error = None
-            break
-        except (requests.RequestException, ValueError, KeyError, TypeError) as e:
-            error = e
-    if error is not None:
-        log.warning("Обложка «%s»: SteamGridDB не ответил и со второго раза: %s", name, mask_secrets(error))
-        raise ServiceBusy("SteamGridDB сейчас не отвечает. Так бывает минуту-другую — попробуйте чуть позже.")
-    if not content:
-        log.info("Обложка «%s»: в SteamGridDB вертикальной обложки нет", game["name"])
-        return None
-    path = save_cover_bytes(game["name"], content)
-    mark_custom_cover(game["name"])
-    log.info("Обложка «%s» заменена из SteamGridDB по просьбе пользователя", game["name"])
-    return path
+    return next_griddb_art(game, "cover", api_key)
 
 
 # --- Steam ------------------------------------------------------------------
@@ -2382,8 +2382,17 @@ def _griddb_game_id(game, api_key):
         except requests.RequestException:
             pass  # по appid не нашлось — ищем по названию
     search_url = f"{STEAMGRIDDB_API_URL}/search/autocomplete/{quote(game['name'], safe='')}"
-    found = fetch(search_url, headers=headers).json().get("data", [])
-    return found[0]["id"] if found else None
+    found = [item for item in fetch(search_url, headers=headers).json().get("data", []) if item.get("id")]
+    # Первой поиск порой ставит не ту игру с похожим названием (другую часть, версию для другой приставки) —
+    # если среди найденных есть игра ровно с этим названием (без учёта знаков и регистра), берём её
+    wanted = _plain_title(game["name"])
+    exact = next((item for item in found if _plain_title(item.get("name") or "") == wanted), None)
+    return (exact or found[0])["id"] if found else None
+
+
+def _plain_title(name):
+    """Название без знаков препинания и регистра: «James Bond 007: Blood Stone» = «James Bond 007 - Blood Stone»."""
+    return re.sub(r"[^0-9a-zа-яё]+", "", (name or "").casefold())
 
 
 def _download_art(game, kind, api_key):
@@ -2639,6 +2648,343 @@ def make_backdrop(hero_path):
     image = ImageEnhance.Brightness(image).enhance(0.75)
     image.save(path, quality=85)
     return path
+
+
+# Своя картинка фона рулетки. Программа делает из неё копию — уменьшенную и размытую, как матовое стекло, —
+# и дальше берёт только копию: сам файл пользователя не трогается, путь к нему нигде не хранится.
+ROULETTE_BACKDROP_FILE = os.path.join(CACHE_DIR, "backdrop", "roulette.jpg")
+ROULETTE_BACKDROP_WIDTH = 1280  # больше не нужно: картинка размыта и растягивается на окно
+ROULETTE_BACKDROP_BLUR = 14
+
+
+def save_roulette_backdrop(source):
+    """Сделать фон рулетки из картинки source. Возвращает путь к готовой копии. Не картинка — ValueError."""
+    try:
+        with Image.open(source) as image:
+            image = ImageOps.exif_transpose(image).convert("RGB")  # фото с телефона — правильной стороной вверх
+    except (OSError, Image.DecompressionBombError) as e:
+        raise ValueError(f"это не картинка или она повреждена ({e})") from None
+    if image.width > ROULETTE_BACKDROP_WIDTH:
+        image = image.resize((ROULETTE_BACKDROP_WIDTH, max(1, round(image.height * ROULETTE_BACKDROP_WIDTH /
+                                                                    image.width))), Image.Resampling.LANCZOS)
+    image = image.filter(ImageFilter.GaussianBlur(ROULETTE_BACKDROP_BLUR))
+    os.makedirs(os.path.dirname(ROULETTE_BACKDROP_FILE), exist_ok=True)
+    tmp_path = ROULETTE_BACKDROP_FILE + ".tmp"
+    image.save(tmp_path, "JPEG", quality=90)
+    os.replace(tmp_path, ROULETTE_BACKDROP_FILE)
+    log.info("Фон рулетки: своя картинка, %d×%d", image.width, image.height)
+    return ROULETTE_BACKDROP_FILE
+
+
+def roulette_backdrop():
+    """Путь к своей картинке фона рулетки или None — её нет."""
+    return ROULETTE_BACKDROP_FILE if os.path.exists(ROULETTE_BACKDROP_FILE) else None
+
+
+# --- Подложка из выделенных игр ---------------------------------------------------
+# Выделили игру на вкладке — за списком её обложка под матовым стеклом; несколько — коллаж из их обложек.
+# Собирается в фоновом потоке, маленькой (растягивается на окно — она и так размыта), в памяти, на диск не пишется.
+SELECTION_MAX = 12
+SELECTION_SIZE = (960, 540)
+SELECTION_BLUR = 16
+
+
+def _fit_cover(path, width, height):
+    """Обложка, вписанная в прямоугольник целиком: лишнее по краям обрезается."""
+    with Image.open(path) as image:
+        return ImageOps.fit(image.convert("RGB"), (max(1, width), max(1, height)), Image.Resampling.LANCZOS)
+
+
+def _collage(paths, width, height, rows):
+    """Коллаж: обложки рядами (rows), в каждом ряду — поровну; в последнем ряду обложки шире, если их меньше."""
+    canvas = Image.new("RGB", (width, height), FILM_COLOR)
+    per_row = math.ceil(len(paths) / rows)
+    for row in range(rows):
+        part = paths[row * per_row:(row + 1) * per_row]
+        if not part:
+            break
+        top, bottom = round(row * height / rows), round((row + 1) * height / rows)
+        for i, path in enumerate(part):
+            left, right = round(i * width / len(part)), round((i + 1) * width / len(part))
+            try:
+                canvas.paste(_fit_cover(path, right - left, bottom - top), (left, top))
+            except (OSError, ValueError):
+                continue  # битая обложка — на её месте просто фон
+    return canvas
+
+
+def selection_backdrop(paths):
+    """Подложка вкладки из обложек выделенных игр: одна — во весь фон, несколько — коллаж, всё размыто.
+    PIL Image или None — обложек нет. Вызывается в фоновом потоке."""
+    paths = [p for p in paths if p][:SELECTION_MAX]
+    if not paths:
+        return None
+    width, height = SELECTION_SIZE
+    rows = 1 if len(paths) <= 5 else 2
+    image = _collage(paths, width, height, rows)
+    return image.filter(ImageFilter.GaussianBlur(SELECTION_BLUR))
+
+
+COLLECTION_COVER_SIZE = (264, 396)  # плитка коллекции — как обложка 2:3, вдвое крупнее для чётких экранов
+COLLECTION_COVER_BLUR = 5
+
+
+def collection_cover(paths):
+    """Картинка плитки коллекции в виде «Стекло»: до четырёх обложек её игр (одна — целиком,
+    две-три — рядом, четыре — 2×2), чуть размытых — поверх ляжет название. PIL Image или None. В фоновом потоке."""
+    paths = [p for p in paths if p][:4]
+    if not paths:
+        return None
+    width, height = COLLECTION_COVER_SIZE
+    image = _collage(paths, width, height, 1 if len(paths) < 4 else 2)
+    return image.filter(ImageFilter.GaussianBlur(COLLECTION_COVER_BLUR))
+
+
+# --- Коллекции -------------------------------------------------------------------
+# Свои подборки игр: из Steam, портов и дисковых вместе. Игра в коллекции — ссылка на неё (номер в Steam или
+# название, у портов и дисковых — их номер в списке), а не копия: переименовали или обновили игру — в коллекции
+# она та же. Убрали игру из списка — из коллекции она пропадает, а вернули — снова на месте.
+COLLECTIONS_FILE = os.path.join(BASE_DIR, "collections.json")
+COLLECTION_NAME_MAX = 60
+COLLECTION_KINDS = ("steam", "port", "disc")
+
+
+def collection_ref(game):
+    """Ссылка на игру для коллекции."""
+    if is_port(game):
+        return {"kind": "disc" if is_disc(game) else "port", "id": game["id"]}
+    if game.get("appid"):
+        return {"kind": "steam", "appid": int(game["appid"])}
+    return {"kind": "steam", "name": game["name"]}
+
+
+class CollectionLibrary:
+    def __init__(self, path=COLLECTIONS_FILE):
+        self.path = path
+        self.collections = []
+
+    @staticmethod
+    def _valid_ref(ref):
+        if not isinstance(ref, dict) or ref.get("kind") not in COLLECTION_KINDS:
+            return False
+        if ref["kind"] == "steam":
+            return isinstance(ref.get("appid"), int) or isinstance(ref.get("name"), str)
+        return isinstance(ref.get("id"), str)
+
+    def load(self):
+        """Прочитать коллекции. Файл испорчен — откладываем его в .broken и начинаем с пустого; текст для
+        уведомления или None."""
+        self.collections = []
+        if not os.path.exists(self.path):
+            return None
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+            items = data.get("collections") if isinstance(data, dict) else None
+            if not isinstance(items, list):
+                raise ValueError("нет списка коллекций")
+        except (OSError, ValueError) as e:
+            log.warning("Коллекции не прочитались: %s", e)
+            try:
+                os.replace(self.path, self.path + ".broken")
+            except OSError:
+                pass
+            return "Файл коллекций повреждён — он сохранён как collections.json.broken, коллекции начаты заново."
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not isinstance(item.get("name"), str):
+                continue
+            refs = [ref for ref in item.get("items") or [] if self._valid_ref(ref)]
+            self.collections.append({"id": item["id"], "name": item["name"][:COLLECTION_NAME_MAX], "items": refs,
+                                     "created": int(item.get("created") or 0)})
+        return None
+
+    def save(self):
+        save_json(self.path, {"version": 1, "collections": self.collections})
+
+    def find(self, collection_id):
+        return next((c for c in self.collections if c["id"] == collection_id), None)
+
+    def name_taken(self, name, skip=None):
+        key = name.strip().casefold()
+        return any(c is not skip and c["name"].casefold() == key for c in self.collections)
+
+    def create(self, name):
+        collection_id = f"c{int(time.time() * 1000)}"
+        while self.find(collection_id):
+            collection_id += "x"
+        collection = {"id": collection_id, "name": name.strip()[:COLLECTION_NAME_MAX], "items": [],
+                      "created": int(time.time())}
+        self.collections.append(collection)
+        return collection
+
+    def delete(self, collection):
+        self.collections = [c for c in self.collections if c is not collection]
+
+    @staticmethod
+    def has(collection, ref):
+        return ref in collection["items"]
+
+    def add(self, collection, refs):
+        """Добавить игры; сколько добавилось (уже бывшие в коллекции не дублируются)."""
+        added = 0
+        for ref in refs:
+            if ref not in collection["items"]:
+                collection["items"].append(ref)
+                added += 1
+        return added
+
+    def remove(self, collection, refs):
+        before = len(collection["items"])
+        collection["items"] = [ref for ref in collection["items"] if ref not in refs]
+        return before - len(collection["items"])
+
+
+# --- Другой вариант картинки из SteamGridDB --------------------------------------
+# «Обложка из SteamGridDB» в меню и кнопки «Фон ›» и «Логотип ›» в шапке страницы игры берут из SteamGridDB
+# следующий вариант при каждом нажатии, по кругу. Обложки — только 600×900, как остальные на барабане
+# (нет таких — любые вертикальные). Список вариантов и какой сейчас показан — в cache/griddb_variants.json.
+GRIDDB_VARIANTS_FILE = os.path.join(CACHE_DIR, "griddb_variants.json")
+GRIDDB_VARIANTS_TTL = 7 * 24 * 3600  # за неделю на сайт выкладывают новые картинки — список спрашиваем заново
+GRIDDB_VARIANTS_MAX = 50
+GRIDDB_SECTIONS = {"cover": "grids", "hero": "heroes", "logo": "logos"}
+GRIDDB_KIND_NAMES = {"cover": "Обложка", "hero": "Фон", "logo": "Логотип"}
+_griddb_variants_lock = threading.Lock()
+
+
+def _variant_key(game, kind):
+    return kind + ":" + (str(game["appid"]) if game.get("appid") else "name_" + clean_name(game["name"]).casefold())
+
+
+def _load_griddb_variants():
+    try:
+        with open(GRIDDB_VARIANTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _griddb_variant_urls(game, kind, api_key):
+    """Адреса всех картинок kind игры в SteamGridDB: сначала те, что выше оценены на сайте."""
+    game_id = _griddb_game_id(game, api_key)
+    if not game_id:
+        return []
+    headers = {"Authorization": f"Bearer {api_key}"}
+    url = f"{STEAMGRIDDB_API_URL}/{GRIDDB_SECTIONS[kind]}/game/{game_id}"
+    params = {"types": "static"}  # живые фоны — отдельной кнопкой в шапке
+    if kind == "cover":
+        items = fetch(url, headers=headers, params=dict(params, dimensions="600x900")).json().get("data", [])
+        if not items:
+            items = [item for item in fetch(url, headers=headers, params=params).json().get("data", [])
+                     if (item.get("height") or 0) > (item.get("width") or 0)]
+    else:
+        items = fetch(url, headers=headers, params=params).json().get("data", [])
+    return list(dict.fromkeys(item["url"] for item in items if item.get("url")))[:GRIDDB_VARIANTS_MAX]
+
+
+def _current_art(game, kind):
+    """Путь к картинке kind, которая сейчас у игры, или None."""
+    if kind == "cover":
+        return find_cover(game["name"])
+    path = _art_path(game, kind)
+    return path if os.path.exists(path) else None
+
+
+def _same_picture(image, path):
+    """Та же картинка, что в файле path (с точностью до сжатия и размера)."""
+    from PIL import ImageChops
+
+    try:
+        with Image.open(path) as current:
+            small = [im.convert("L").resize((32, 32)) for im in (image, current)]
+    except (OSError, ValueError):
+        return False
+    return sum(ImageChops.difference(*small).getdata()) / 1024 < 8
+
+
+def _save_art_variant(game, kind, image, content):
+    """Сохранить вариант на место картинки kind игры. Возвращает путь, который показывать."""
+    if kind == "cover":
+        path = save_cover_bytes(game["name"], content)
+        mark_custom_cover(game["name"])  # выбранную вручную обложку программа сама не заменит
+        return path
+    path = _art_path(game, kind)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    stale = [path + ".none", path[:-4] + ("_backdrop.jpg" if kind == "hero" else "_t.png")]
+    for old in stale:  # подложка и обрезанный логотип собраны из прошлой картинки
+        if os.path.exists(old):
+            os.remove(old)
+    if kind == "hero":
+        image = image.convert("RGB")
+        if image.width > HERO_WIDTH:
+            image = image.resize((HERO_WIDTH, round(image.height * HERO_WIDTH / image.width)),
+                                 Image.Resampling.LANCZOS)
+        image.save(path, quality=90)
+        return path
+    image = image.convert("RGBA")
+    image.thumbnail(LOGO_SIZE, Image.Resampling.LANCZOS)
+    image.save(path)
+    return _trimmed_logo(path)
+
+
+def next_griddb_art(game, kind, api_key, step=1):
+    """Следующий (step=1) или предыдущий (step=-1) вариант обложки, фона или логотипа (kind: "cover" | "hero" |
+    "logo") из SteamGridDB, по кругу. Сохраняется на место прежней картинки. Возвращает {"path", "index",
+    "count"} или None — вариантов нет. SteamGridDB не ответил и со второго раза — ServiceBusy. В фоновом потоке."""
+    step = -1 if step < 0 else 1
+    key = _variant_key(game, kind)
+    with _griddb_variants_lock:
+        entry = _load_griddb_variants().get(key) or {}
+    urls = entry.get("urls") if time.time() - (entry.get("fetched") or 0) < GRIDDB_VARIANTS_TTL else None
+    error = None
+    for attempt in range(2):
+        if attempt:
+            time.sleep(GRIDDB_RETRY_PAUSE)
+        try:
+            if not urls:
+                urls = _griddb_variant_urls(game, kind, api_key)
+            error = None
+            break
+        except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+            error = e
+    if error is not None:
+        log.warning("%s «%s»: SteamGridDB не ответил и со второго раза: %s", GRIDDB_KIND_NAMES[kind], game["name"],
+                    mask_secrets(error))
+        raise ServiceBusy("SteamGridDB сейчас не отвечает. Так бывает минуту-другую — попробуйте чуть позже.")
+    if not urls:
+        log.info("%s «%s»: в SteamGridDB вариантов нет", GRIDDB_KIND_NAMES[kind], game["name"])
+        return None
+    current = _current_art(game, kind)
+    # Ещё не листали — сейчас стоит первый вариант (или картинка не из SteamGridDB): вперёд — первый, назад — последний
+    start = -1 if step > 0 else 0
+    index = entry.get("index", start) if entry.get("urls") == urls else start
+    image = content = None
+    for _ in range(min(len(urls), 4)):  # тот же вариант, что уже стоит, пропускаем
+        index = (index + step) % len(urls)
+        try:
+            content = fetch(urls[index]).content
+            image = Image.open(io.BytesIO(content))
+            image.load()
+        except (requests.RequestException, OSError, ValueError) as e:
+            log.warning("%s «%s», вариант %d не скачался: %s", GRIDDB_KIND_NAMES[kind], game["name"], index + 1, e)
+            image = None
+            continue
+        if not (current and len(urls) > 1 and _same_picture(image, current)):
+            break
+    if image is None:
+        raise ServiceBusy("Картинка из SteamGridDB не скачалась — попробуйте ещё раз.")
+    with _griddb_variants_lock:
+        data = _load_griddb_variants()
+        data[key] = {"urls": urls, "index": index, "fetched": entry.get("fetched") if entry.get("urls") == urls
+                     else time.time()}
+        try:
+            os.makedirs(os.path.dirname(GRIDDB_VARIANTS_FILE), exist_ok=True)
+            save_json(GRIDDB_VARIANTS_FILE, data)
+        except OSError:
+            log.exception("Не удалось запомнить варианты картинок SteamGridDB")
+    path = _save_art_variant(game, kind, image, content)
+    log.info("%s «%s» из SteamGridDB: вариант %d из %d", GRIDDB_KIND_NAMES[kind], game["name"], index + 1, len(urls))
+    return {"path": path, "index": index, "count": len(urls)}
 
 
 def clear_artwork_misses():
@@ -3246,6 +3592,721 @@ def search_store(term):
                  if item.get("type") == "app" and item.get("id") and item.get("name")][:STORE_SEARCH_LIMIT]
     log.info("Поиск в магазине Steam «%s»: найдено %d", term, len(found))
     return found
+
+
+# --- Игры Native Port's -------------------------------------------------------
+# Native Port's — игры, которые уже установлены на этом ПК и запускаются своей программой, чаще всего фанатские
+# порты с GitHub (Ship of Harkinian, OpenMW и т. п.). Программа их только находит и запускает: ничего не качает
+# и не ставит. Список — в ports.json рядом с программой (как games.json, в репозиторий не попадает).
+#
+# Безопасность запуска: запускается только тот .exe, который выбрал пользователь, только изнутри папки порта,
+# без параметров и без командной строки Windows. При добавлении запоминается контрольная сумма SHA-256 файла:
+# поменялся файл (порт обновили — или подменили) — программа спросит, прежде чем запускать.
+# Обновления: программа читает открытые сведения о релизах на GitHub (без ключа и без входа) и только сообщает
+# о новой версии. Скачивает и ставит обновление сам пользователь — со страницы релиза в браузере.
+PORTS_FILE = os.path.join(BASE_DIR, "ports.json")
+# «Дисковые игры» — игры с дисков (и любые другие), установленные в свою папку. Устроены как порты, только без
+# GitHub: список в discs.json, запуск — тот же, с той же проверкой файла.
+DISCS_FILE = os.path.join(BASE_DIR, "discs.json")
+PORT_SCAN_DEPTH = 2  # насколько глубоко в папке порта искать .exe: сама папка, bin\, build\Release\
+PORT_SCAN_FILES = 20000  # больше файлов в одной папке не просматриваем — это уже не папка порта
+PORT_EXES_LIMIT = 15
+# Явно не запуск игры: удаление, установщики, библиотеки Microsoft, отчёты о сбоях
+PORT_JUNK_EXE_RE = re.compile(r"unins\d*|setup|vc_?redist|vcredist|dxsetup|dxwebsetup|dotnet|ndp\d|"
+                              r"crash_?(handler|report|pad)|unitycrashhandler|crashpad_handler", re.IGNORECASE)
+# Похоже на служебную программу порта — в списке вариантов запуска такие идут последними
+PORT_MINOR_EXE_RE = re.compile(r"editor|server|config|benchmark|test|tool|helper|update|wizard|[-_]cs$",
+                               re.IGNORECASE)
+PORT_SKIP_DIRS = {"__pycache__", "redist", "_commonredist", "directx", "vcredist", "dotnet"}
+PORT_LAUNCHER_EXE_RE = re.compile(r"launch", re.IGNORECASE)
+# Слова в названии папки, которые не часть названия игры: версии, платформы, сборки. Одиночное число — не версия,
+# а номер части («Max Payne 2»): версия — с «v» или с точкой («v8», «1.0.4»)
+PORT_NAME_JUNK_RE = re.compile(r"^(v\d+([._]\d+)*[a-z]?|\d+([._]\d+)+[a-z]?|win(dows)?(32|64)?|x(86|64)|amd64|arm64|"
+                               r"portable|release|build|nightly|latest)$", re.IGNORECASE)
+PORT_README_RE = re.compile(r"^(readme|read_me|about|info).*|.*\.(md|txt|url)$", re.IGNORECASE)
+PORT_README_MAX = 256 * 1024
+GITHUB_REPO_RE = re.compile(r"(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100})",
+                            re.IGNORECASE)
+GITHUB_NOT_OWNERS = {"orgs", "sponsors", "settings", "features", "topics", "marketplace", "about", "login",
+                     "apps", "collections", "search", "site", "pricing", "users"}
+GITHUB_API_URL = "https://api.github.com"
+GITHUB_HEADERS = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "BacklogRoulette"}
+PORT_CHECK_EVERY = 6 * 3600  # обновления портов — не чаще раза в 6 часов (без входа GitHub даёт 60 запросов в час)
+PORT_NOTES_MAX = 3000  # описание релиза длиннее — обрезаем
+
+
+class GitHubLimit(ServiceBusy):
+    """GitHub исчерпал лимит проверок без входа (60 в час)."""
+
+
+def port_name_from_folder(folder):
+    """Название игры из имени папки: «Ship_of_Harkinian-v8.0.4-Win64» → «Ship of Harkinian»,
+    «Half-Life 2 [GOG]» → «Half-Life 2». Отбрасываются версии (v8, 1.0.4), платформы и пометки в квадратных
+    скобках; номер части игры («2») и дефис в названии («Half-Life») остаются."""
+    raw = os.path.basename(os.path.normpath(folder))
+    raw = re.sub(r"\s*\[[^\]]*\]\s*", " ", raw).strip() or raw
+    kept = []
+    for token in (t for t in re.split(r"[\s_]+", raw) if t):
+        parts = token.split("-")
+        if len(parts) > 1 and any(PORT_NAME_JUNK_RE.match(p) for p in parts if p):
+            kept += [p for p in parts if p and not PORT_NAME_JUNK_RE.match(p)]  # «Harkinian-v8.0.4-Win64»
+        elif not PORT_NAME_JUNK_RE.match(token.strip("-.")):
+            kept.append(token)
+    return clean_name(" ".join(kept)) or clean_name(raw)
+
+
+def parse_github_repo(text):
+    """«автор/проект» из ссылки на GitHub (страница проекта, релизы, файл) или из «автор/проект». None — не ссылка."""
+    text = (text or "").strip()
+    match = GITHUB_REPO_RE.search(text) or re.fullmatch(r"([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100})", text)
+    if not match:
+        return None
+    # Точка в конце — обычно конец предложения в README («…на github.com/автор/проект.»), а не часть имени
+    owner, repo = match.group(1), re.sub(r"\.git$", "", match.group(2).rstrip("."), flags=re.IGNORECASE)
+    if owner.lower() in GITHUB_NOT_OWNERS or repo in ("", ".", ".."):
+        return None
+    return f"{owner}/{repo}"
+
+
+def _port_repo_hint(folder, exes=()):
+    """Ссылка на GitHub для порта — как подсказка; файлы только читаются, ничего не запускается.
+
+    Где искать: README и подобные файлы в самой папке порта, текстовые файлы в подпапках (настройки, списки
+    изменений) и основной файл запуска — многие порты держат в .exe адрес своего проекта, чтобы проверять
+    обновления. Подходит только ссылка, похожая на сам порт: в имени проекта есть слово из названия папки или
+    основного .exe. Остальные ссылки — на то, из чего порт собран (движок Aurora, SDL, Real-ESRGAN в соседнем
+    .exe): лучше не подставить ничего, чем подставить чужой проект."""
+    words = _port_words(folder, exes[:1])
+    if not words:
+        return None  # название из одних коротких слов («P.T») — узнать свой проект не по чему
+    counts = {}
+
+    def take(repos, weight):
+        for repo in repos:
+            if _repo_matches(repo, words):
+                counts[repo.lower()] = (counts.get(repo.lower(), (0, repo))[0] + weight, repo)
+
+    try:
+        names = sorted(os.listdir(folder))[:200]
+    except OSError:
+        return None
+    for name in names:
+        path = os.path.join(folder, name)
+        if PORT_README_RE.match(name) and os.path.isfile(path):
+            take(_repos_in_text(_read_small_text(path)), 3)  # README в самой папке — вернее всего
+    for path in _port_text_files(folder):
+        take(_repos_in_text(_read_small_text(path)), 1)
+    if exes:
+        take(_repos_in_binary(os.path.join(folder, exes[0])), 2)
+    if not counts:
+        return None
+    repo = max(counts.values())[1]
+    log.info("Папка порта «%s»: ссылка на GitHub найдена в файлах порта — %s",
+             os.path.basename(os.path.normpath(folder)), repo)
+    return repo
+
+
+PORT_TEXT_RE = re.compile(r".*\.(md|txt|url|json|ini|cfg|toml|ya?ml|xml|nfo|html?)$|^(license|changelog|authors)",
+                          re.IGNORECASE)
+PORT_TEXT_FILES = 300  # столько текстовых файлов в подпапках порта смотрим, не больше
+PORT_EXE_SCAN_MAX = 96 * 1024 * 1024  # файлы запуска больше — не читаем: долго, а ссылка обычно в начале
+_GITHUB_BYTES_RE = re.compile(rb"github\.com/([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100})", re.IGNORECASE)
+_GITHUB_WIDE_RE = re.compile(rb"g\x00i\x00t\x00h\x00u\x00b\x00\.\x00c\x00o\x00m\x00/\x00((?:[A-Za-z0-9._/-]\x00){3,140})",
+                             re.IGNORECASE)
+
+
+def _read_small_text(path):
+    try:
+        if os.path.getsize(path) > PORT_README_MAX:
+            return ""
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _repos_in_text(text):
+    repos = []
+    for match in GITHUB_REPO_RE.finditer(text):
+        repo = parse_github_repo(match.group(0))
+        if repo:
+            repos.append(repo)
+    return repos
+
+
+def _port_text_files(folder):
+    """Текстовые файлы в подпапках порта (не глубже PORT_SCAN_DEPTH) — там бывают настройки со ссылкой на проект."""
+    files = []
+    for root, dirs, names in os.walk(folder):
+        rel = os.path.relpath(root, folder)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        dirs[:] = [] if depth >= PORT_SCAN_DEPTH else sorted(
+            d for d in dirs if not d.startswith(".") and d.lower() not in PORT_SKIP_DIRS)
+        if depth:
+            files += [os.path.join(root, n) for n in sorted(names) if PORT_TEXT_RE.match(n)]
+        if len(files) >= PORT_TEXT_FILES:
+            break
+    return files[:PORT_TEXT_FILES]
+
+
+def _repos_in_binary(path):
+    """Адреса проектов GitHub, записанные внутри файла запуска (обычными буквами и в UTF-16 Windows)."""
+    try:
+        if os.path.getsize(path) > PORT_EXE_SCAN_MAX:
+            return []
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return []
+    found = [f"{m.group(1).decode()}/{m.group(2).decode()}" for m in _GITHUB_BYTES_RE.finditer(data)]
+    found += ["/".join(m.group(1).replace(b"\x00", b"").decode().split("/")[:2]) for m in _GITHUB_WIDE_RE.finditer(data)]
+    return [repo for repo in (parse_github_repo(text) for text in found) if repo]
+
+
+PORT_WORD_SKIP = {"game", "games", "port", "recomp", "recompiled", "decomp", "launcher", "win64", "win32",
+                  "native", "edition", "remastered", "collection", "the"}
+
+
+def _port_words(folder, exes=()):
+    """Слова, по которым ссылку на GitHub можно узнать как ссылку на сам порт: из названия папки и .exe."""
+    texts = [port_name_from_folder(folder)] + [os.path.splitext(os.path.basename(e))[0] for e in exes]
+    words = set()
+    for text in texts:
+        for word in re.split(r"[^0-9a-zа-яё]+", text.casefold()):
+            if len(word) >= 4 and not word.isdigit() and word not in PORT_WORD_SKIP:
+                words.add(word)
+    return words
+
+
+def _repo_matches(repo, words):
+    name = re.sub(r"[^0-9a-z]+", "", repo.split("/", 1)[1].casefold())
+    return any(word in name for word in words)
+
+
+def _port_exes(folder):
+    """Файлы .exe в папке порта, которые могут запускать игру, — лучшие первыми (пути относительно папки)."""
+    found, seen = [], 0
+    for root, dirs, names in os.walk(folder):
+        rel = os.path.relpath(root, folder)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        dirs[:] = [] if depth >= PORT_SCAN_DEPTH else sorted(
+            d for d in dirs if not d.startswith(".") and d.lower() not in PORT_SKIP_DIRS)
+        seen += len(names)
+        for name in names:
+            if name.lower().endswith(".exe") and not PORT_JUNK_EXE_RE.search(name):
+                found.append((depth, os.path.normpath(os.path.join(rel, name)) if depth else name))
+        if seen > PORT_SCAN_FILES:
+            break
+    words = [w.casefold() for w in re.split(r"\W+", port_name_from_folder(folder)) if len(w) >= 3]
+
+    def rank(item):
+        # Лаунчер — первым: у игр с дисков он обычно сам предлагает одиночную игру, сеть и дополнения
+        # (Call of Duty: CoDSP, CoDMP, CoDUOSP… и Launcher.exe над ними)
+        depth, path = item
+        stem = os.path.splitext(os.path.basename(path))[0].casefold()
+        minor = bool(PORT_MINOR_EXE_RE.search(stem))
+        return (minor, not (PORT_LAUNCHER_EXE_RE.search(stem) and not minor), depth, -sum(w in stem for w in words),
+                path.casefold())
+
+    return [path for _, path in sorted(found, key=rank)][:PORT_EXES_LIMIT]
+
+
+def scan_port_folder(folder, hint=True):
+    """Одна папка порта: {"name", "folder", "exes": [пути .exe относительно папки], "repo": подсказка или None}.
+    None — запускать в ней нечего. Ничего не запускается: только список файлов и чтение файлов порта.
+    hint=False — без поиска ссылки на GitHub (он читает и сами .exe — это для фонового потока)."""
+    folder = os.path.normpath(folder)
+    exes = _port_exes(folder)
+    if not exes:
+        return None
+    return {"name": port_name_from_folder(folder), "folder": folder, "exes": exes,
+            "repo": _port_repo_hint(folder, exes) if hint else None}
+
+
+def scan_ports_root(root, known_folders=(), hint=True):
+    """Папка, в которой у каждой игры своя папка: {"found": [игры], "empty": [имена папок без .exe],
+    "known": сколько уже в списке}. Сама папка тоже считается игрой, если .exe лежат прямо в ней.
+    hint=False — без поиска ссылки на GitHub (для дисковых игр он не нужен)."""
+    root = os.path.normpath(root)
+    known = {os.path.normcase(os.path.normpath(f)) for f in known_folders}
+    found, empty, already = [], [], 0
+    try:
+        entries = sorted(os.listdir(root), key=natural_key)
+    except OSError as e:
+        raise OSError(f"папка не открылась: {e}") from None
+    folders = [os.path.join(root, e) for e in entries if os.path.isdir(os.path.join(root, e)) and not e.startswith(".")]
+    if any(name.lower().endswith(".exe") and not PORT_JUNK_EXE_RE.search(name) for name in entries):
+        folders.insert(0, root)
+    for folder in folders:
+        if os.path.normcase(folder) in known:
+            already += 1
+            continue
+        port = scan_port_folder(folder, hint=hint)
+        if port:
+            found.append(port)
+        else:
+            empty.append(os.path.basename(folder))
+    log.info("Папка с играми: найдено %d, без файлов запуска %d, уже в списке %d", len(found), len(empty), already)
+    return {"found": found, "empty": empty, "known": already}
+
+
+ERROR_ELEVATION_REQUIRED = 740  # Windows: «Запрошенная операция требует повышения»
+
+
+def _file_fingerprint(path):
+    """Размер, время изменения и SHA-256 файла — по ним видно, что файл запуска порта поменялся."""
+    stat = os.stat(path)
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"size": stat.st_size, "mtime": int(stat.st_mtime), "sha256": digest.hexdigest()}
+
+
+def port_exe_path(port):
+    """Полный путь к файлу запуска порта. OSError — файл указывает за пределы папки порта (так не запускаем)."""
+    folder = os.path.normpath(port["folder"])
+    path = os.path.normpath(os.path.join(folder, port["exe"]))
+    try:
+        inside = os.path.commonpath([os.path.normcase(folder), os.path.normcase(path)]) == os.path.normcase(folder)
+    except ValueError:  # разные диски
+        inside = False
+    if not inside or not path.lower().endswith(".exe"):
+        raise OSError("файл запуска лежит не в папке порта — такой файл программа не запускает")
+    return path
+
+
+def port_fingerprint(port):
+    """Отпечаток файла запуска (при добавлении порта). Вызывается в фоновом потоке."""
+    return _file_fingerprint(port_exe_path(port))
+
+
+def check_port_exe(port):
+    """Можно ли запускать порт: {"state": ok | changed | missing, "fingerprint": новый отпечаток или None}.
+    changed — файл запуска не тот, что был при добавлении (обновили или подменили). Вызывается в фоновом потоке."""
+    path = port_exe_path(port)
+    if not os.path.isfile(path):
+        return {"state": "missing", "fingerprint": None}
+    old = port.get("fingerprint") or {}
+    stat = os.stat(path)
+    if old.get("sha256") and old.get("size") == stat.st_size and old.get("mtime") == int(stat.st_mtime):
+        return {"state": "ok", "fingerprint": old}
+    new = _file_fingerprint(path)
+    same = bool(old.get("sha256")) and hmac.compare_digest(new["sha256"], old["sha256"])
+    return {"state": "ok" if same else "changed", "fingerprint": new}
+
+
+def launch_port(port):
+    """Запустить порт или дисковую игру: выбранный .exe из её папки, без параметров и без командной строки
+    Windows. Просит игра права администратора — Windows спросит пользователя, как при обычном запуске."""
+    import subprocess
+
+    path = port_exe_path(port)
+    if not os.path.isfile(path):
+        raise OSError("файла запуска больше нет — порт перенесли или удалили")
+    env = dict(os.environ)
+    for name in list(env):  # настройки Qt и сборки программы порту не нужны — у него могут быть свои
+        if name.startswith(("QT_", "QML", "_PYI", "_MEI", "PYTHON")):
+            env.pop(name)
+    if getattr(sys, "frozen", False):
+        env["PATH"] = os.pathsep.join(p for p in env.get("PATH", "").split(os.pathsep)
+                                      if not same_path(p, RESOURCE_DIR))
+    kernel32, old_dir = None, None
+    if sys.platform == "win32" and getattr(sys, "frozen", False):
+        # Собранная программа ищет свои библиотеки в своей папке (SetDllDirectory), и запущенная игра это
+        # унаследовала бы — на время запуска возвращаем обычный поиск библиотек Windows
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        buffer = ctypes.create_unicode_buffer(32768)
+        old_dir = buffer.value if kernel32.GetDllDirectoryW(32768, buffer) else None
+        kernel32.SetDllDirectoryW(None)
+    elevated = False
+    try:
+        subprocess.Popen([path], cwd=os.path.dirname(path), env=env, close_fds=True,
+                         creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    except OSError as e:
+        if getattr(e, "winerror", None) != ERROR_ELEVATION_REQUIRED:
+            raise
+        # Игре нужны права администратора (так часто у старых игр с дисков) — просим их у Windows: она сама
+        # покажет окно подтверждения, и без «Да» пользователя ничего не запустится. Без параметров, как и обычно.
+        os.startfile(path, "runas", cwd=os.path.dirname(path))
+        elevated = True
+    finally:
+        if kernel32 is not None:
+            kernel32.SetDllDirectoryW(old_dir)
+    log.info("Запуск «%s»: %s%s", port["name"], os.path.basename(path),  # полный путь с именем пользователя — нет
+             " — с правами администратора, по запросу самой игры" if elevated else "")
+
+
+def running_programs():
+    """Полные пути запущенных программ (в нижнем регистре) — чтобы считать время в портах и дисковых играх.
+
+    Только читает список процессов Windows: ничего не открывает на запись и ничем не управляет. Программы,
+    путь которых Windows не отдаёт (системные), пропускаются. Не Windows — пустой список."""
+    if sys.platform != "win32":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    query_limited = 0x1000  # PROCESS_QUERY_LIMITED_INFORMATION: только сведения, без доступа к памяти процесса
+    count = 1024
+    while True:
+        pids = (wintypes.DWORD * count)()
+        got = wintypes.DWORD()
+        if not kernel32.K32EnumProcesses(pids, ctypes.sizeof(pids), ctypes.byref(got)):
+            return []
+        if got.value < ctypes.sizeof(pids):
+            break
+        count *= 2
+    paths = []
+    buffer = ctypes.create_unicode_buffer(32768)
+    for pid in pids[:got.value // ctypes.sizeof(wintypes.DWORD)]:
+        if not pid:
+            continue
+        handle = kernel32.OpenProcess(query_limited, False, pid)
+        if not handle:
+            continue
+        try:
+            size = wintypes.DWORD(len(buffer))
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                paths.append(os.path.normcase(buffer.value[:size.value]))
+        finally:
+            kernel32.CloseHandle(handle)
+    return paths
+
+
+def folder_running(folder, programs):
+    """Запущена ли какая-нибудь программа из папки игры (сама игра, её лаунчер или то, что он запустил)."""
+    prefix = os.path.normcase(os.path.normpath(folder)).rstrip(os.sep) + os.sep
+    return any(path.startswith(prefix) for path in programs)
+
+
+def playtime_text(seconds):
+    """«2 ч 15 мин», «45 мин», «меньше минуты»."""
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "меньше минуты"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} ч {minutes} мин" if hours and minutes else f"{hours} ч" if hours else f"{minutes} мин"
+
+
+class PortLibrary:
+    """Порты в ports.json (или дисковые игры в discs.json): [{"id", "name", "folder", "exe" (путь относительно
+    папки), "repo" («автор/проект» или ""), "fingerprint", "installed_tag", "latest", "checked", "about",
+    "added", "kind" (port | disc)}, ...]"""
+
+    def __init__(self, path=PORTS_FILE, kind="port"):
+        self.path = path
+        self.kind = kind
+        self.ports = []
+
+    def load(self):
+        """Загружает список. Возвращает сообщение для пользователя или None."""
+        name = os.path.basename(self.path)
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return None
+        except (json.JSONDecodeError, OSError) as e:
+            broken = self.path + ".broken"
+            try:
+                os.replace(self.path, broken)
+            except OSError:
+                pass
+            return f"Файл {name} повреждён ({e}). Он сохранён как {os.path.basename(broken)}, список начат заново."
+        self.ports = [p for p in data if isinstance(p, dict) and p.get("id") and p.get("name")
+                      and p.get("folder") and p.get("exe")] if isinstance(data, list) else []
+        for port in self.ports:
+            port["kind"] = self.kind  # по kind рулетка знает, на какой вкладке открыть выпавшую игру
+        return None
+
+    def save(self):
+        save_json(self.path, self.ports)
+
+    def find(self, port_id):
+        return next((p for p in self.ports if p["id"] == port_id), None)
+
+    def unique_name(self, name, skip=None):
+        """Название, которого ещё нет в этом списке: обложки хранятся по названию (без знаков, как имя файла),
+        поэтому «A: B» и «A B» — одно и то же название."""
+        base, n = title_name(name) or "Игра", 1
+        taken = {clean_name(p["name"]).casefold() for p in self.ports if p is not skip}
+        result = base
+        while clean_name(result).casefold() in taken:
+            n += 1
+            result = f"{base} ({n})"
+        return result
+
+    def folders(self):
+        return [p["folder"] for p in self.ports]
+
+    def add(self, name, folder, exe, repo="", fingerprint=None):
+        port = {"id": secrets.token_hex(8), "name": self.unique_name(name), "folder": os.path.normpath(folder),
+                "exe": exe, "repo": repo or "", "fingerprint": fingerprint or {}, "installed_tag": "",
+                "latest": None, "checked": 0, "about": None, "added": int(time.time()), "kind": self.kind}
+        self.ports.append(port)
+        return port
+
+    def remove(self, port):
+        self.ports.remove(port)
+
+
+def is_port(game):
+    """Игра из «Native Port's» или «Дисковых игр» — запускается своим .exe (у игр Steam файла запуска нет)."""
+    return bool(game) and "exe" in game
+
+
+def is_disc(game):
+    """Игра из «Дисковых игр»."""
+    return is_port(game) and game.get("kind") == "disc"
+
+
+def port_has_update(port):
+    latest = (port.get("latest") or {}).get("tag")
+    return bool(latest and port.get("installed_tag") and latest != port["installed_tag"])
+
+
+def markdown_to_text(text):
+    """Описание релиза с GitHub (Markdown) — обычным текстом: без картинок, ссылок-разметки и HTML."""
+    text = re.sub(r"<!--.*?-->", "", text or "", flags=re.DOTALL)
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-*+]\s+", "• ", text, flags=re.MULTILINE)
+    text = re.sub(r"\*\*|__|~~|`{1,3}", "", html.unescape(text))
+    return re.sub(r"\n{3,}", "\n\n", text.replace("\r", "")).strip()
+
+
+def _github(path, **params):
+    """Ответ открытого API GitHub или None — нет такого (404). Лимит без входа исчерпан — GitHubLimit."""
+    response = requests.get(GITHUB_API_URL + path, headers=GITHUB_HEADERS, params=params or None,
+                            timeout=REQUEST_TIMEOUT)
+    if response.status_code == 404:
+        return None
+    if response.status_code in (403, 429) and response.headers.get("X-RateLimit-Remaining") == "0":
+        reset = int(response.headers.get("X-RateLimit-Reset") or 0)
+        minutes = max(1, round((reset - time.time()) / 60)) if reset else 60
+        raise GitHubLimit(f"GitHub без входа отвечает не больше чем на 60 проверок в час — следующая "
+                          f"примерно через {minutes} мин.")
+    response.raise_for_status()
+    return response.json()
+
+
+def _release_page(repo, url, fallback):
+    """Адрес страницы релиза — только на github.com, иначе страница релизов проекта."""
+    return url if isinstance(url, str) and url.startswith(f"https://github.com/{repo}/") else \
+        f"https://github.com/{repo}/{fallback}"
+
+
+class GitHubMissing(ServiceBusy):
+    """Такого проекта на GitHub нет (или он закрыт). Текст — для пользователя."""
+
+
+PORT_HISTORY_FETCH = 15  # сколько последних релизов берём одним запросом
+PORT_HISTORY_MAX = 40  # и сколько храним в ports.json — старые релизы с GitHub могут и удалить
+
+
+def _release_item(repo, data):
+    return {"tag": str(data.get("tag_name") or ""), "title": clean_name(data.get("name") or "")[:120],
+            "url": _release_page(repo, data.get("html_url"), "releases"),
+            "published": str(data.get("published_at") or data.get("created_at") or "")[:10],
+            "notes": markdown_to_text(data.get("body"))[:PORT_NOTES_MAX], "prerelease": bool(data.get("prerelease"))}
+
+
+def fetch_port_releases(repo):
+    """Версии порта на GitHub одним запросом: {"latest": релиз или None, "history": [релизы, новые первыми]}.
+    Релиз — {"tag", "title", "url", "published", "notes", "prerelease"}. Последней считается свежая обычная
+    версия; если есть только предварительные — свежая из них. Релизов нет — берём метку (tag). Проекта нет —
+    GitHubMissing. Вызывается в фоновом потоке."""
+    items = _github(f"/repos/{repo}/releases", per_page=PORT_HISTORY_FETCH)
+    if items is None:
+        raise GitHubMissing(f"проекта {repo} на GitHub нет — проверьте ссылку")
+    history = [_release_item(repo, data) for data in items
+               if isinstance(data, dict) and not data.get("draft") and data.get("tag_name")]
+    latest = next((r for r in history if not r["prerelease"]), history[0] if history else None)
+    if latest is None:
+        tags = _github(f"/repos/{repo}/tags", per_page=1) or []
+        if tags and tags[0].get("name"):
+            latest = {"tag": str(tags[0]["name"]), "title": "", "url": f"https://github.com/{repo}/tags",
+                      "published": "", "notes": "", "prerelease": False}
+    return {"latest": latest, "history": history}
+
+
+def merge_port_history(old, new):
+    """История версий порта: новые сведения с GitHub поверх сохранённых — так в ней остаются и версии, которые
+    уже ушли из последних PORT_HISTORY_FETCH. Новые версии первыми, не больше PORT_HISTORY_MAX."""
+    by_tag = {item["tag"]: item for item in old or [] if isinstance(item, dict) and item.get("tag")}
+    for item in new or []:
+        by_tag[item["tag"]] = dict(item)
+    history = sorted(by_tag.values(), key=lambda r: (r.get("published") or "", natural_key(r["tag"])), reverse=True)
+    return history[:PORT_HISTORY_MAX]
+
+
+def fetch_port_about(repo):
+    """Описание проекта порта на GitHub: {"repo" — как он записан на GitHub, "description", "homepage", "stars",
+    "fetched"}. Проекта нет — GitHubMissing. Вызывается в фоновом потоке; им же проверяется ссылка в «Изменить…»."""
+    data = _github(f"/repos/{repo}")
+    if data is None:
+        raise GitHubMissing(f"проекта {repo} на GitHub нет — проверьте ссылку")
+    homepage = data.get("homepage") or ""
+    return {"repo": parse_github_repo(str(data.get("full_name") or "")) or repo,
+            "description": clean_name(data.get("description") or "")[:500],
+            "homepage": homepage if homepage.startswith("https://") else "",
+            "stars": int(data.get("stargazers_count") or 0), "fetched": int(time.time())}
+
+
+PORT_SEARCH_RESULTS = 8
+# По этим словам в имени или описании проекта видно, что это порт игры, а не программа с похожим названием
+PORT_PROJECT_RE = re.compile(r"\b(ports?|pc[ -]?port|native|recomp\w*|decomp\w*|reimplementation|source port|"
+                             r"engine|remake|reverse[- ]engineer\w*)\b", re.IGNORECASE)
+
+
+def search_port_repos(name):
+    """Проекты на GitHub, похожие на порт, — для кнопки «Найти на GitHub»: [{"repo", "description", "stars"}].
+    Сначала проекты, по имени и описанию похожие на порт игры («native PC port», «recompiled»), потом остальные.
+    Программа ничего не выбирает сама — выбирает пользователь."""
+    words = [w for w in re.split(r"[^0-9A-Za-zА-Яа-яЁё]+", name or "") if w]
+    if not words:
+        return []
+    if all(len(w) <= 2 for w in words):
+        words = ["".join(words)]  # «P T» → «PT»: однобуквенные слова GitHub не ищет
+    terms = " ".join(words)
+    seen, found = set(), []
+    # Два запроса: с «port» — находит порты, без — проекты, которые так себя не называют
+    for query in (f"{terms} port in:name,description", f"{terms} in:name,description"):
+        data = _github("/search/repositories", q=query, per_page=PORT_SEARCH_RESULTS * 2) or {}
+        for item in data.get("items") or []:
+            repo = parse_github_repo(str(item.get("full_name") or ""))
+            if not repo or repo.lower() in seen:
+                continue
+            seen.add(repo.lower())
+            found.append({"repo": repo, "description": clean_name(item.get("description") or "")[:160],
+                          "stars": int(item.get("stargazers_count") or 0), "fork": bool(item.get("fork"))})
+    name_words = [w.casefold() for w in words if len(w) >= 2]
+
+    def rank(item):
+        text = f"{item['repo'].split('/', 1)[1]} {item['description']}"
+        named = re.sub(r"[^0-9a-z]+", "", item["repo"].split("/", 1)[1].casefold())
+        return (not PORT_PROJECT_RE.search(text.replace("-", " ").replace("_", " ")),
+                not any(w in named for w in name_words), item["fork"], -item["stars"])
+
+    found.sort(key=rank)
+    log.info("Поиск порта на GitHub «%s»: найдено %d", terms, len(found))
+    return [{k: v for k, v in item.items() if k != "fork"} for item in found[:PORT_SEARCH_RESULTS]]
+
+
+def needs_russian(text):
+    """Текст не на русском — его стоит перевести."""
+    return bool(text) and not _is_russian(text)
+
+
+def translate_port_text(text):
+    """Описание с GitHub на русском или None — уже русское, перевод выключен или не получился."""
+    if not text or not translation_enabled():
+        return None
+    translated, done = _to_russian(text)
+    return translated if done else None
+
+
+# --- Описание дисковой игры из Википедии ---------------------------------------
+# Если игры нет в магазине Steam (или её не связали с ним), описание берётся из Википедии: начало статьи об игре,
+# обычным текстом — без разметки, картинок и ссылок. Сначала русская Википедия, потом английская (её текст
+# переводится, как описания с GitHub). Только чтение открытого API по HTTPS, без входа. Статья подходит, только
+# если её название похоже на название игры и в начале сказано, что это игра, — иначе лучше без описания,
+# чем с описанием одноимённого фильма.
+WIKI_API_URL = "https://{lang}.wikipedia.org/w/api.php"
+WIKI_HEADERS = {"User-Agent": "BacklogRoulette (https://github.com/byRedFox/BacklogRoulette)"}
+WIKI_QUERY = {"ru": "{name} компьютерная игра", "en": "{name} video game"}
+WIKI_GAME_RE = {
+    "ru": re.compile(r"видеоигр|компьютерн\w*\s+(\w+\s+)?игр|игр\w*\s+в\s+жанре|—\s+[^.]{0,80}\bигра\b", re.IGNORECASE),
+    "en": re.compile(r"video ?game|computer game|\bis an? [^.]{0,100}\bgame\b", re.IGNORECASE),
+}
+WIKI_TEXT_MAX = 2500
+WIKI_ROMAN = {"i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"}
+
+
+def _wiki_words(text):
+    return {w for w in re.split(r"[^0-9a-zа-яё]+", (text or "").casefold()) if w}
+
+
+def _wiki_numbers(words):
+    """Номера частей среди слов: числа до 30 и римские I–X. Годы (1993, 2005) и «007» (это имя, не номер
+    части: «James Bond 007: Blood Stone») номером не считаются."""
+    return {w for w in words if (w.isdigit() and not w.startswith("0") and int(w) <= 30) or w in WIKI_ROMAN}
+
+
+def _wiki_title_fits(name_words, title):
+    """Статья про эту игру, а не про соседнюю часть: почти все слова названия есть в названии статьи, номер части
+    тот же («Silent Hill 4» — не «Silent Hill», «Battle for Middle-earth I» — не «…II»), а год в скобках
+    («The Punisher (игра, 2005)») совпадает, если он есть в названии игры."""
+    main = re.sub(r"\([^)]*\)", " ", title)  # «(игра, 1993)», «(video game)» — пояснение, не название
+    title_words, main_words = _wiki_words(title), _wiki_words(main)
+    if len(name_words & title_words) < max(1, math.ceil(len(name_words) * 0.75)):
+        return False
+    if _wiki_numbers(name_words) - title_words - {"1", "i"} or _wiki_numbers(main_words) - name_words:
+        return False  # у первой части номера в названии статьи обычно нет: «Battle for Middle-earth I»
+    years = {w for w in name_words if re.fullmatch(r"(19|20)\d\d", w)}
+    return not years or bool(years & title_words)
+
+
+def fetch_wiki_summary(name):
+    """Начало статьи об игре в Википедии: {"title", "text", "url", "lang"} или None — статьи об игре нет.
+    Википедия не ответила — ServiceBusy. Вызывается в фоновом потоке."""
+    words = _wiki_words(name)
+    if not words:
+        return None
+    for lang in ("ru", "en"):
+        params = {"action": "query", "format": "json", "formatversion": 2, "redirects": 1,
+                  "generator": "search", "gsrsearch": WIKI_QUERY[lang].format(name=name), "gsrlimit": 5,
+                  "gsrnamespace": 0, "prop": "extracts|info|pageprops", "exintro": 1, "explaintext": 1,
+                  "exlimit": 5, "inprop": "url", "ppprop": "disambiguation"}
+        try:
+            response = requests.get(WIKI_API_URL.format(lang=lang), params=params, headers=WIKI_HEADERS,
+                                    timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            pages = ((response.json() or {}).get("query") or {}).get("pages") or []
+        except (requests.RequestException, ValueError, AttributeError) as e:
+            raise ServiceBusy(f"Википедия не ответила: {str(e).split('?', 1)[0][:160]}") from None
+        for page in sorted((p for p in pages if isinstance(p, dict)), key=lambda p: p.get("index") or 99):
+            title, text = str(page.get("title") or ""), str(page.get("extract") or "").strip()
+            if not text or "disambiguation" in (page.get("pageprops") or {}):
+                continue
+            if not _wiki_title_fits(words, title) or not WIKI_GAME_RE[lang].search(text[:600]):
+                continue
+            if len(text) > WIKI_TEXT_MAX:  # обрезаем по концу предложения
+                cut = text.rfind(". ", 0, WIKI_TEXT_MAX)
+                text = text[:cut + 1] if cut > 0 else text[:WIKI_TEXT_MAX] + "…"
+            url = str(page.get("fullurl") or "")
+            if not url.startswith(f"https://{lang}.wikipedia.org/"):
+                url = f"https://{lang}.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"
+            log.info("Википедия (%s): «%s» → статья «%s»", lang, name, title)
+            return {"title": title, "text": re.sub(r"\n{3,}", "\n\n", text), "url": url, "lang": lang}
+    log.info("Википедия: статьи об игре «%s» не нашлось", name)
+    return None
+
+
+def check_ports_updates(ports, force=False):
+    """Новые версии портов на GitHub: {"results": {id порта: {"latest", "history"} или {"error": текст}},
+    "limit": текст или None}. Без force — только порты, которые не проверялись PORT_CHECK_EVERY.
+    Вызывается в фоновом потоке."""
+    results, limit, now = {}, None, time.time()
+    for port in ports:
+        repo = port.get("repo")
+        if not repo or (not force and now - (port.get("checked") or 0) < PORT_CHECK_EVERY):
+            continue
+        try:
+            results[port["id"]] = fetch_port_releases(repo)
+        except GitHubLimit as e:
+            limit = str(e)
+            break
+        except (GitHubMissing, requests.RequestException, ValueError, TypeError, KeyError, IndexError) as e:
+            results[port["id"]] = {"error": str(e).split("?", 1)[0][:200]}
+    log.info("Обновления портов: проверено %d%s", len(results), f" — {limit}" if limit else "")
+    return {"results": results, "limit": limit}
 
 
 # --- Фон рулетки: обложки на «фотоплёнке» -----------------------------------

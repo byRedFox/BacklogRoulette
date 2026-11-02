@@ -4,6 +4,7 @@
 """
 
 import faulthandler
+import hashlib
 import json
 import math
 import os
@@ -17,9 +18,9 @@ from urllib.parse import quote_plus
 
 LAUNCHED = time.monotonic()  # для замера запуска: отсюда начинается загрузка Qt и библиотек
 
-from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QEvent, QObject, QPointF, QPropertyAnimation,
+from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QEvent, QObject, QPoint, QPointF, QPropertyAnimation,
                             QRect, QRectF, QSize, QSizeF, Qt, QTimer, QUrl, QVariantAnimation, Signal)
-from PySide6.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QImage, QKeySequence,
+from PySide6.QtGui import (QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QIcon, QImage, QKeySequence,
                            QLinearGradient, QMovie, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
                            QRadialGradient, QShortcut)
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer, QSoundEffect
@@ -31,7 +32,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFr
 from qfluentwidgets import (Action, BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon as FIF, InfoBar,
                             IndeterminateProgressBar, InfoBarPosition, LineEdit, ListWidget, MessageBox,
                             MessageBoxBase, RadioButton,
-                            MSFluentWindow, NavigationItemPosition, PasswordLineEdit, PlainTextEdit,
+                            FluentWindow, NavigationItemPosition, PasswordLineEdit, PlainTextEdit,
                             PrimaryPushButton, PrimaryToolButton, ProgressBar, PushButton, RoundMenu, ScrollArea,
                             SearchLineEdit, Slider, StrongBodyLabel,
                             SubtitleLabel, SwitchButton, TextEdit, Theme, TitleLabel, TransparentPushButton,
@@ -43,22 +44,35 @@ try:  # полосы прокрутки Fluent для обычных списк�
 except ImportError:
     SmoothScrollDelegate = None
 
-# Кнопки бокового меню Fluent шириной 64 точки, а значок в них нарисован с отступом под эту ширину.
-# «О программе» туда не помещается, поэтому меню делаем шире, а значок сдвигаем к середине кнопки.
-try:
-    from qfluentwidgets.components.navigation.navigation_bar import NavigationBarPushButton
+try:  # как сейчас показано боковое меню: полоской значков, раскрытым поверх страницы и т. д.
+    from qfluentwidgets import NavigationDisplayMode
+except ImportError:
+    NavigationDisplayMode = None
 
-    _draw_nav_icon = NavigationBarPushButton._drawIcon
+# Прозрачные кнопки Fluent («Удалить с ПК», «К портам», «Другая папка…») без рамки: на размытой подложке
+# альбома или игры их не видно, пока не наведёшь мышь. Поэтому вокруг них — тонкая рамка, как у плашек
+# на странице игры; под мышью она цвета темы.
+_paint_transparent_button = TransparentPushButton.paintEvent
 
-    def _draw_centered_nav_icon(self, painter):
-        painter.save()
-        painter.translate((self.width() - 64) / 2, 0)
-        _draw_nav_icon(self, painter)
-        painter.restore()
 
-    NavigationBarPushButton._drawIcon = _draw_centered_nav_icon
-except (ImportError, AttributeError):
-    pass
+def _paint_outlined_button(self, event):
+    _paint_transparent_button(self, event)
+    painter = QPainter(self)
+    painter.setRenderHint(QPainter.Antialiasing)
+    dark = isDarkTheme()
+    if not self.isEnabled():
+        color = QColor(255, 255, 255, 20) if dark else QColor(0, 0, 0, 16)
+    elif getattr(self, "isHover", False) or self.underMouse():
+        color = themeColor()
+    else:
+        color = QColor(255, 255, 255, 40) if dark else QColor(0, 0, 0, 30)
+    painter.setPen(QPen(color, 1))
+    painter.setBrush(Qt.NoBrush)
+    painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 5, 5)
+    painter.end()
+
+
+TransparentPushButton.paintEvent = _paint_outlined_button
 
 # Окна поверх программы (подключение к Steam, импорт, вопросы) — это затемнение на всё окно, и оно закрывает
 # заголовок, за который окно таскают. Поэтому окно программы можно таскать за само затемнение —
@@ -105,7 +119,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.3"
+__version__ = "2.4"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -1870,28 +1884,81 @@ class VideoView(QGraphicsView):
             self.clicked.emit()
 
 
-class LiveButton(QWidget):
-    """Значок «живой фон» в шапке страницы игры: тёмный кружок со значком видео.
+class HeaderPill(QWidget):
+    """Значок в шапке страницы игры — в том же стиле, что мини-плеер: кружок со значком, который при наведении
+    раскрывается вправо в «таблетку» ◀ номер ▶ (у живого фона ещё ✓ — оставить этот вариант).
 
-    Пока живой фон качается, по краю кружка бежит кольцо загрузки, как при установке приложения в iOS
-    (размер файла неизвестен — по кругу крутится дуга). Живой фон включён — кружок цвета темы.
+    Три таких значка столбиком слева сверху: живой фон (видео), фон (картинка) и логотип (Aa). Щелчок по самому
+    значку: у живого фона — включить или выключить его, у фона и логотипа — следующий вариант из SteamGridDB.
+    Пока вариант качается, по краю кружка бежит кольцо загрузки, а «таблетка» не сворачивается.
+    Живой фон включён — значок цвета темы.
     """
 
     clicked = Signal()
-    SIZE = 36
-    RING = 3
+    stepRequested = Signal(int)  # -1 — предыдущий вариант, +1 — следующий
+    keepRequested = Signal()
+    COLLAPSE_MS = 500
+    ANIM_MS = 240
+    PAD, GAP = 3, 2
+    PART = 30  # значок и кнопки ◀ ▶ ✓ — квадраты такой стороны
+    RING = 2.5
+    SIZE = PART + 2 * PAD  # свёрнутый кружок
+    opened = Signal()  # начал раскрываться — соседние значки сворачиваются, чтобы не налезать друг на друга
 
-    def __init__(self, parent):
+    def __init__(self, parent, icon, title="", keep=False):
         super().__init__(parent)
-        self.setFixedSize(self.SIZE, self.SIZE)
-        self.setCursor(Qt.PointingHandCursor)
-        self.progress = None  # None — не качается, -1 — качается, сколько осталось неизвестно, 0–100 — проценты
+        self.icon, self.title = icon, title
+        self.reveal = 0.0  # 0 — один значок, 1 — вся «таблетка»
+        self.progress = None  # None — не качается, -1 — качается (сколько осталось неизвестно), 0–100 — проценты
         self.active = False
-        self.hover = False
+        self.expandable = False  # есть что листать — тогда при наведении раскрывается
         self._angle = 0
+        self.main = TransparentToolButton(icon, self)
+        self.main.clicked.connect(lambda: self.clicked.emit())
+        self.prev_button = TransparentToolButton(FIF.LEFT_ARROW, self)
+        self.prev_button.clicked.connect(lambda: self.stepRequested.emit(-1))
+        self.label = CaptionLabel("", self)
+        self.label.setAlignment(Qt.AlignCenter)
+        template = f"{title} 50 / 50" if title else "50 / 50"
+        self.label.setFixedWidth(QFontMetrics(self.label.font()).horizontalAdvance(template) + 12)
+        self.next_button = TransparentToolButton(FIF.RIGHT_ARROW, self)
+        self.next_button.clicked.connect(lambda: self.stepRequested.emit(1))
+        what = title.lower() if title else "вариант живого фона"
+        self.prev_button.setToolTip(f"Предыдущий {what}" + (" из SteamGridDB" if title else ""))
+        self.next_button.setToolTip(f"Следующий {what}" + (" из SteamGridDB" if title else ""))
+        self.controls = [self.prev_button, self.label, self.next_button]
+        self.keep_button = None
+        if keep:
+            self.keep_button = TransparentToolButton(FIF.ACCEPT, self)
+            self.keep_button.clicked.connect(lambda: self.keepRequested.emit())
+            self.controls.append(self.keep_button)
+        for button in (self.main, self.prev_button, self.next_button, self.keep_button):
+            if button is not None:
+                # Все части квадратные и одной высоты: кольцо загрузки ровно вокруг значка, как бы ни раскрылась
+                # «таблетка»
+                button.setFixedSize(self.PART, self.PART)
+                button.setIconSize(QSize(14, 14) if button is not self.main else QSize(16, 16))
+        self.collapse_timer = QTimer(self)
+        self.collapse_timer.setSingleShot(True)
+        self.collapse_timer.setInterval(self.COLLAPSE_MS)
+        self.collapse_timer.timeout.connect(self._collapse)
+        self.anim = QVariantAnimation(self)
+        self.anim.setDuration(self.ANIM_MS)
+        self.anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.anim.valueChanged.connect(self._set_reveal)
         self.spin_timer = QTimer(self)  # крутит дугу, пока размер файла неизвестен
         self.spin_timer.setInterval(30)
         self.spin_timer.timeout.connect(self._spin)
+        self.set_state(0, 0)
+        self._set_reveal(0.0)
+
+    # --- Состояние ---
+    def set_tip(self, text):
+        self.main.setToolTip(text)
+
+    def set_active(self, active):
+        self.active = active
+        self.main.setIcon(self.icon.icon(color=themeColor()) if active else self.icon)
 
     def set_progress(self, progress):
         self.progress = progress
@@ -1899,45 +1966,114 @@ class LiveButton(QWidget):
             self.spin_timer.start()
         else:
             self.spin_timer.stop()
+        busy = progress is not None
+        for button in (self.prev_button, self.next_button):
+            button.setEnabled(not busy)
+        if self.keep_button is not None:
+            self.keep_button.setEnabled(not busy and self._keep_allowed)
+        if busy and self.expandable:
+            self._animate(1.0)  # пока качается — видно, какой вариант
+        elif not busy:
+            self.collapse_timer.start()
         self.update()
 
-    def set_active(self, active):
-        self.active = active
+    def set_state(self, index, count, chosen=None, _busy=None):
+        """Какой вариант показан (index из count) и какой сохранён (chosen — только у живого фона)."""
+        number = f"{index + 1} / {count}" if count else ""
+        self.label.setText(f"{self.title} {number}".strip() if self.title else number)
+        self._keep_allowed = index != chosen
+        if self.keep_button is not None:
+            self.keep_button.setEnabled(self.progress is None and self._keep_allowed)
+            self.keep_button.setToolTip("Этот вариант уже сохранён" if not self._keep_allowed else
+                                        "Оставить этот вариант — остальные просмотренные удалятся с диска")
+
+    def set_expandable(self, expandable):
+        self.expandable = expandable
+        if not expandable:
+            self._animate(0.0)
+        elif self.underMouse() or self.progress is not None:
+            self._animate(1.0)
+
+    def collapse_now(self):
+        self.anim.stop()
+        self._set_reveal(0.0)
+
+    def slide(self, shown):
+        """Раскрыть или свернуть «таблетку» (если есть что листать)."""
+        self._animate(1.0 if shown and self.expandable else 0.0)
+
+    # --- Раскрытие ---
+    def sizeHint(self):
+        controls = sum(self._part_size(w).width() + self.GAP for w in self.controls)
+        return QSize(round(2 * self.PAD + self.PART + controls * self.reveal), 2 * self.PAD + self.PART)
+
+    def _part_size(self, widget):
+        return QSize(widget.width(), self.PART) if widget is self.label else QSize(self.PART, self.PART)
+
+    def _set_reveal(self, value):
+        self.reveal = float(value)
+        self.resize(self.sizeHint())
+        self._arrange()
         self.update()
+
+    def _arrange(self):
+        """Значок на месте слева, остальное выезжает справа из-за края «таблетки»."""
+        x = self.PAD
+        for widget in [self.main] + self.controls:
+            size = self._part_size(widget)
+            widget.setGeometry(x, self.PAD, size.width(), size.height())
+            x += size.width() + self.GAP
+        for widget in self.controls:
+            widget.setVisible(self.reveal > 0)
+
+    def _animate(self, target):
+        if self.reveal == target and self.anim.state() != QAbstractAnimation.Running:
+            return
+        if self.anim.state() == QAbstractAnimation.Running and self.anim.endValue() == target:
+            return
+        self.anim.stop()
+        self.anim.setStartValue(self.reveal)
+        self.anim.setEndValue(float(target))
+        self.anim.start()
+
+    def enterEvent(self, event):
+        self.collapse_timer.stop()
+        if self.expandable:
+            self.opened.emit()
+            self._animate(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.collapse_timer.start()
+        super().leaveEvent(event)
+
+    def _collapse(self):
+        if self.underMouse() or (self.progress is not None and self.expandable):
+            return
+        self._animate(0.0)
 
     def _spin(self):
         self._angle = (self._angle + 12) % 360
         self.update()
 
-    def enterEvent(self, event):
-        self.hover = True
-        self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self.hover = False
-        self.update()
-        super().leaveEvent(event)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.clicked.emit()
-
     def paintEvent(self, event):
+        # Кружок (свёрнут) или «таблетка» (раскрыт) — те же цвета, что у мини-плеера
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        painter.setPen(QPen(QColor(255, 255, 255, 170 if self.hover else 110), 1))
-        painter.setBrush(themeColor() if self.active else QColor(0, 0, 0, 170 if self.hover else 130))
-        painter.drawEllipse(rect)
-        side = 18
-        offset = (self.SIZE - side) // 2
-        FIF.VIDEO.icon(color=WHITE).paint(painter, QRect(offset, offset, side, side))
+        dark = isDarkTheme()
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.setPen(QPen(QColor(255, 255, 255, 40) if dark else QColor(0, 0, 0, 30), 1))
+        painter.setBrush(QColor(32, 32, 36, 200) if dark else QColor(255, 255, 255, 215))
+        radius = rect.height() / 2
+        painter.drawRoundedRect(rect, radius, radius)
         if self.progress is None:
             return
-        ring = rect.adjusted(self.RING / 2 + 1, self.RING / 2 + 1, -self.RING / 2 - 1, -self.RING / 2 - 1)
+        # Кольцо загрузки — ровно вокруг значка (он слева, квадратный)
+        side = self.SIZE
+        ring = QRectF(0, 0, side, side).adjusted(self.RING / 2 + 1, self.RING / 2 + 1,
+                                                 -self.RING / 2 - 1, -self.RING / 2 - 1)
         painter.setBrush(Qt.NoBrush)
-        painter.setPen(QPen(QColor(255, 255, 255, 60), self.RING))
+        painter.setPen(QPen(QColor(255, 255, 255, 50) if dark else QColor(0, 0, 0, 30), self.RING))
         painter.drawEllipse(ring)
         pen = QPen(themeColor(), self.RING)
         pen.setCapStyle(Qt.RoundCap)
@@ -1948,92 +2084,18 @@ class LiveButton(QWidget):
             painter.drawArc(ring, 90 * 16, -round(360 * 16 * self.progress / 100))  # от верха по часовой
 
 
-class VariantBar(QWidget):
-    """Выбор варианта живого фона: «таблетка», которая выезжает вправо из-под значка живого фона.
-    ◀ ▶ — предыдущий и следующий вариант (скачиваются по одному), «2 / 5» — какой показан,
-    ✓ — оставить этот, остальные просмотренные удалить."""
-
-    stepRequested = Signal(int)  # -1 — предыдущий, +1 — следующий
-    keepRequested = Signal()
-    HEIGHT = LiveButton.SIZE
-    PAD, GAP = 4, 2
-    ANIM_MS = 240
-
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.reveal = 0.0  # 0 — спрятана под значком, 1 — выехала целиком
-        self.prev_button = TransparentToolButton(FIF.LEFT_ARROW.icon(color=WHITE), self)
-        self.prev_button.setToolTip("Предыдущий вариант живого фона")
-        self.prev_button.clicked.connect(lambda: self.stepRequested.emit(-1))
-        self.label = CaptionLabel("", self)
-        self.label.setTextColor(WHITE, WHITE)
-        self.label.setAlignment(Qt.AlignCenter)
-        self.next_button = TransparentToolButton(FIF.RIGHT_ARROW.icon(color=WHITE), self)
-        self.next_button.setToolTip("Следующий вариант живого фона")
-        self.next_button.clicked.connect(lambda: self.stepRequested.emit(1))
-        self.keep_button = TransparentToolButton(FIF.ACCEPT.icon(color=WHITE), self)
-        self.keep_button.clicked.connect(self.keepRequested)
-        self.parts = (self.prev_button, self.label, self.next_button, self.keep_button)
-        for button in (self.prev_button, self.next_button, self.keep_button):
-            button.setFixedSize(28, 28)
-            button.setIconSize(QSize(12, 12))
-        self.label.setFixedWidth(QFontMetrics(self.label.font()).horizontalAdvance("30 / 30") + 8)
-        self.anim = QVariantAnimation(self)
-        self.anim.setDuration(self.ANIM_MS)
-        self.anim.setEasingCurve(QEasingCurve.OutCubic)
-        self.anim.valueChanged.connect(self._set_reveal)
-        self.anim.finished.connect(lambda: self.reveal == 0 and self.hide())
-        self.resize(1, self.HEIGHT)
-        self.hide()
-
-    def full_width(self):
-        return 2 * self.PAD + sum(w.width() for w in self.parts) + self.GAP * (len(self.parts) - 1) \
-            + LiveButton.SIZE // 2
-
-    def set_state(self, index, count, chosen, busy):
-        self.label.setText(f"{index + 1} / {count}")
-        for button in (self.prev_button, self.next_button):
-            button.setEnabled(not busy)
-        kept = index == chosen
-        self.keep_button.setEnabled(not busy and not kept)
-        self.keep_button.setToolTip("Этот вариант уже сохранён" if kept else
-                                    "Оставить этот вариант — остальные просмотренные удалятся с диска")
-
-    def slide(self, shown):
-        target = 1.0 if shown else 0.0
-        if target == self.reveal and self.anim.state() != QAbstractAnimation.Running:
-            self.setVisible(shown)
-            return
-        if shown:
-            self.show()
-        self.anim.stop()
-        self.anim.setStartValue(self.reveal)
-        self.anim.setEndValue(target)
-        self.anim.start()
-
-    def _set_reveal(self, value):
-        self.reveal = float(value)
-        self.resize(max(1, round(self.full_width() * self.reveal)), self.HEIGHT)
-        x = self.PAD + LiveButton.SIZE // 2  # левая часть прячется под значком
-        for widget in self.parts:
-            widget.move(x, (self.HEIGHT - widget.height()) // 2)
-            x += widget.width() + self.GAP
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        rect = QRectF(self.rect()).adjusted(0.5, 1, -0.5, -1)
-        painter.setPen(QPen(QColor(255, 255, 255, 90), 1))
-        painter.setBrush(QColor(0, 0, 0, 150))
-        painter.drawRoundedRect(rect, rect.height() / 2, rect.height() / 2)
+LiveButton = HeaderPill  # прежнее имя значка живого фона
 
 
 class HeroHeader(QWidget):
     """Шапка страницы игры: широкий фон, который внизу растворяется в окне, логотип или название поверх
-    и большая кнопка ▶ по центру, если у игры есть трейлер."""
+    и большая кнопка ▶ по центру, если у игры есть трейлер.
+
+    Слева сверху — значки: «живой фон» (если он есть), а с ключом SteamGridDB — «Фон» (картинка) и «Логотип»
+    («Aa»). Навели на значок — справа выезжает ◀ номер ▶; щелчок по самому значку — следующий вариант."""
 
     playClicked = Signal()
+    artRequested = Signal(str, int)  # другой вариант фона ("hero") или логотипа ("logo"): шаг -1 или +1
     liveRequested = Signal(int)  # нужен вариант живого фона номер N, а он ещё не скачан — страница игры качает его
     liveKeepRequested = Signal(int)  # оставить вариант номер N, остальные удалить
     MIN_HEIGHT, MAX_HEIGHT = 360, 600
@@ -2051,13 +2113,26 @@ class HeroHeader(QWidget):
         self._movie_held = False  # на время трейлера живой фон стоит
         # Варианты живого фона: сколько их в SteamGridDB, какой показан и какой выбран (сохранён)
         self.live_count, self.live_index, self.live_chosen = 0, 0, None
-        # Значок «живой фон» — только у игр, для которых он нашёлся; справа от него выезжает выбор варианта
-        self.variant_bar = VariantBar(self)
-        self.variant_bar.stepRequested.connect(self._step_variant)
-        self.variant_bar.keepRequested.connect(lambda: self.liveKeepRequested.emit(self.live_index))
-        self.live_button = LiveButton(self)
+        # Значок «живой фон» — только у игр, для которых он нашёлся; при наведении раскрывается выбор варианта
+        self.live_button = HeaderPill(self, FIF.VIDEO, keep=True)
         self.live_button.clicked.connect(self._on_live_clicked)
+        self.live_button.stepRequested.connect(self._step_variant)
+        self.live_button.keepRequested.connect(lambda: self.liveKeepRequested.emit(self.live_index))
         self.live_button.hide()
+        self.variant_bar = self.live_button  # выбор варианта теперь внутри того же значка
+        # «Фон» и «Логотип» из SteamGridDB: щелчок — следующий вариант, при наведении — ◀ номер ▶
+        self.art_buttons, self.art_state = {}, {}
+        for kind, title, icon in (("hero", "Фон", FIF.PHOTO), ("logo", "Логотип", fluent_icon("FONT", FIF.EDIT))):
+            pill = HeaderPill(self, icon, title)
+            pill.set_tip(f"{title} из SteamGridDB — щелчок ставит следующий вариант, стрелки листают в обе стороны. "
+                         "Выбранный остаётся")
+            pill.clicked.connect(lambda k=kind: self._step_art(k, 1))
+            pill.stepRequested.connect(lambda step, k=kind: self._step_art(k, step))
+            pill.set_expandable(True)
+            pill.hide()
+            self.art_buttons[kind], self.art_state[kind] = pill, (0, 0)
+        for pill in [self.live_button] + list(self.art_buttons.values()):
+            pill.opened.connect(lambda p=pill: self._collapse_others(p))
         self.title = ""
         self.has_trailer = False
         self.play_hover = False
@@ -2079,12 +2154,58 @@ class HeroHeader(QWidget):
         self.live_count, self.live_index, self.live_chosen = 0, 0, None
         self.live_button.set_progress(None)
         self.live_button.set_active(False)
+        self.live_button.set_expandable(False)
+        self.live_button.collapse_now()
         self.live_button.hide()
-        self.variant_bar.slide(False)
         self.hero = self.logo = self.static = None
         self.title = title
         self.has_trailer = False
+        has_key = bool(core.griddb_key())
+        for kind, pill in self.art_buttons.items():
+            pill.set_progress(None)
+            pill.setVisible(has_key)
+            self.art_state[kind] = (0, 0)
+            pill.set_state(0, 0)
+            pill.collapse_now()
+        self._place_art_buttons()
         self.play_intro()
+
+    # --- Другой фон и логотип из SteamGridDB ---
+    def _collapse_others(self, pill):
+        """Раскрывается один значок — остальные сразу сворачиваются (кроме тех, где качается вариант): провели
+        мышью снизу вверх — две «таблетки» не торчат одновременно."""
+        for other in [self.live_button] + list(self.art_buttons.values()):
+            if other is not pill and other.progress is None and other.reveal > 0:
+                other.collapse_timer.stop()
+                other.collapse_now()
+
+    def _step_art(self, kind, step):
+        if self.art_buttons[kind].progress is None:  # пока качается прошлый — ждём
+            self.artRequested.emit(kind, step)
+
+    def set_art_busy(self, kind, busy):
+        self.art_buttons[kind].set_progress(-1 if busy else None)
+
+    def set_art_counter(self, kind, index, count):
+        self.art_state[kind] = (index, count)
+        self.art_buttons[kind].set_state(index, count)
+
+    def replace_hero(self, pixmap):
+        """Новый обычный фон из SteamGridDB — его сразу видно, даже если был включён живой."""
+        if self.movie:
+            self._toggle_live(False)
+        self.static = self.hero = pixmap
+        self.update()
+
+    def _place_art_buttons(self):
+        """Значки — столбиком слева сверху: живой фон (если есть), под ним фон и логотип. Раскрываются вправо."""
+        y = 16
+        for pill in [self.live_button] + list(self.art_buttons.values()):
+            if pill.isHidden():
+                continue
+            pill.move(16, y)
+            pill.raise_()
+            y += pill.height() + 10
 
     def set_trailer(self, has_trailer):
         self.has_trailer = has_trailer
@@ -2157,11 +2278,12 @@ class HeroHeader(QWidget):
         self._update_live_button()
         self.live_button.show()
         self.live_button.raise_()
+        self._place_art_buttons()  # фон и логотип — под значком живого фона
         return True
 
     def set_live_progress(self, progress):
         self.live_button.set_progress(progress)
-        self.live_button.setToolTip("Живой фон загружается…")
+        self.live_button.set_tip("Живой фон загружается…")
         self._update_variant_bar()
 
     def live_ready(self, path, index, chosen=None):
@@ -2226,18 +2348,17 @@ class HeroHeader(QWidget):
         else:
             tip = "Включить живой фон — он скачается из SteamGridDB"
         if self.live_count > 1:
-            tip += f"\nВариантов в SteamGridDB: {self.live_count} — листать их стрелками справа"
-        self.live_button.setToolTip(tip)
+            tip += f"\nВариантов в SteamGridDB: {self.live_count} — наведите, чтобы листать"
+        self.live_button.set_tip(tip)
         self._update_variant_bar()
 
     def _update_variant_bar(self):
-        """Выбор варианта виден, пока живой фон включён (или качается следующий вариант) и вариантов больше одного."""
+        """Выбор варианта живого фона раскрывается при наведении (и пока качается следующий вариант), когда
+        живой фон включён и вариантов больше одного."""
         busy = self.live_button.progress is not None
-        shown = self.live_count > 1 and not self.live_button.isHidden() and (
-            self.movie is not None or (busy and self.live_path is not None))
-        self.variant_bar.set_state(self.live_index, self.live_count, self.live_chosen, busy)
-        self.variant_bar.slide(shown)
-        self.live_button.raise_()  # левый край «таблетки» прячется под значком
+        self.live_button.set_state(self.live_index, self.live_count, self.live_chosen)
+        self.live_button.set_expandable(self.live_count > 1 and not self.live_button.isHidden() and (
+            self.movie is not None or (busy and self.live_path is not None)))
 
     def hold_movie(self, held):
         """Поставить живой фон на паузу (трейлер поверх) или продолжить."""
@@ -2261,8 +2382,7 @@ class HeroHeader(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.live_button.move(16, 16)
-        self.variant_bar.move(16 + LiveButton.SIZE // 2, 16)
+        self._place_art_buttons()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -2407,15 +2527,18 @@ class AddGameDialog(MessageBoxBase):
     описание, скриншоты, трейлеры, обложки и установка через Steam. Ключ и вход для поиска не нужны.
 
     С game — «Найти в Steam» для игры, добавленной вручную: найденный номер привязывается к ней.
+    for_disc — то же для дисковой игры: из Steam берутся только описание, оценки и отзывы, запускается она
+    по-прежнему своим файлом. Поэтому игры из списка «Игры Steam» здесь не помечаются как «уже в списке».
     """
 
     ICON = QSize(120, 45)  # картинки поиска Steam — 231×87
     SEARCH_DELAY = 500  # мс: ищем, когда перестали печатать
 
-    def __init__(self, parent, game=None, term="", synced=False):
+    def __init__(self, parent, game=None, term="", synced=False, for_disc=False):
         super().__init__(parent)
         self.win = parent
         self.game = game
+        self.for_disc = for_disc
         self.choice = None  # {"appid", "name"} — выбранная игра
         self.plain_name = None  # «Без Steam» — название как ввели
         self.bulk = False  # «Списком…»
@@ -2426,10 +2549,13 @@ class AddGameDialog(MessageBoxBase):
         self._rows_by_image = {}
         self.owned = core.owned_apps()
         self.my_id = parent.my_steam_id()
-        self.listed = {g["appid"] for g in parent.library.games if g.get("appid")}
+        self.listed = set() if for_disc else {g["appid"] for g in parent.library.games if g.get("appid")}
 
         self.viewLayout.addWidget(SubtitleLabel(f"Найти в Steam: «{game['name']}»" if game else "Добавить игру", self))
-        hint = CaptionLabel("Программа найдёт игру в магазине Steam — у неё будут описание, скриншоты, трейлеры, "
+        hint = CaptionLabel("Программа найдёт игру в магазине Steam и возьмёт оттуда описание, оценки, отзывы и "
+                            "картинки. Запускаться игра будет по-прежнему своим файлом из её папки. Ключ и вход "
+                            "для поиска не нужны." if for_disc else
+                            "Программа найдёт игру в магазине Steam — у неё будут описание, скриншоты, трейлеры, "
                             "обложки и кнопка «Установить». Для поиска не нужны ни ключ, ни вход.", self)
         hint.setWordWrap(True)
         self.viewLayout.addWidget(hint)
@@ -2461,7 +2587,7 @@ class AddGameDialog(MessageBoxBase):
         self.list.currentRowChanged.connect(self._on_row)
         self.list.itemDoubleClicked.connect(lambda _item: self._choose())
         self.viewLayout.addWidget(self.list)
-        if QWebEngineView:
+        if QWebEngineView and not for_disc:
             # Что есть на аккаунте, Steam без ключа показывает только тому, кто вошёл в магазин
             text = "Обновить, что есть на моём аккаунте" if self.owned else "Показать, что есть на моём аккаунте"
             owned_button = (TransparentPushButton if self.owned else PushButton)(text, self, FIF.PEOPLE)
@@ -2505,6 +2631,8 @@ class AddGameDialog(MessageBoxBase):
 
     def _caption(self, appid):
         """Подпись под найденной игрой: есть ли она на аккаунте (после входа в магазин) и установлена ли на ПК."""
+        if self.for_disc:  # дисковую игру через Steam не ставят и не покупают — важен только сам номер
+            return f"Магазин Steam · номер {appid}"
         owner = core.installed_owner(appid)  # файлы Steam на диске — без ключа и без входа
         installed_mine = owner is not None and (not owner or not self.my_id or owner == self.my_id)
         installed_other = owner is not None and not installed_mine
@@ -2542,7 +2670,8 @@ class AddGameDialog(MessageBoxBase):
         self.results = items
         if not items:
             self.status.setText("В магазине Steam ничего не нашлось. Попробуйте название по-английски, номер игры "
-                                "или ссылку на её страницу. Игра не из Steam — «Без Steam».")
+                                "или ссылку на её страницу. " + ("Игры нет в Steam — описание возьмётся из Википедии."
+                                                                if self.for_disc else "Игра не из Steam — «Без Steam»."))
             return
         self.status.setText("Выберите игру и нажмите «" + self.yesButton.text() + "» (или дважды щёлкните по ней).")
         for row, item in enumerate(items):
@@ -4353,12 +4482,13 @@ def clear_layout(layout):
 
 class CenteredFlowLayout(QLayout):
     """Элементы в ряд по центру; не помещаются по ширине — переносятся на следующую строку,
-    и каждая строка тоже выравнивается по центру. Скрытые элементы пропускаются."""
+    и каждая строка тоже выравнивается по центру (center=False — по левому краю). Скрытые элементы пропускаются."""
 
-    def __init__(self, parent=None, spacing=10):
+    def __init__(self, parent=None, spacing=10, center=True):
         super().__init__(parent)
         self._items = []
         self._spacing = spacing
+        self._center = center
         self.setContentsMargins(0, 0, 0, 0)
 
     def addItem(self, item):
@@ -4418,7 +4548,7 @@ class CenteredFlowLayout(QLayout):
         y = area.y()
         for i, (row, row_width) in enumerate(rows):
             height = max(item.sizeHint().height() for item, _ in row)
-            x = area.x() + (area.width() - row_width) // 2
+            x = area.x() + ((area.width() - row_width) // 2 if self._center else 0)
             if apply:
                 for item, w in row:
                     h = item.sizeHint().height()
@@ -4609,12 +4739,51 @@ OWNED_STORE_TIP = ("Игра уже есть на вашем аккаунте St
                    "или докупить дополнения (DLC)")
 
 
+def step_art(page, game, kind, step=1):
+    """Значки «Фон» и «Логотип» в шапке страницы игры (Steam, порта или дисковой): другой вариант из SteamGridDB,
+    step — вперёд (+1) или назад (-1). Он сохраняется вместо прежнего — при следующем открытии страницы будет он."""
+    page.header.set_art_busy(kind, True)
+    page._run(core.next_griddb_art, (dict(game), kind, core.griddb_key(), step),
+              lambda result: _on_art_step(page, kind, result),
+              lambda message: _on_art_step_failed(page, kind, message))
+
+
+def _on_art_step(page, kind, result):
+    page.header.set_art_busy(kind, False)
+    if not result:
+        notify("info", page.win, "В SteamGridDB вариантов нет",
+               ("Фона" if kind == "hero" else "Логотипа") + " для этой игры там пока не выложили.", 5000)
+        return
+    page.header.set_art_counter(kind, result["index"], result["count"])
+    pixmap = QPixmap.fromImage(QImage(result["path"]))
+    if pixmap.isNull():
+        return
+    if kind == "hero":
+        page.header.replace_hero(pixmap)
+        page._run(core.make_backdrop, (result["path"],), page._on_backdrop)  # подложка страницы — из нового фона
+    else:
+        page.header.set_logo(pixmap)
+
+
+def _on_art_step_failed(page, kind, message):
+    page.header.set_art_busy(kind, False)
+    notify("warning", page.win, "SteamGridDB не ответил", message.split(": ", 1)[-1], 6000)
+
+
 class GamePage(QWidget):
     """Страница выпавшей игры: шапка с фоном и логотипом, кнопки, скриншоты и трейлеры, описание.
 
     Всё, что качается из интернета, загружается в фоне. Если за это время открыли другую игру,
     опоздавшие ответы отбрасываются по номеру открытия (_token).
     """
+
+    def set_origin(self, collection):
+        """Открыли из коллекции — кнопка «К коллекции «…»» видна; из рулетки или списка — нет."""
+        self.origin = collection
+        self.collection_button.setVisible(collection is not None)
+        if collection is not None:
+            self.collection_button.setText(f"К коллекции «{collection['name']}»")
+        self.buttons.invalidate()
 
     CHIP_ORDER = ("genres", "release", "developers", "reviews", "metacritic", "achievements")
     SIDE_MARGIN = 32  # как отступ логотипа в шапке
@@ -4627,6 +4796,7 @@ class GamePage(QWidget):
         super().__init__()
         self.home, self.win = home, home.win
         self.game = None
+        self.origin = None  # коллекция, из которой открыли игру, — для кнопки «К коллекции»
         self.media = []  # скриншоты: [{"thumb": адрес превью, "full": адрес}]
         self.thumbs = []
         self.trailer_sources = []  # адреса трейлеров по порядку попыток
@@ -4652,6 +4822,7 @@ class GamePage(QWidget):
         self.header.playClicked.connect(self.play_trailer)
         self.header.liveRequested.connect(self._download_live)
         self.header.liveKeepRequested.connect(self._keep_live)
+        self.header.artRequested.connect(lambda kind, step: self.game and step_art(self, self.game, kind, step))
         self._live_urls = []  # адреса вариантов живого фона открытой игры
 
         self.play_button = PrimaryPushButton("Играть", self, FIF.PLAY)
@@ -4678,12 +4849,16 @@ class GamePage(QWidget):
         library_button = TransparentPushButton("К играм Steam", self, FIF.LIBRARY)
         library_button.setToolTip("Вернуться на вкладку «Игры Steam» — к этой игре в списке")
         library_button.clicked.connect(self.home.back_to_library)
+        # Открыли игру из коллекции — можно вернуться и туда (кнопка видна только тогда)
+        self.collection_button = TransparentPushButton("К коллекции", self, fluent_icon("ALBUM", FIF.FOLDER))
+        self.collection_button.clicked.connect(self.win.back_to_collection)
+        self.collection_button.hide()
 
         # Кнопки по центру; в узком окне переносятся на вторую строку
         buttons_box = QWidget(self)
         buttons = CenteredFlowLayout(buttons_box, spacing=12)
         for button in (self.play_button, self.link_button, self.spin_button, self.done_button, self.cover_button,
-                       self.store_button, self.soundtrack_button, back_button, library_button):
+                       self.store_button, self.soundtrack_button, self.collection_button, back_button, library_button):
             buttons.addWidget(button)
         self.buttons = buttons
 
@@ -4879,7 +5054,7 @@ class GamePage(QWidget):
     def _on_art(self, kind, path):
         if kind == "hero":
             self._timing_mark("фон")
-        pixmap = QPixmap(path) if path else QPixmap()
+        pixmap = QPixmap.fromImage(QImage(path)) if path else QPixmap()  # файл мог смениться под тем же именем
         if pixmap.isNull():
             return
         if kind == "hero":
@@ -4948,7 +5123,7 @@ class GamePage(QWidget):
 
     # --- Размытая подложка под всей страницей ---
     def _on_backdrop(self, path):
-        pixmap = QPixmap(path) if path else QPixmap()
+        pixmap = QPixmap.fromImage(QImage(path)) if path else QPixmap()  # файл мог смениться под тем же именем
         if pixmap.isNull():
             return
         self.backdrop = pixmap
@@ -5062,9 +5237,11 @@ class GamePage(QWidget):
             if key in self.chip_values:
                 caption, value, url = self.chip_values[key]
                 chips.append(InfoChip(caption, value, url, self.chips_box))
-        if self.chip_values:  # обзоры изданий — только у игр из магазина
+        if self.chip_values:  # обзоры изданий и время прохождения — только у игр из магазина
             for title, url in self.press_links:
                 chips.append(InfoChip("Обзор", title, url, self.chips_box))
+            chips.append(InfoChip("How Long To Beat", "Сколько проходить", hltb_url(self.game["name"]),
+                                  self.chips_box))
         for chip in chips:
             chip.linkClicked.connect(self.home.open_link)
             self.chips.addWidget(chip)
@@ -5614,14 +5791,18 @@ class FilmBackdrop(QWidget):
 
     Фон размыт и притушен, чтобы барабан поверх него читался чётко. Рисуем его в картинку втрое меньше
     окна и растягиваем: так дешевле, а растяжение само добавляет мягкости.
-    """
+
+    Кнопкой «Фон» под барабаном ленты можно остановить или поставить вместо них свою картинку — она идёт
+    под то же матовое стекло (MODES)."""
+
+    MODES = ("film", "still", "custom")
 
     SCALE = 3  # во сколько раз картинка фона меньше окна
     ANGLE = 18  # наклон лент в градусах: верх уходит влево, как «\»
     SPEED = 8  # пикселей маленькой картинки в секунду — на экране втрое больше
     FPS = 30
     STRIPS = 8  # разных лент; если на экран нужно больше — они повторяются
-    CORNER = 10  # скругление левого верхнего угла области страниц у MSFluentWindow
+    CORNER = 10  # скругление левого верхнего угла области страниц у окна Fluent
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -5641,6 +5822,36 @@ class FilmBackdrop(QWidget):
         self.fade_anim.setStartValue(0.0)
         self.fade_anim.setEndValue(1.0)
         self.fade_anim.valueChanged.connect(self._set_opacity)
+        self.custom = None  # своя картинка (уже размытая), когда mode == "custom"
+        mode = core.load_settings().get("roulette_backdrop", "film")
+        self.mode = "film"
+        self.set_mode(mode if mode in self.MODES else "film")
+
+    def set_mode(self, mode):
+        """Сменить фон: film — ленты едут, still — стоят, custom — своя картинка. Своей нет — ленты."""
+        self.custom = None
+        if mode == "custom":
+            path = core.roulette_backdrop()
+            image = QImage(path) if path else QImage()
+            if image.isNull():
+                mode = "film"
+            else:
+                self.custom = QPixmap.fromImage(image)
+        self.mode = mode
+        self.frame = None
+        if mode == "custom":
+            if self.opacity == 0.0:
+                self.fade_anim.start()
+        else:
+            self.rebuild_if_empty()
+        if mode == "film" and self.isVisible():
+            self.timer.start()
+        else:
+            self.timer.stop()
+        self.update()
+
+    def _has_picture(self):
+        return self.custom is not None if self.mode == "custom" else bool(self.strips)
 
     def rebuild(self):
         """Собрать ленты заново из обложек на диске — в фоне, окно не подвисает."""
@@ -5663,9 +5874,9 @@ class FilmBackdrop(QWidget):
         self.strips = [QPixmap.fromImage(QImage(image.tobytes("raw", "RGB"), image.width, image.height,
                                                 image.width * 3, QImage.Format_RGB888).copy())
                        for image in images]
-        if self.strips and not had_strips:
+        if self.strips and not had_strips and self.opacity == 0.0:
             self.fade_anim.start()  # первое появление — плавно
-        self._render()
+        self.frame = None
         self.update()
         if self._dirty:
             self._dirty = False
@@ -5680,7 +5891,7 @@ class FilmBackdrop(QWidget):
         self.update()
 
     def _tick(self):
-        if self.strips and not self.window().isMinimized():
+        if self.mode == "film" and self.strips and not self.window().isMinimized():
             self._render()
             self.update()
 
@@ -5690,12 +5901,22 @@ class FilmBackdrop(QWidget):
         if self.frame is None or self.frame.width() != w or self.frame.height() != h:
             self.frame = QImage(w, h, QImage.Format_RGB32)
         self.frame.fill(QColor(*core.FILM_COLOR))
-        if not self.strips:
+        if not self._has_picture():
             return
         painter = QPainter(self.frame)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)  # плавный сдвиг на доли пикселя
 
-        t = time.monotonic() - self.started
+        if self.mode == "custom":  # своя картинка — на весь кадр, лишнее по краям обрезается
+            scale = max(w / self.custom.width(), h / self.custom.height())
+            cw, ch = self.custom.width() * scale, self.custom.height() * scale
+            painter.drawPixmap(QRectF((w - cw) / 2, (h - ch) / 2, cw, ch), self.custom, QRectF(self.custom.rect()))
+        else:
+            self._draw_strips(painter, w, h)
+        self._draw_wash(painter, w, h)
+        painter.end()
+
+    def _draw_strips(self, painter, w, h):
+        t = time.monotonic() - self.started if self.mode == "film" else 0.0  # «стоят» — один и тот же кадр
         half = math.hypot(w, h) / 2  # повёрнутые ленты должны закрыть кадр целиком, с углами
         strip_w = self.strips[0].width()
         count = math.ceil(2 * half / strip_w) + 1
@@ -5714,6 +5935,8 @@ class FilmBackdrop(QWidget):
             painter.restore()
         painter.restore()
 
+    @staticmethod
+    def _draw_wash(painter, w, h):
         # Вуаль цвета темы, в центре — плотнее: там барабан
         dark = isDarkTheme()
         wash = QColor(22, 22, 26, 165) if dark else QColor(240, 240, 244, 185)
@@ -5722,12 +5945,12 @@ class FilmBackdrop(QWidget):
         glow.setColorAt(0, QColor(wash.red(), wash.green(), wash.blue(), 70))
         glow.setColorAt(1, QColor(wash.red(), wash.green(), wash.blue(), 0))
         painter.fillRect(0, 0, w, h, glow)
-        painter.end()
 
     def paintEvent(self, event):
-        if not self.strips:
+        if not self._has_picture():
             return
-        if self.frame is None:
+        if self.frame is None or getattr(self, "_frame_dark", None) != isDarkTheme():
+            self._frame_dark = isDarkTheme()  # сменили тему — вуаль другого цвета, даже если ленты стоят
             self._render()
         painter = QPainter(self)
         painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
@@ -5745,12 +5968,130 @@ class FilmBackdrop(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.rebuild_if_empty()
-        self.timer.start()
+        if self.mode != "custom":
+            self.rebuild_if_empty()
+        if self.mode == "film":
+            self.timer.start()
 
     def hideEvent(self, event):
         super().hideEvent(event)
         self.timer.stop()  # на другой вкладке и на странице игры фон не крутим
+
+
+def pil_pixmap(image):
+    """Картинка PIL (RGB) → QPixmap. None → None."""
+    if image is None:
+        return None
+    image = image.convert("RGB")
+    qimage = QImage(image.tobytes("raw", "RGB"), image.width, image.height, image.width * 3, QImage.Format_RGB888)
+    return QPixmap.fromImage(qimage.copy())
+
+
+class SelectionBackdrop(QWidget):
+    """Подложка вкладки с играми: выделили игру — за списком её обложка под матовым стеклом, как фон рулетки;
+    выделили несколько — коллаж из их обложек. Сменили выделение — картинки плавно сменяют друг друга,
+    сняли — подложка уходит. Лежит под всем остальным на вкладке и мышь не ловит."""
+
+    DELAY_MS = 160  # выделяют мышью с Shift — собираем, когда перестали щёлкать
+    FADE_MS = 450
+    CORNER = FilmBackdrop.CORNER
+    instances = []  # все подложки — переключатель в «Настройках» включает и выключает их разом
+
+    def __init__(self, host):
+        super().__init__(host)
+        SelectionBackdrop.instances.append(self)
+        self.host = host
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.pixmap = self.old = None
+        self.fade = 1.0
+        self.names = ()
+        self.wanted = ()  # выделенные игры — даже когда подложка выключена, чтобы сразу показать при включении
+        self._token = 0
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(self.DELAY_MS)
+        self.timer.timeout.connect(self._build)
+        self.anim = QVariantAnimation(self)
+        self.anim.setDuration(self.FADE_MS)
+        self.anim.setStartValue(0.0)
+        self.anim.setEndValue(1.0)
+        self.anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.anim.valueChanged.connect(self._set_fade)
+        host.installEventFilter(self)  # вкладка поменяла размер — подложка тоже
+        self.setGeometry(host.rect())
+        self.lower()
+
+    def eventFilter(self, obj, event):
+        if obj is self.host and event.type() == QEvent.Resize:
+            self.setGeometry(self.host.rect())
+            self.lower()
+        return False
+
+    def set_names(self, names):
+        """Названия выделенных игр (обложки ищутся по названию)."""
+        self.wanted = tuple(dict.fromkeys(n for n in names if n))[:core.SELECTION_MAX]
+        settings = getattr(self.window(), "settings", None) or core.load_settings()  # без чтения с диска
+        names = self.wanted if settings.get("selection_backdrop", True) else ()
+        if names != self.names:
+            self.names = names
+            self.timer.start()
+
+    def apply_setting(self):
+        """Переключили подложку в «Настройках» — показать или убрать её сразу."""
+        self.set_names(self.wanted)
+
+    def refresh(self, name=None):
+        """Обложка игры сменилась — если она на подложке, собрать подложку заново."""
+        if name is None or name in self.names:
+            self.timer.start()
+
+    def _build(self):
+        self._token += 1
+        token = self._token
+        paths = [p for p in (core.find_cover(n) for n in self.names) if p]
+        if not paths:
+            self._show(None)
+            return
+        worker = Worker(core.selection_backdrop, paths, parent=self)
+        worker.finished.connect(lambda image: token == self._token and self._show(pil_pixmap(image)))
+        worker.start()
+
+    def _show(self, pixmap):
+        if pixmap is None and self.pixmap is None:
+            return
+        self.old = self.pixmap if self.fade >= 0.5 else self.old  # уходящая картинка — та, что сейчас видна
+        self.pixmap = pixmap
+        self.fade = 0.0
+        self.anim.stop()
+        self.anim.start()
+
+    def _set_fade(self, value):
+        self.fade = float(value)
+        if self.fade >= 1.0:
+            self.old = None
+        self.update()
+
+    def _draw(self, painter, pixmap, opacity):
+        if pixmap is None or opacity <= 0:
+            return
+        w, h = self.width(), self.height()
+        painter.setOpacity(opacity)
+        scale = max(w / pixmap.width(), h / pixmap.height())  # во весь фон, лишнее по краям обрезается
+        pw, ph = pixmap.width() * scale, pixmap.height() * scale
+        painter.drawPixmap(QRectF((w - pw) / 2, (h - ph) / 2, pw, ph), pixmap, QRectF(pixmap.rect()))
+        FilmBackdrop._draw_wash(painter, w, h)  # то же матовое стекло, что у фона рулетки
+
+    def paintEvent(self, event):
+        if self.pixmap is None and self.old is None:
+            return
+        painter = QPainter(self)
+        painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        corner = QPainterPath()  # скругляем только левый верхний угол, как у самой области страниц
+        corner.addRoundedRect(QRectF(0, 0, self.width() + self.CORNER, self.height() + self.CORNER),
+                              self.CORNER, self.CORNER)
+        painter.setClipPath(corner)
+        self._draw(painter, self.old, 1.0 - self.fade)
+        self._draw(painter, self.pixmap, self.fade)
 
 
 class HomePage(QWidget):
@@ -5802,10 +6143,12 @@ class HomePage(QWidget):
         self.page_layout.addWidget(self.stack, 1)
 
         self.win.libraryChanged.connect(self.on_library_changed)
+        self.win.portsChanged.connect(self.on_library_changed)
+        self.win.collectionsChanged.connect(self.on_library_changed)  # коллекцию могут крутить
         self.win.covers.coverReady.connect(self.reel.refresh_cover)
         self.win.covers.progress.connect(self.on_cover_progress)
         self.win.covers.finished.connect(self.on_covers_finished)
-        self.reel.show_idle(self.win.library.games)
+        self.reel.show_idle(self.win.roulette_games())
         self.stack.setCurrentWidget(self.reel_view)
         self.update_count()
         self.update_buttons()
@@ -5863,6 +6206,24 @@ class HomePage(QWidget):
         self.spin_button = PrimaryPushButton("Крутить", view, FIF.SYNC)
         self.spin_button.setMinimumWidth(200)
         self.spin_button.clicked.connect(self.spin)
+        # Что крутить — видно, когда кроме игр Steam есть порты или дисковые игры; варианты — из того, что есть
+        self.pool_box = ComboBox(view)
+        self.pool_box.setToolTip("Что крутит рулетка: игры Steam, порты, дисковые игры — отдельно или вместе, "
+                                 "или одну из ваших коллекций")
+        self._pool_keys, self._pool_labels, self._pool_titles = [], [], {}
+        self.pool_box.currentIndexChanged.connect(self._on_pool_changed)
+        # Фон рулетки: ленты едут, стоят или своя картинка — если от движения укачивает
+        self.backdrop_button = TransparentPushButton("Фон", view, FIF.PHOTO)
+        self.backdrop_button.setToolTip("Фон рулетки: ленты из обложек (едут или стоят) или своя картинка")
+        self.backdrop_button.clicked.connect(self._backdrop_menu)
+
+        spin_row = QHBoxLayout()
+        spin_row.setSpacing(12)
+        spin_row.addStretch(1)
+        spin_row.addWidget(self.spin_button)
+        spin_row.addWidget(self.pool_box)
+        spin_row.addWidget(self.backdrop_button)
+        spin_row.addStretch(1)
 
         layout = QVBoxLayout(view)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -5871,9 +6232,71 @@ class HomePage(QWidget):
         layout.addWidget(self.reel)
         layout.addWidget(self.name_label)
         layout.addSpacing(8)
-        layout.addWidget(self.spin_button, 0, Qt.AlignHCenter)
+        layout.addLayout(spin_row)
         layout.addStretch(1)
         return view
+
+    # Варианты в порядке показа; показываются те, для которых все источники не пусты
+    POOLS = (("steam", "Игры Steam"), ("steam+ports+discs", "Все игры"), ("steam+ports", "Steam и порты"),
+             ("steam+discs", "Steam и дисковые"), ("ports+discs", "Порты и дисковые"), ("ports", "Только порты"),
+             ("discs", "Только дисковые"))
+    POOL_NAMES = {"steam": "игры Steam", "ports": "порты", "discs": "дисковые"}
+
+    def _on_pool_changed(self, index):
+        if not 0 <= index < len(self._pool_keys):
+            return
+        pool = self._pool_keys[index]
+        if pool == self.win.roulette_pool():
+            return
+        self.win.settings["roulette_pool"] = pool
+        core.save_settings(roulette_pool=pool)
+        core.log.info("Рулетка крутит: %s", self._pool_titles.get(pool, pool))
+        self.current = None
+        self.name_label.setText("")
+        self.on_library_changed()
+        for page in (self.win.native_page, self.win.disc_page):
+            page.page.refresh()  # кнопка «Крутить ещё» на странице игры
+
+    # --- Фон рулетки ---
+    BACKDROP_TITLES = {"film": "Ленты из обложек — едут", "still": "Ленты из обложек — стоят",
+                       "custom": "Своя картинка"}
+
+    def _backdrop_menu(self):
+        menu = RoundMenu(parent=self)
+        current = self.backdrop.mode
+        for mode, icon in (("film", FIF.PLAY), ("still", FIF.PAUSE)):
+            action = Action(FIF.ACCEPT if mode == current else icon, self.BACKDROP_TITLES[mode], menu)
+            action.triggered.connect(lambda _=False, m=mode: self._set_backdrop(m))
+            menu.addAction(action)
+        if core.roulette_backdrop():
+            mine = Action(FIF.ACCEPT if current == "custom" else FIF.PHOTO, "Своя картинка", menu)
+            mine.triggered.connect(lambda: self._set_backdrop("custom"))
+            menu.addAction(mine)
+        menu.addSeparator()
+        pick = Action(FIF.FOLDER, "Выбрать картинку…", menu)
+        pick.setToolTip("Программа сделает размытую копию — сам файл не трогается")
+        pick.triggered.connect(self._pick_backdrop)
+        menu.addAction(pick)
+        button = self.backdrop_button
+        menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
+
+    def _set_backdrop(self, mode):
+        self.backdrop.set_mode(mode)
+        mode = self.backdrop.mode  # своей картинки могло не оказаться
+        core.save_settings(roulette_backdrop=mode)
+        core.log.info("Фон рулетки: %s", self.BACKDROP_TITLES[mode])
+
+    def _pick_backdrop(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Картинка для фона рулетки", "",
+                                              "Изображения (*.png *.jpg *.jpeg *.webp *.bmp)")
+        if not path:
+            return
+        show_busy(self.win, "Готовлю фон…", "Делаю размытую копию картинки. Сам файл не трогаю.")
+        worker = Worker(core.save_roulette_backdrop, path, parent=self)
+        worker.finished.connect(lambda _path: (hide_busy(self.win), self._set_backdrop("custom")))
+        worker.failed.connect(lambda message: (hide_busy(self.win), notify(
+            "error", self.win, "Фон не поставился", message.split(": ", 1)[-1], 6000)))
+        worker.start()
 
     # --- Переходы между барабаном, загрузкой и страницей игры ---
     def _set_view(self, view):
@@ -5892,20 +6315,10 @@ class HomePage(QWidget):
 
     def open_link(self, url):
         """Ссылка с карточки игры: в программе или во внешнем браузере — как выбрано, иначе спрашиваем."""
-        if not self.browser:
+        if not self.browser or external_only(url):
             QDesktopServices.openUrl(QUrl(url))
             return
-        choice = core.load_settings().get("link_open", "ask")
-        if choice not in ("inside", "outside"):
-            dialog = LinkDialog(self.win, url)
-            core.log.info("Открыто окно «Открыть ссылку»: %s", url)
-            dialog.exec()
-            choice = dialog.choice
-            core.log.info("Окно «Открыть ссылку» закрыто: %s%s", choice or "отмена",
-                          ", больше не спрашивать" if choice and dialog.remember_box.isChecked() else "")
-            if choice and dialog.remember_box.isChecked():
-                core.save_settings(link_open=choice)
-                self.win.settings_page.show_link_mode(choice)
+        choice = link_choice(self.win, url)
         if choice == "outside":
             QDesktopServices.openUrl(QUrl(url))
         elif choice == "inside":
@@ -5959,7 +6372,7 @@ class HomePage(QWidget):
         if self.stack.currentWidget() is self.reel_view:
             return
         if self.current is None:
-            self.reel.show_idle(self.win.library.games)
+            self.reel.show_idle(self.win.roulette_games())
         self._set_view(self.reel_view)
         self.reel.play_intro()
 
@@ -5975,14 +6388,24 @@ class HomePage(QWidget):
             self.win.library_page.reveal(game)
 
     def open_game(self, game):
-        """Страница игры — после прокрутки или из списка игр."""
+        """Страница игры — после прокрутки или из списка игр. Выпал порт или дисковая игра — её страница
+        на её вкладке."""
         if self.reel.is_spinning():
+            return
+        if core.is_port(game):
+            self.current = game
+            self.reel.show_idle(self.win.roulette_games(), center=game)
+            self.show_name(game["name"])
+            page = self.win.disc_page if core.is_disc(game) else self.win.native_page
+            self.win.switchTo(page)
+            page.open_port(game)
             return
         self.current = game
         # При возврате к рулетке барабан стоит на этой игре
-        self.reel.show_idle(self.win.library.games, center=game)
+        self.reel.show_idle(self.win.roulette_games(), center=game)
         self.show_name(game["name"])
         self.game_page.show_game(game)
+        self.game_page.set_origin(self.win.game_origin)
         self._set_view(self.game_page)
         if not core.find_cover(game["name"]):
             self.win.covers.enqueue([game], front=True)
@@ -6006,7 +6429,42 @@ class HomePage(QWidget):
 
     # --- Барабан ---
     def update_count(self):
-        self.count_label.setText(f"Игр в списке: {len(self.win.library.games)}")
+        pool = self.win.roulette_pool()
+        counts = {"steam": len(self.win.library.games), "ports": len(self.win.ports.ports),
+                  "discs": len(self.win.discs.ports)}
+        sources = pool.split("+")
+        if pool.startswith("col:"):
+            collection = self.win.collections.find(pool[4:])
+            text = f"Крутим коллекцию «{collection['name']}»: {game_word(len(self.win.roulette_games()))}"
+        elif sources == ["steam"]:
+            text = f"Игр в списке: {counts['steam']}"
+        else:
+            text = "Крутим: " + " + ".join(f"{self.POOL_NAMES[s]} {counts[s]}" for s in sources)
+        self.count_label.setText(text)
+        # Выбор «что крутить» — из тех вариантов, для которых есть игры, и коллекции, в которых есть игры.
+        # Кроме Steam ничего нет — не показываем
+        available = set(self.win.pool_sources())
+        keys = [key for key, _ in self.POOLS if set(key.split("+")) <= available]
+        titles = dict(self.POOLS)
+        for collection in self.win.collections.collections:
+            if self.win.collection_games(collection):
+                key = f"col:{collection['id']}"
+                keys.append(key)
+                titles[key] = f"Коллекция «{collection['name']}»"
+        labels = [titles[key] for key in keys]
+        self._pool_titles = titles
+        if keys != self._pool_keys or labels != self._pool_labels:
+            self._pool_keys, self._pool_labels = keys, labels
+            self.pool_box.blockSignals(True)
+            self.pool_box.clear()
+            self.pool_box.addItems(labels)
+            self.pool_box.blockSignals(False)
+        self.pool_box.setVisible(len(keys) > 1)
+        index = keys.index(pool) if pool in keys else 0
+        if self.pool_box.currentIndex() != index:
+            self.pool_box.blockSignals(True)
+            self.pool_box.setCurrentIndex(index)
+            self.pool_box.blockSignals(False)
 
     def update_buttons(self):
         self.spin_button.setEnabled(not self.reel.is_spinning())
@@ -6022,17 +6480,20 @@ class HomePage(QWidget):
         self.update_count()
         if self.reel.is_spinning():
             return
-        if self.current is not None and self.current not in self.win.library.games:
+        games = self.win.roulette_games()
+        if self.current is not None and not any(g is self.current for g in games):
             self.current = None
             self.name_label.setText("")
-            if self._on_page():
-                self.show_reel()  # игру убрали из списка — её страница больше не нужна
+            if self._on_page() and not core.is_port(self.game_page.game or {}):
+                game = self.game_page.game
+                if not game or not any(g is game for g in self.win.library.games):
+                    self.show_reel()  # игру убрали из списка — её страница больше не нужна
         if self.current is None:
-            self.reel.show_idle(self.win.library.games)
+            self.reel.show_idle(games)
         self.update_buttons()
 
     def spin(self):
-        games = self.win.library.games
+        games = self.win.roulette_games()
         if self.reel.is_spinning():
             return
         if not games:
@@ -6057,6 +6518,7 @@ class HomePage(QWidget):
     def _open_after_spin(self, game):
         # За время паузы могли закрутить заново или уйти с барабана
         if self.current is game and not self.reel.is_spinning() and self.stack.currentWidget() is self.reel_view:
+            self.win.game_origin = None  # выпала на рулетке — «назад» к рулетке, а не в коллекцию
             self.open_game(game)
 
     def mark_done(self):
@@ -6235,11 +6697,76 @@ def two_lines(text, metrics, width):
     return first + ("\n" + metrics.elidedText(rest, Qt.ElideRight, width) if rest else "")
 
 
+# Порядок игр на вкладках с играми. Новые — по порядку добавления: так работает и для игр, добавленных до 2.4
+SORT_TITLES = {"name": "По названию: А–Я", "name_desc": "По названию: Я–А", "new": "Сначала новые",
+               "old": "Сначала давние", "played": "Больше наиграно", "recent": "Недавно запускали"}
+
+
+def sort_games(games, mode):
+    """Игры в выбранном порядке (SORT_TITLES). «Сначала новые» — добавленные последними сверху: после
+    синхронизации со Steam сразу видно, что добавилось."""
+    indexed = list(enumerate(games))
+
+    def by_name(pair):
+        return core.natural_key(pair[1]["name"])
+
+    if mode == "name_desc":
+        indexed.sort(key=by_name, reverse=True)
+    elif mode == "new":
+        indexed.reverse()
+    elif mode == "old":
+        pass
+    elif mode == "played":
+        indexed.sort(key=lambda p: (-(p[1].get("playtime") or 0), by_name(p)))
+    elif mode == "recent":
+        indexed.sort(key=lambda p: (-(p[1].get("last_played") or 0), by_name(p)))
+    else:
+        indexed.sort(key=by_name)
+    return [game for _, game in indexed]
+
+
+def make_sort_box(parent, modes, setting, on_change):
+    """Выбор порядка игр; выбор запоминается в настройке setting."""
+    box = ComboBox(parent)
+    box.addItems([SORT_TITLES[m] for m in modes])
+    current = core.load_settings().get(setting, "name")
+    box.setCurrentIndex(modes.index(current) if current in modes else 0)
+    box.setToolTip("Порядок игр. «Сначала новые» — добавленные последними сверху, например после синхронизации")
+
+    def changed(index):
+        if 0 <= index < len(modes):
+            core.save_settings(**{setting: modes[index]})
+            on_change()
+
+    box.currentIndexChanged.connect(changed)
+    box.mode = lambda: modes[box.currentIndex()] if 0 <= box.currentIndex() < len(modes) else "name"
+    return box
+
+
+class MiniPlayerSpot:
+    """Мини-плеер в правом верхнем углу вкладки, на линии её заголовка — как на рулетке. Лежит поверх
+    раскладки; вкладка зовёт place() из resizeEvent и showEvent."""
+
+    def __init__(self, page, title, margins=(36, 20, 36, 28)):
+        self.page, self.title = page, title
+        self.top, self.right = margins[1], margins[2]
+        self.player = MiniPlayer(page.win, page)
+        self.player.sizeChanged.connect(self.place)  # раскрылся — встаёт у правого края
+        page.win.music.trackChanged.connect(lambda: QTimer.singleShot(0, self.place))
+
+    def place(self):
+        size = self.player.sizeHint()
+        y = self.top + max(0, (self.title.sizeHint().height() - size.height()) // 2)
+        self.player.setGeometry(self.page.width() - self.right - size.width(), y, size.width(), size.height())
+        self.player.raise_()
+
+
 class LibraryPage(QWidget):
     """Вкладка «Игры»: список игр — строками или плиткой с обложками (выбор запоминается). Поиск, правый
-    клик (запуск, магазин, обложка, удаление), выделение нескольких игр и двойной клик — запуск — в обоих видах."""
+    клик (запуск, магазин, обложка, удаление), выделение нескольких игр и двойной клик — страница игры — в обоих видах."""
 
     VIEWS = ("list", "grid")
+    SORTS = ("name", "name_desc", "new", "old")
 
     def __init__(self, window):
         super().__init__()
@@ -6275,7 +6802,8 @@ class LibraryPage(QWidget):
             view.setSelectionMode(QAbstractItemView.ExtendedSelection)
             view.setContextMenuPolicy(Qt.CustomContextMenu)
             view.customContextMenuRequested.connect(lambda pos, v=view: self.show_menu(v, pos))
-            view.itemDoubleClicked.connect(lambda item: self.win.launch_game(self.game_of(item)))
+            # Двойной щелчок — страница игры, как в коллекциях; запуск — с неё или из меню по правому клику
+            view.itemDoubleClicked.connect(lambda item: self.open_page(self.game_of(item)))
             view.viewport().installEventFilter(self)  # клик мимо игр — снять выделение
         # Esc снимает выделение (а в строке поиска — сначала стирает поиск)
         escape = QShortcut(QKeySequence(Qt.Key_Escape), self)
@@ -6293,9 +6821,12 @@ class LibraryPage(QWidget):
         self.grid_button.setToolTip("Плиткой с обложками — сразу видно, у каких игр обложки нет или она не та. "
                                     "Правый клик по игре → своя обложка или обложка из SteamGridDB")
         self.grid_button.clicked.connect(lambda: self.set_view("grid"))
+        self.sort_box = make_sort_box(self, self.SORTS, "library_sort", self.refresh)
         search_row = QHBoxLayout()
         search_row.setSpacing(6)
         search_row.addWidget(self.search, 1)
+        search_row.addSpacing(6)
+        search_row.addWidget(self.sort_box)
         search_row.addSpacing(6)
         search_row.addWidget(self.list_button)
         search_row.addWidget(self.grid_button)
@@ -6312,12 +6843,12 @@ class LibraryPage(QWidget):
         self.clear_button = PushButton("Очистить список", self, FIF.BROOM)
         self.clear_button.clicked.connect(self.clear_library)
 
-        buttons = QHBoxLayout()
-        buttons.setSpacing(12)
-        for button in (self.import_button, self.sync_button, self.add_button, self.delete_button):
+        # В узком окне (половина экрана) кнопки переносятся на вторую строку, а не сжимаются
+        buttons_box = QWidget(self)
+        buttons = CenteredFlowLayout(buttons_box, spacing=12, center=False)
+        for button in (self.import_button, self.sync_button, self.add_button, self.delete_button,
+                       self.clear_button):
             buttons.addWidget(button)
-        buttons.addStretch(1)
-        buttons.addWidget(self.clear_button)
         self._quick = False
         self._had_token = False  # при последней загрузке был вход в магазин Steam (семейная группа проверялась)
         self.set_import_busy(False)
@@ -6329,7 +6860,12 @@ class LibraryPage(QWidget):
         layout.addWidget(self.count_label)
         layout.addLayout(search_row)
         layout.addWidget(self.views, 1)
-        layout.addLayout(buttons)
+        layout.addWidget(buttons_box)
+        self.mini = MiniPlayerSpot(self, self.title)
+        # Выделили игры — за списком их обложки под матовым стеклом
+        self.backdrop = SelectionBackdrop(self)
+        for view in (self.list, self.grid):
+            view.itemSelectionChanged.connect(self._on_selection)
 
         self.win.libraryChanged.connect(self.refresh)
         self.win.covers.coverReady.connect(self.cover_changed)
@@ -6337,10 +6873,14 @@ class LibraryPage(QWidget):
         view = core.load_settings().get("library_view", "list")
         self.set_view(view if view in self.VIEWS else "list", save=False)
 
+    def _on_selection(self):
+        self.backdrop.set_names([item.data(Qt.UserRole) for item in self.current_view().selectedItems()])
+
     def set_view(self, view, save=True):
         self.views.setCurrentWidget(self.grid if view == "grid" else self.list)
         self.list_button.setChecked(view == "list")
         self.grid_button.setChecked(view == "grid")
+        self._on_selection()
         if save:
             core.save_settings(library_view=view)
             core.log.info("Вкладка «Игры Steam»: вид — %s", "плиткой" if view == "grid" else "списком")
@@ -6390,10 +6930,15 @@ class LibraryPage(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        QTimer.singleShot(0, self.mini.place)
         ratio = self.devicePixelRatioF()
         if ratio != self.thumbs.ratio:  # окно перенесли на экран с другим масштабом — обложки резче
             self.thumbs.ratio = ratio
             self.thumbs.clear()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.mini.place()
 
     def game_of(self, item):
         return self.win.library.find(item.data(Qt.UserRole) or item.text()) if item else None
@@ -6435,10 +6980,12 @@ class LibraryPage(QWidget):
         menu.addAction(own_cover)
         if core.griddb_key():
             grid_cover = Action(FIF.DOWNLOAD, "Обложка из SteamGridDB", menu)
-            grid_cover.setToolTip("Заменить обложку лучшей вертикальной из SteamGridDB — например, если Steam "
-                                  "собрал её из горизонтальной шапки")
+            grid_cover.setToolTip("Обложка из SteamGridDB — например, если Steam собрал её из горизонтальной шапки. "
+                                  "Выберите ещё раз — будет следующий вариант")
             grid_cover.triggered.connect(lambda: self.cover_from_griddb(game))
             menu.addAction(grid_cover)
+        menu.addSeparator()
+        add_collection_menu(self.win, menu, [self.game_of(i) for i in view.selectedItems()])
         menu.addSeparator()
         count = len(view.selectedItems())
         delete = Action(FIF.DELETE, "Удалить из списка" if count == 1 else f"Удалить выбранные ({count})", menu)
@@ -6447,15 +6994,23 @@ class LibraryPage(QWidget):
         menu.exec(view.viewport().mapToGlobal(pos))
 
     def open_page(self, game):
+        if not game:
+            return
+        self.win.game_origin = None  # «назад» со страницы — на «Игры Steam», как обычно
         self.win.switchTo(self.win.home_page)
         self.win.home_page.open_game(game)
 
     # --- Обложки ---
     def cover_changed(self, name):
-        """Обложка игры появилась или сменилась — перерисовать её на плитке и на барабане."""
+        """Обложка игры появилась или сменилась — перерисовать её на плитке, на барабане, у портов и дисковых игр."""
         self.thumbs.forget(name)
         self.grid.viewport().update()
+        self.backdrop.refresh(name)
         self.win.home_page.reel.refresh_cover(name)
+        for page in (getattr(self.win, "native_page", None), getattr(self.win, "disc_page", None),
+                     getattr(self.win, "collections_page", None)):
+            if page is not None:  # «Своя обложка» и SteamGridDB для них — те же, что у игр Steam
+                page.cover_changed(name)
 
     def choose_cover(self, game):
         path, _ = QFileDialog.getOpenFileName(self, f"Обложка для «{game['name']}»", "",
@@ -6474,28 +7029,32 @@ class LibraryPage(QWidget):
         notify("success", self.win, "Обложка сохранена", f"«{game['name']}»")
 
     def cover_from_griddb(self, game):
+        """Каждое нажатие — следующая вертикальная обложка 600×900 из SteamGridDB, по кругу."""
         name = game["name"]
         worker = Worker(core.cover_from_griddb, dict(game), core.griddb_key(), parent=self)
-        worker.finished.connect(lambda path: self._on_griddb_cover(name, path))
+        worker.finished.connect(lambda result: self._on_griddb_cover(name, result))
         worker.failed.connect(lambda message: notify("warning", self.win, "SteamGridDB не ответил",
                                                      message.split(": ", 1)[-1], 6000))
         worker.start()
         notify("info", self.win, "Ищу обложку в SteamGridDB", f"«{name}»", 2500)
 
-    def _on_griddb_cover(self, name, path):
-        if not path:
+    def _on_griddb_cover(self, name, result):
+        if not result:
             notify("info", self.win, "В SteamGridDB обложки нет",
                    f"«{name}»: вертикальной обложки там пока не выложили. Можно поставить свою.", 6000)
             return
         self.cover_changed(name)
-        notify("success", self.win, "Обложка заменена", f"«{name}» — из SteamGridDB.")
+        more = (" Не та — выберите «Обложка из SteamGridDB» ещё раз, будет следующая." if result["count"] > 1
+                else " Других вариантов там нет.")
+        notify("success", self.win, "Обложка заменена",
+               f"«{name}» — из SteamGridDB, вариант {result['index'] + 1} из {result['count']}.{more}", 5000)
 
     def refresh(self):
         query = self.search.text().casefold().strip()
         self.list.clear()
         self.grid.clear()
         tile = CoverTileDelegate.COVER
-        for game in sorted(self.win.library.games, key=lambda g: g["name"].casefold()):
+        for game in sort_games(self.win.library.games, self.sort_box.mode()):
             if query and query not in game["name"].casefold():
                 continue
             for view in (self.list, self.grid):
@@ -7223,18 +7782,18 @@ class MusicPage(QWidget):
         left.addWidget(self.sync_button)
         left.addWidget(self.buy_button)
 
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
-        actions.addWidget(self.listen_button)
-        actions.addWidget(self.game_button)
-        actions.addStretch(1)
-        actions.addWidget(self.remove_button)
+        # В узком окне кнопки альбома переносятся на вторую строку, а не сжимаются
+        actions_box = QWidget(self)
+        actions = CenteredFlowLayout(actions_box, spacing=8, center=False)
+        for button in (self.listen_button, self.game_button, self.remove_button):
+            actions.addWidget(button)
+        self.album_actions = actions
         info = QVBoxLayout()
         info.setSpacing(4)
         info.addWidget(self.album_title)
         info.addWidget(self.album_caption)
         info.addStretch(1)
-        info.addLayout(actions)
+        info.addWidget(actions_box)
         header = QHBoxLayout()
         header.setSpacing(18)
         header.addWidget(self.album_cover, 0, Qt.AlignTop)
@@ -7400,7 +7959,7 @@ class MusicPage(QWidget):
         """Квадратная картинка для списка и плеера. Широкие шапки Steam вписываем целиком, остальное обрезаем."""
         key = (path, size)
         if key not in self._pixmaps:
-            pixmap = QPixmap(path) if path else QPixmap()
+            pixmap = QPixmap.fromImage(QImage(path)) if path else QPixmap()  # файл мог смениться под тем же именем
             if not pixmap.isNull():
                 ratio = self.devicePixelRatioF()
                 side = round(size * ratio)
@@ -7474,6 +8033,7 @@ class MusicPage(QWidget):
         self.listen_button.setText("Скачать в Steam" if store else "Слушать")
         self.listen_button.setIcon(FIF.DOWNLOAD if store else FIF.PLAY)
         self.listen_button.setEnabled(store or bool(tracks))
+        self.album_actions.invalidate()  # кнопки появились или спрятались — перенос по строкам заново
         self._mark_tracks()
         self._update_backdrop()
 
@@ -8095,11 +8655,11 @@ class SettingsPage(QWidget):
         grid_button = PushButton("Ключ SteamGridDB", self, FIF.PHOTO)
         grid_button.setToolTip("Что даёт ключ SteamGridDB и как его получить — по шагам, с проверкой ключа")
         grid_button.clicked.connect(self.win.run_griddb_setup)
-        key_buttons = QHBoxLayout()
-        key_buttons.setSpacing(8)
+        # Кнопки — с переносом строк: в окне на половину экрана они не сжимаются и не обрезают надписи
+        key_buttons = QWidget(self)
+        key_flow = CenteredFlowLayout(key_buttons, spacing=8, center=False)
         for button in (self.save_button, login_button, grid_button, forget_button):
-            key_buttons.addWidget(button)
-        key_buttons.addStretch(1)
+            key_flow.addWidget(button)
 
         keys = QGridLayout()
         keys.setHorizontalSpacing(16)
@@ -8136,11 +8696,10 @@ class SettingsPage(QWidget):
         choose_folder = PushButton("Папка…", self, FIF.FOLDER)
         choose_folder.setToolTip("Все треки из папки и подпапок")
         choose_folder.clicked.connect(self.choose_music_folder)
-        music_buttons = QHBoxLayout()
-        music_buttons.setSpacing(8)
+        music_buttons = QWidget(self)
+        music_flow = CenteredFlowLayout(music_buttons, spacing=8, center=False)
         for button in (builtin_button, self.custom_button, choose_file, choose_folder):
-            music_buttons.addWidget(button)
-        music_buttons.addStretch(1)
+            music_flow.addWidget(button)
 
         self.sounds_switch = SwitchButton(self)
         self.sounds_switch.setOnText("Вкл")
@@ -8153,7 +8712,7 @@ class SettingsPage(QWidget):
         sound.setVerticalSpacing(8)
         sound.addWidget(BodyLabel("Музыка", self), 0, 0)
         sound.addWidget(self.music_edit, 0, 1)
-        sound.addLayout(music_buttons, 1, 1)
+        sound.addWidget(music_buttons, 1, 1, 1, 2)
         sound.addWidget(CaptionLabel("Саундтреки Steam, громкость и плеер — на вкладке «Саундтреки». "
                                      "Пауза, треки и «вперемешку» — кнопками справа вверху на рулетке.", self),
                         2, 1)
@@ -8177,6 +8736,20 @@ class SettingsPage(QWidget):
         appearance.addSpacing(16)
         appearance.addWidget(self.theme_box)
         appearance.addStretch(1)
+        # Подложка из выделенных игр — кому-то она мешает, поэтому выключается
+        self.selection_switch = SwitchButton(self)
+        self.selection_switch.setOnText("Вкл")
+        self.selection_switch.setOffText("Выкл")
+        self.selection_switch.setChecked(bool(settings.get("selection_backdrop", True)))
+        self.selection_switch.checkedChanged.connect(self.set_selection_backdrop)
+        selection_row = QHBoxLayout()
+        selection_row.addWidget(BodyLabel("Подложка из выделенных игр", self))
+        selection_row.addSpacing(16)
+        selection_row.addWidget(self.selection_switch)
+        selection_row.addStretch(1)
+        selection_hint = CaptionLabel("Выделили игру на вкладке с играми — за списком её обложка под матовым "
+                                      "стеклом, несколько — коллаж из их обложек", self)
+        selection_hint.setWordWrap(True)
 
         # Перевод описаний и отзывов: Google, а когда он не отвечает — модулем на этом ПК
         self.translate_box = ComboBox(self)
@@ -8244,7 +8817,7 @@ class SettingsPage(QWidget):
         layout.addSpacing(8)
         layout.addWidget(StrongBodyLabel("Ключи", self))
         layout.addLayout(keys)
-        layout.addLayout(key_buttons)
+        layout.addWidget(key_buttons)
         layout.addSpacing(16)
         layout.addWidget(StrongBodyLabel("Звук", self))
         layout.addLayout(sound)
@@ -8252,6 +8825,8 @@ class SettingsPage(QWidget):
         layout.addSpacing(16)
         layout.addWidget(StrongBodyLabel("Оформление", self))
         layout.addLayout(appearance)
+        layout.addLayout(selection_row)
+        layout.addWidget(selection_hint)
         layout.addSpacing(16)
         layout.addWidget(StrongBodyLabel("Перевод описаний", self))
         layout.addLayout(translate_row)
@@ -8281,6 +8856,13 @@ class SettingsPage(QWidget):
         core.save_settings(sounds_enabled=enabled)
         if enabled:
             self.win.sounds.win()  # пример звука
+
+    def set_selection_backdrop(self, enabled):
+        self.win.settings["selection_backdrop"] = enabled
+        core.save_settings(selection_backdrop=enabled)
+        core.log.info("Подложка из выделенных игр: %s", "включена" if enabled else "выключена")
+        for backdrop in SelectionBackdrop.instances:
+            backdrop.apply_setting()
 
     # --- Фоновая музыка ---
     def update_music(self):
@@ -8569,125 +9151,2762 @@ class AboutPage(QWidget):
         layout.addStretch(1)
 
 
-# --- Страница «Игры Native Port's» (пока строится) --------------------------
-class RoadWorksArt(QWidget):
-    """Картинка «дорожные работы»: полосатый барьер с мигающим фонарём и дорожный конус. Рисуется сама —
-    без файлов и скачиваний, и в тёмной, и в светлой теме."""
+# --- Страница «Игры Native Port's» ------------------------------------------
+def _port_fingerprints(items):
+    """Отпечатки файлов запуска для новых портов: [отпечаток или {"error": текст}]. В фоновом потоке."""
+    result = []
+    for item in items:
+        try:
+            result.append(core.port_fingerprint(item))
+        except OSError as e:
+            result.append({"error": str(e)})
+    return result
 
-    ORANGE = QColor(255, 140, 0)
-    WHITE_STRIPE = QColor(250, 250, 250)
 
-    def __init__(self, parent=None):
+def text_key(text):
+    """Короткий ключ текста — под ним хранится его перевод."""
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _translate_texts(texts):
+    """Перевод описаний с GitHub на русский: {"done": {ключ: перевод}, "tried": [ключи]}. В фоновом потоке."""
+    done = {}
+    for text in texts:
+        translated = core.translate_port_text(text)
+        if translated:
+            done[text_key(text)] = translated
+    return {"done": done, "tried": [text_key(t) for t in texts]}
+
+
+def plain_label(text, parent, caption=False, selectable=False):
+    """Подпись с переносом строк и только обычным текстом: тексты с GitHub — не разметка (QLabel иначе сам
+    угадывает HTML и показал бы чужие ссылки и картинки)."""
+    label = (CaptionLabel if caption else BodyLabel)(text, parent)
+    label.setTextFormat(Qt.PlainText)
+    label.setWordWrap(True)
+    if selectable:
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    return label
+
+
+class PortScanDialog(MessageBoxBase):
+    """Игры, найденные в папке (порты или дисковые): какие добавить и каким файлом каждая запускается."""
+
+    WIDTH = 620
+
+    def __init__(self, parent, scan, title="Найдены порты", github=True):
         super().__init__(parent)
-        self.setFixedSize(360, 230)
-        self.lamp_on = True
-        self.timer = QTimer(self)
-        self.timer.setInterval(600)
-        self.timer.timeout.connect(self._blink)
+        self.rows = []
+        found, empty = scan["found"], scan["empty"]
+        self.viewLayout.addWidget(SubtitleLabel(title, self))
+        parts = [f"Найдено: {len(found)}"]
+        if scan["known"]:
+            parts.append(f"уже в списке: {scan['known']}")
+        if empty:
+            parts.append(f"без файла запуска: {len(empty)} ({', '.join(empty[:4])}{'…' if len(empty) > 4 else ''})")
+        self.viewLayout.addWidget(plain_label(
+            " · ".join(parts) + ". Отметьте, какие добавить, и проверьте файл запуска. Программа ничего "
+            "не запускала — только посмотрела, какие .exe лежат в папках.", self, caption=True))
 
-    def _blink(self):
-        self.lamp_on = not self.lamp_on
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(0, 0, 14, 0)  # справа — место под полосу прокрутки
+        layout.setSpacing(4)
+        for port in found:
+            box = CheckBox(port["name"], body)
+            box.setChecked(True)
+            box.stateChanged.connect(self._update)
+            exe = ComboBox(body)
+            exe.addItems(port["exes"])
+            exe.setFixedWidth(260)
+            exe.setToolTip("Каким файлом запускается игра. Первым стоит самый вероятный")
+            row = QHBoxLayout()
+            row.setSpacing(12)
+            row.addWidget(box, 1)
+            row.addWidget(exe)
+            layout.addLayout(row)
+            note = os.path.basename(port["folder"]) + (f" · GitHub: {port['repo']}" if port["repo"] else "")
+            caption = plain_label(note, body, caption=True)
+            caption.setContentsMargins(28, 0, 0, 8)
+            layout.addWidget(caption)
+            self.rows.append((port, box, exe))
+        layout.addStretch(1)
+        scroll = ScrollArea(self)
+        scroll.setWidget(body)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget {background: transparent; border: none}")
+        scroll.setFixedHeight(min(layout.totalHeightForWidth(self.WIDTH) + 8, max(240, parent.height() - 320)))
+        self.viewLayout.addWidget(scroll)
+        if github:
+            self.viewLayout.addWidget(plain_label(
+                "Ссылку на проект порта на GitHub — для проверки обновлений — можно добавить потом: правый клик по "
+                "порту → «Изменить…».", self, caption=True))
+        self.widget.setMinimumWidth(self.WIDTH + 48)
+        self.widget.setMaximumWidth(self.WIDTH + 48)
+        self.cancelButton.setText("Отмена")
+        self._update()
+
+    def _update(self, *_):
+        count = len(self.selected())
+        self.yesButton.setText(f"Добавить ({count})" if count else "Добавить")
+        self.yesButton.setEnabled(bool(count))
+
+    def selected(self):
+        return [{"name": port["name"], "folder": port["folder"], "exe": exe.currentText(), "repo": port["repo"] or ""}
+                for port, box, exe in self.rows if box.isChecked()]
+
+
+class PortEditDialog(MessageBoxBase):
+    """Порт: название, папка, файл запуска и ссылка на его проект на GitHub — для проверки обновлений.
+
+    Новую ссылку окно проверяет у GitHub, прежде чем сохранить: с опечаткой в ссылке порт потерял бы сведения
+    о версиях. «Найти на GitHub» — поиск проектов по названию; выбирает из них пользователь."""
+
+    def __init__(self, parent, port, title, find_repo=False, github=True):
+        super().__init__(parent)
+        self.win = parent
+        self.github = github
+        self.folder = port["folder"]
+        self.initial_repo = port.get("repo") or ""
+        self.result_port = None
+        self._closed = False
+        self._checking = False
+        self.viewLayout.addWidget(SubtitleLabel(title, self))
+
+        self.name_edit = LineEdit(self)
+        self.name_edit.setText(port["name"])
+        self.folder_label = plain_label(self.folder, self, caption=True)
+        folder_button = TransparentPushButton("Другая папка…", self, FIF.FOLDER)
+        folder_button.clicked.connect(self._choose_folder)
+        self.exe_box = ComboBox(self)
+        self.exe_box.setMinimumWidth(300)
+        exes = list(port.get("exes") or [])
+        if port.get("exe") and port["exe"] not in exes:
+            exes.insert(0, port["exe"])
+        self.exe_box.addItems(exes)
+        if port.get("exe"):
+            self.exe_box.setCurrentText(port["exe"])
+        exe_button = TransparentPushButton("Другой файл…", self, FIF.APPLICATION)
+        exe_button.clicked.connect(self._choose_exe)
+        self.repo_edit = LineEdit(self)
+        self.repo_edit.setPlaceholderText("github.com/автор/проект — страница проекта или его релизов")
+        self.repo_edit.setClearButtonEnabled(True)
+        if port.get("repo"):
+            self.repo_edit.setText(f"https://github.com/{port['repo']}")
+        self.search_button = TransparentPushButton("Найти на GitHub", self, FIF.SEARCH)
+        self.search_button.setToolTip("Поиск проектов на GitHub по названию игры — выберите подходящий из списка")
+        self.search_button.clicked.connect(self._search_github)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+        form.addWidget(BodyLabel("Название", self), 0, 0)
+        form.addWidget(self.name_edit, 0, 1, 1, 2)
+        form.addWidget(BodyLabel("Папка", self), 1, 0)
+        form.addWidget(self.folder_label, 1, 1)
+        form.addWidget(folder_button, 1, 2)
+        form.addWidget(BodyLabel("Запуск", self), 2, 0)
+        form.addWidget(self.exe_box, 2, 1)
+        form.addWidget(exe_button, 2, 2)
+        if github:
+            form.addWidget(BodyLabel("GitHub", self), 3, 0)
+            form.addWidget(self.repo_edit, 3, 1)
+            form.addWidget(self.search_button, 3, 2)
+        else:  # у дисковых игр GitHub нет — поле не показываем
+            self.repo_edit.hide()
+            self.search_button.hide()
+        form.setColumnStretch(1, 1)
+        self.viewLayout.addLayout(form)
+        self.viewLayout.addWidget(plain_label(
+            "Обложка, фон и логотип ищутся в SteamGridDB по названию. По ссылке на GitHub программа раз в несколько "
+            "часов смотрит, вышла ли новая версия, и сообщает о ней. Скачиваете и ставите обновление вы сами — "
+            "программа ничего не качает и не запускает. Ссылку можно не указывать." if github else
+            "Обложка, фон и логотип ищутся в SteamGridDB по названию — если игра нашлась не та, поправьте "
+            "название. Запускается только выбранный файл из папки игры.", self, caption=True))
+        self.status = plain_label("", self, caption=True)
+        self.status.setTextColor(*WARNING_TEXT)
+        self.status.hide()
+        self.viewLayout.addWidget(self.status)
+
+        self.widget.setMinimumWidth(640)
+        self.widget.setMaximumWidth(640)
+        self.yesButton.setText("Сохранить")
+        self.yesButton.clicked.disconnect()
+        self.yesButton.clicked.connect(self._save)
+        self.cancelButton.setText("Отмена")
+        if find_repo and not self.initial_repo and os.path.isdir(self.folder):
+            # Ссылки нет — пока окно открыто, ищем её в файлах порта (настройки, сами .exe)
+            self.status.setText("Ищу ссылку на GitHub в файлах порта…")
+            self.status.setTextColor(QColor(0, 0, 0, 160), QColor(255, 255, 255, 170))
+            self.status.show()
+            worker = Worker(core.scan_port_folder, self.folder, parent=self.win)
+            worker.finished.connect(self._on_repo_hint)
+            worker.failed.connect(lambda _message: not self._closed and self.status.hide())
+            worker.start()
+
+    def _on_repo_hint(self, found):
+        if self._closed:
+            return
+        self.status.setTextColor(*WARNING_TEXT)
+        repo = (found or {}).get("repo")
+        if repo and not self.repo_edit.text().strip():
+            self.repo_edit.setText(f"https://github.com/{repo}")
+            self.status.setText("Ссылка найдена в файлах порта — проверьте, что это его проект, и сохраните.")
+        elif not self.repo_edit.text().strip():
+            self.status.setText("В файлах порта ссылки нет. Нажмите «Найти на GitHub» или вставьте её сами.")
+        else:
+            self.status.hide()
+
+    def _warn(self, text):
+        self.status.setText(text)
+        self.status.show()
+
+    def done(self, code):
+        self._closed = True  # опоздавшие ответы GitHub больше не нужны
+        super().done(code)
+
+    def _choose_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Папка порта", self.folder)
+        if not folder:
+            return
+        found = core.scan_port_folder(folder, hint=False)
+        if not found:
+            self._warn("В этой папке нет файлов .exe — выберите папку, где лежит сама игра.")
+            return
+        self.folder = found["folder"]
+        self.folder_label.setText(self.folder)
+        self.exe_box.clear()
+        self.exe_box.addItems(found["exes"])
+        self.status.hide()
+
+    def _choose_exe(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Файл запуска игры", self.folder, "Программы (*.exe)")
+        if not path:
+            return
+        try:
+            rel = os.path.relpath(os.path.normpath(path), self.folder)
+        except ValueError:  # другой диск
+            rel = ".."
+        if rel.startswith("..") or os.path.isabs(rel):
+            self._warn("Файл запуска должен лежать в папке порта (или в её подпапке).")
+            return
+        if self.exe_box.findText(rel) < 0:
+            self.exe_box.addItem(rel)
+        self.exe_box.setCurrentText(rel)
+        self.status.hide()
+
+    # --- Поиск проекта на GitHub ---
+    def _search_github(self):
+        name = core.clean_name(self.name_edit.text())
+        if not name:
+            self._warn("Сначала впишите название игры — по нему и ищем.")
+            return
+        self.search_button.setEnabled(False)
+        self.search_button.setText("Ищу…")
+        worker = Worker(core.search_port_repos, name, parent=self.win)  # окно могут закрыть раньше ответа
+        worker.finished.connect(self._on_found)
+        worker.failed.connect(self._on_search_failed)
+        worker.start()
+
+    def _end_search(self):
+        self.search_button.setEnabled(True)
+        self.search_button.setText("Найти на GitHub")
+
+    def _on_found(self, found):
+        if self._closed:
+            return
+        self._end_search()
+        if not found:
+            self._warn("На GitHub ничего похожего не нашлось. Попробуйте название по-английски или вставьте "
+                       "ссылку сами.")
+            return
+        self.status.hide()
+        menu = RoundMenu(parent=self)
+        for item in found:
+            text = f"{item['repo']}  ★ {item['stars']}" + (f" — {item['description'][:70]}" if item["description"] else "")
+            action = Action(FIF.GITHUB, text, menu)
+            action.triggered.connect(lambda _=False, repo=item["repo"]: self.repo_edit.setText(f"https://github.com/{repo}"))
+            menu.addAction(action)
+        menu.exec(self.search_button.mapToGlobal(self.search_button.rect().bottomLeft()))
+
+    def _on_search_failed(self, message):
+        if self._closed:
+            return
+        self._end_search()
+        self._warn("GitHub не ответил: " + message.split(": ", 1)[-1])
+
+    # --- Сохранение ---
+    def _save(self):
+        if self._checking:
+            return
+        name = core.title_name(self.name_edit.text())  # двоеточие и знаки остаются: по ним точнее поиск картинок
+        exe = self.exe_box.currentText()
+        repo_text = self.repo_edit.text().strip() if self.github else ""
+        repo = core.parse_github_repo(repo_text) if repo_text else ""
+        if not name:
+            self._warn("Впишите название игры.")
+        elif not exe:
+            self._warn("Выберите файл, которым запускается игра.")
+        elif repo_text and not repo:
+            self._warn("Это не похоже на ссылку на проект GitHub. Нужна ссылка вида github.com/автор/проект.")
+        elif repo and repo.casefold() != self.initial_repo.casefold():
+            self._check_repo(name, exe, repo)  # новая ссылка — сначала спросим GitHub, есть ли такой проект
+        else:
+            self.result_port = {"name": name, "folder": self.folder, "exe": exe, "repo": repo}
+            self.accept()
+
+    def _check_repo(self, name, exe, repo):
+        self._checking = True
+        self.yesButton.setEnabled(False)
+        self.yesButton.setText("Проверяю ссылку…")
+        self.status.hide()
+        worker = Worker(core.fetch_port_about, repo, parent=self.win)
+        worker.finished.connect(lambda about: self._on_repo_checked(name, exe, about))
+        worker.failed.connect(lambda message: self._on_repo_failed(name, exe, repo, message))
+        worker.start()
+
+    def _end_check(self):
+        self._checking = False
+        self.yesButton.setEnabled(True)
+        self.yesButton.setText("Сохранить")
+
+    def _on_repo_checked(self, name, exe, about):
+        if self._closed:
+            return
+        self._end_check()
+        self.result_port = {"name": name, "folder": self.folder, "exe": exe, "repo": about["repo"], "about": about}
+        self.accept()
+
+    def _on_repo_failed(self, name, exe, repo, message):
+        if self._closed:
+            return
+        self._end_check()
+        text = message.split(": ", 1)[-1]
+        if message.startswith("GitHubMissing"):
+            self._warn(f"{text[:1].upper()}{text[1:]}. Ссылка не сохранена — исправьте её или сотрите.")
+            return
+        # GitHub не ответил или просит подождать — ссылку сохраняем, проверка обновлений покажет, если она неверна
+        core.log.info("Ссылку на GitHub для «%s» не проверить сейчас (%s) — сохраняю как есть", name, text)
+        self.result_port = {"name": name, "folder": self.folder, "exe": exe, "repo": repo}
+        self.accept()
+
+
+class PortTileDelegate(CoverTileDelegate):
+    """Плитка порта — как у игр Steam, а если на GitHub вышла новая версия, в углу обложки кружок со стрелкой."""
+
+    UPDATE_ROLE = Qt.UserRole + 2
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if not index.data(self.UPDATE_ROLE):
+            return
+        rect = QRectF(option.rect)
+        right = rect.x() + (rect.width() + self.COVER.width()) / 2
+        center = QPointF(right - 16, rect.y() + self.PAD + 16)
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(WHITE, 2))
+        painter.setBrush(themeColor())
+        painter.drawEllipse(center, 12, 12)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(WHITE)
+        x, y = center.x(), center.y()
+        painter.drawPolygon(QPolygonF([QPointF(x, y - 7), QPointF(x + 6, y), QPointF(x + 2.2, y),
+                                       QPointF(x + 2.2, y + 6), QPointF(x - 2.2, y + 6), QPointF(x - 2.2, y),
+                                       QPointF(x - 6, y)]))
+        painter.restore()
+
+
+def hltb_url(name):
+    """Поиск игры на How Long To Beat — сколько её проходить."""
+    return f"https://howlongtobeat.com/?q={quote_plus(name)}"
+
+
+# Сайты, которые во встроенном браузере ломаются: How Long To Beat при прокрутке становится чёрным (из-за его
+# рекламы — флаги отрисовки Chromium не помогают). Их программа всегда открывает во внешнем браузере.
+EXTERNAL_ONLY_HOSTS = ("howlongtobeat.com",)
+
+
+def external_only(url):
+    host = QUrl(url).host().lower()
+    return any(host == h or host.endswith("." + h) for h in EXTERNAL_ONLY_HOSTS)
+
+
+def link_choice(win, url):
+    """Где открыть ссылку: «inside» | «outside» — как выбрано в «Настройках», а если там «Спрашивать» —
+    спрашиваем окном. None — окно закрыли без выбора."""
+    choice = core.load_settings().get("link_open", "ask")
+    if choice in ("inside", "outside"):
+        return choice
+    dialog = LinkDialog(win, url)
+    core.log.info("Открыто окно «Открыть ссылку»: %s", url)
+    dialog.exec()
+    choice = dialog.choice
+    core.log.info("Окно «Открыть ссылку» закрыто: %s%s", choice or "отмена",
+                  ", больше не спрашивать" if choice and dialog.remember_box.isChecked() else "")
+    if choice and dialog.remember_box.isChecked():
+        core.save_settings(link_open=choice)
+        win.settings_page.show_link_mode(choice)
+    return choice
+
+
+def pcgamingwiki_url(name):
+    """Статья об игре на PCGamingWiki: как запустить старую игру на современной системе, патчи, широкий экран.
+    Поиск по названию: если статья с таким названием есть, сайт сразу открывает её."""
+    return f"https://www.pcgamingwiki.com/w/index.php?search={quote_plus(name)}&title=Special%3ASearch&go=Go"
+
+
+class PortPage(QWidget):
+    """Страница порта: шапка с фоном и логотипом (из SteamGridDB, по названию), кнопки, версии и что нового
+    в последнем релизе на GitHub.
+
+    У дисковой игры вместо GitHub — описание: из магазина Steam, если игру связали с ним («Найти в Steam»; там же
+    оценки, отзывы и обзоры изданий), а если её в Steam нет — начало статьи из Википедии."""
+
+    SIDE_MARGIN, CONTENT_WIDTH, TEXT_WIDTH = GamePage.SIDE_MARGIN, GamePage.CONTENT_WIDTH, GamePage.TEXT_WIDTH
+    ABOUT_TTL = 7 * 24 * 3600  # описание проекта с GitHub — раз в неделю
+    WIKI_TTL = 30 * 24 * 3600  # статья из Википедии — раз в месяц (и сразу, если игру переименовали)
+    WIKI_VERSION = 3  # 3: «007» — не номер части; статьи, найденные (и не найденные) раньше, ищутся заново
+
+    def __init__(self, ports_page):
+        super().__init__()
+        self.ports_page, self.win = ports_page, ports_page.win
+        self.port = None
+        self.origin = None  # коллекция, из которой открыли игру, — для кнопки «К коллекции»
+        self._token = 0
+        # Дисковая игра, связанная со Steam: карточка магазина (None — ещё не пришла, {} — у Steam её нет)
+        # и отзывы игроков. Хранятся только пока открыта страница — у Steam свой кэш карточек
+        self.store, self.store_reviews = None, None
+        self._store_translating = self._wiki_loading = False
+        self.press_links = []
+        self.backdrop = None
+        self.backdrop_opacity = 0.0
+        self.backdrop_anim = QVariantAnimation(self)
+        self.backdrop_anim.setDuration(900)
+        self.backdrop_anim.setStartValue(0.0)
+        self.backdrop_anim.setEndValue(1.0)
+        self.backdrop_anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.backdrop_anim.valueChanged.connect(self._set_backdrop_opacity)
+
+        self.header = HeroHeader(self)
+        self.header.artRequested.connect(lambda kind, step: self.port and step_art(self, self.port, kind, step))
+        self.play_button = PrimaryPushButton("Играть", self, FIF.PLAY)
+        self.play_button.clicked.connect(lambda: self.ports_page.launch(self.port))
+        self.update_button = PrimaryPushButton("Скачать обновление", self, FIF.DOWNLOAD)
+        self.update_button.setToolTip("Страница нового релиза на GitHub — в браузере. Скачиваете и ставите вы сами")
+        self.update_button.clicked.connect(lambda: self.ports_page.open_release(self.port))
+        self.updated_button = PushButton("Я обновил", self, FIF.ACCEPT)
+        self.updated_button.setToolTip("Отметить, что у вас уже стоит последняя версия")
+        self.updated_button.clicked.connect(lambda: self.ports_page.mark_updated(self.port))
+        self.repo_button = PushButton("Проект на GitHub", self, FIF.GITHUB)
+        self.repo_button.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(f"https://github.com/{self.port['repo']}")))
+        self.folder_button = PushButton("Открыть папку", self, FIF.FOLDER)
+        self.folder_button.clicked.connect(lambda: self.ports_page.open_folder(self.port))
+        self.edit_button = PushButton("Изменить…", self, fluent_icon("EDIT", FIF.SETTING))
+        self.edit_button.clicked.connect(lambda: self.ports_page.edit(self.port))
+        self.cover_button = PushButton("Своя обложка", self, FIF.PHOTO)
+        self.cover_button.clicked.connect(lambda: self.win.library_page.choose_cover(self.port))
+        self.spin_button = PushButton("Крутить ещё", self, FIF.SYNC)
+        self.spin_button.clicked.connect(self._spin_again)
+        self.steam_button = PushButton("Найти в Steam", self, FIF.SEARCH)
+        self.steam_button.setToolTip("Найдите игру в магазине Steam — здесь появятся её описание, оценки и отзывы. "
+                                     "Запускаться она будет по-прежнему своим файлом")
+        self.steam_button.clicked.connect(lambda: self.ports_page.link_steam(self.port))
+        back_button = TransparentPushButton(ports_page.T["back"], self, FIF.LEFT_ARROW)
+        back_button.clicked.connect(self.ports_page.show_list)
+        # Открыли из коллекции — можно вернуться и туда
+        self.collection_button = TransparentPushButton("К коллекции", self, fluent_icon("ALBUM", FIF.FOLDER))
+        self.collection_button.clicked.connect(self.win.back_to_collection)
+        self.collection_button.hide()
+        buttons_box = QWidget(self)
+        self.buttons = CenteredFlowLayout(buttons_box, spacing=12)
+        for button in (self.play_button, self.update_button, self.updated_button, self.repo_button, self.steam_button,
+                       self.folder_button, self.edit_button, self.cover_button, self.spin_button,
+                       self.collection_button, back_button):
+            self.buttons.addWidget(button)
+
+        self.chips_box = QWidget(self)
+        self.chips = CenteredFlowLayout(self.chips_box, spacing=10)
+
+        self.about_box = QWidget(self)
+        about = QVBoxLayout(self.about_box)
+        about.setContentsMargins(0, 0, 0, 0)
+        about.setSpacing(8)
+        self.about_title = SubtitleLabel("О проекте", self.about_box)
+        self.description = plain_label("", self.about_box, selectable=True)
+        self.description.setFont(resized_font(self.description.font(), 2))
+        self.notes_title = SubtitleLabel("", self.about_box)
+        self.notes = plain_label("", self.about_box, selectable=True)
+        # Тексты с GitHub обычно по-английски — переводятся теми же средствами, что описания игр Steam
+        self.translated_note = CaptionLabel("", self.about_box)
+        self.original_button = TransparentPushButton("Показать оригинал", self.about_box,
+                                                     fluent_icon("LANGUAGE", FIF.GLOBE))
+        self.original_button.clicked.connect(self._toggle_original)
+        translate_row = QHBoxLayout()
+        translate_row.setContentsMargins(0, 0, 0, 0)
+        translate_row.addWidget(self.translated_note)
+        translate_row.addWidget(self.original_button)
+        translate_row.addStretch(1)
+        self.hint = plain_label("", self.about_box, caption=True)
+        self.source_note = plain_label("", self.about_box, caption=True)  # откуда описание дисковой игры
+        # Что пишут игроки — у дисковой игры, связанной со Steam, как на странице игры Steam
+        self.players_title = SubtitleLabel("Что пишут игроки", self.about_box)
+        self.players_title.hide()
+        self.players_box = QVBoxLayout()
+        self.players_box.setSpacing(6)
+        for widget in (self.about_title, self.description, self.notes_title, self.notes):
+            about.addWidget(widget)
+        about.addLayout(translate_row)
+        about.addWidget(self.source_note)
+        about.addWidget(self.hint)
+        about.addSpacing(12)
+        about.addWidget(self.players_title)
+        about.addLayout(self.players_box)
+        # История версий — под спойлером; описания старых версий переводятся, когда спойлер раскрыли
+        self.history_box = Spoiler("История версий", self.about_box)
+        self.history_box.toggled.connect(lambda expanded: expanded and self._build_history())
+        about.addSpacing(8)
+        about.addWidget(self.history_box)
+        self._show_original = False
+        self._translating = set()  # ключи текстов, перевод которых уже просили за это открытие страницы
+        self._pending = set()  # и которые переводятся прямо сейчас
+        self._history_dirty = True
+
+        column = QWidget(self)
+        inner = QVBoxLayout(column)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(16)
+        inner.addWidget(buttons_box)
+        inner.addWidget(self.chips_box)
+        inner.addSpacing(8)
+        inner.addLayout(centered(self.about_box, self.TEXT_WIDTH))
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 24)
+        layout.setSpacing(16)
+        layout.addWidget(self.header)
+        sides = centered(column, self.CONTENT_WIDTH)
+        sides.setContentsMargins(self.SIDE_MARGIN, 0, self.SIDE_MARGIN, 0)
+        layout.addLayout(sides)
+        layout.addStretch(1)
+        self.scroll = ScrollArea(self)
+        self.scroll.setWidget(content)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget {background: transparent; border: none}")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self.scroll)
+
+    def show_port(self, port, keep_origin=False):
+        if not keep_origin:  # «Изменить…» и «Найти в Steam» перерисовывают ту же страницу — откуда открыли, не меняем
+            self.origin = self.win.game_origin
+        self._token += 1
+        self.port = port
+        self._translating = set()
+        self._pending = set()
+        self._history_dirty = True
+        self.history_box.set_expanded(False)
+        self.header.set_game(port["name"])
+        self.backdrop = None
+        self.backdrop_anim.stop()
+        self.update()
+        self.scroll.verticalScrollBar().setValue(0)
+        key = core.griddb_key()
+        for kind in core.ART_KINDS:
+            self._run(core.get_artwork, (dict(port), kind, key), lambda path, k=kind: self._on_art(k, path))
+        about = port.get("about") or {}
+        if port.get("repo") and time.time() - (about.get("fetched") or 0) > self.ABOUT_TTL:
+            self._run(core.fetch_port_about, (port["repo"],), self._on_about,
+                      lambda message: core.log.info("Описание порта «%s» с GitHub не загрузилось: %s",
+                                                    port["name"], message))
+        self.store, self.store_reviews, self.press_links = None, None, []
+        self._store_translating = self._wiki_loading = False
+        clear_layout(self.players_box)
+        self.players_title.hide()
+        if not self.ports_page.GITHUB:
+            if port.get("appid"):  # связана со Steam — описание, оценки и отзывы оттуда
+                self._run(core.get_game_details, (port["appid"],), self._on_store_details,
+                          lambda message: self._on_store_details(None, message))
+                self._run(core.get_reviews, (port["appid"],), self._on_store_reviews,
+                          lambda message: core.log.warning("Отзывы Steam не загрузились: %s", message))
+            else:
+                self._load_wiki()
+        self.refresh()
+
+    def _run(self, fn, args, on_done, on_fail=None):
+        token = self._token
+        worker = Worker(fn, *args, parent=self)
+        worker.finished.connect(lambda result: token == self._token and on_done(result))
+        if on_fail:
+            worker.failed.connect(lambda message: token == self._token and on_fail(message))
+        worker.start()
+
+    def _on_art(self, kind, path):
+        pixmap = QPixmap.fromImage(QImage(path)) if path else QPixmap()  # файл мог смениться под тем же именем
+        if pixmap.isNull():
+            return
+        if kind == "hero":
+            self.header.set_hero(pixmap)
+            self._run(core.make_backdrop, (path,), self._on_backdrop)
+        else:
+            self.header.set_logo(pixmap)
+
+    def _on_about(self, about):
+        if self.port is None:
+            return
+        self.port["about"] = about
+        self.ports_page.save()
+        self.refresh()
+
+    # --- Дисковая игра: описание из Steam или из Википедии ---
+    def _on_store_details(self, details, error=None):
+        """Карточка магазина Steam пришла. Нет её (сняли с продажи) или Steam не ответил — описание из Википедии."""
+        if error:
+            core.log.warning("Страница Steam для «%s» не загрузилась: %s", self.port["name"], error)
+        self.store = details or {}
+        if details:
+            name = self.port["name"]
+            self.press_links = [(title, f"https://www.google.com/search?q={quote_plus(f'site:{site} {name} обзор')}")
+                                for title, site in REVIEW_SITES]
+            if core.needs_translation(details) and core.translation_enabled():
+                self._store_translating = True  # пока показываем оригинал, перевод подставим, когда придёт
+                self._run(core.translate_details, (details,), self._on_store_translated,
+                          lambda message: self._on_store_translated(None))
+        else:
+            self._load_wiki()
+        self.refresh()
+
+    def _on_store_translated(self, details):
+        self._store_translating = False
+        if details:
+            self.store = dict(details, translated=True)
+        self.refresh()
+
+    def _on_store_reviews(self, reviews):
+        self.store_reviews = reviews or None
+        clear_layout(self.players_box)
+        excerpts = (reviews or {}).get("excerpts") or []
+        self.players_title.setVisible(bool(excerpts))
+        for review in excerpts:
+            verdict = "👍 Рекомендует" if review["up"] else "👎 Не рекомендует"
+            meta = f"{verdict} · {review['hours']:g} ч в игре".replace(".", ",")
+            if review.get("translated"):
+                meta += " · переведено"
+            self.players_box.addWidget(plain_label(meta, self.about_box, caption=True))
+            self.players_box.addWidget(plain_label(f"«{review['text']}»", self.about_box))
+            self.players_box.addSpacing(10)
+        self.refresh()
+
+    def _wiki(self):
+        """Статья из Википедии для этого названия игры, если нашлась."""
+        wiki = self.port.get("wiki") or {}
+        fresh = wiki.get("v") == self.WIKI_VERSION and wiki.get("query") == self.port["name"]
+        return wiki if fresh and wiki.get("found") else None
+
+    def _load_wiki(self):
+        """Описание из Википедии — раз в WIKI_TTL; переименовали игру — сразу заново, по новому названию."""
+        wiki = self.port.get("wiki") or {}
+        if (wiki.get("v") == self.WIKI_VERSION and wiki.get("query") == self.port["name"]
+                and time.time() - (wiki.get("fetched") or 0) < self.WIKI_TTL):
+            return
+        name = self.port["name"]
+        self._wiki_loading = True
+        self._run(core.fetch_wiki_summary, (name,), lambda found: self._on_wiki(name, found),
+                  lambda message: self._on_wiki_failed(name, message))
+
+    def _on_wiki(self, name, found):
+        self._wiki_loading = False
+        self.port["wiki"] = dict(found or {}, query=name, found=bool(found), fetched=int(time.time()),
+                                 v=self.WIKI_VERSION)
+        self.ports_page.save()
+        self.refresh()
+
+    def _on_wiki_failed(self, name, message):
+        self._wiki_loading = False
+        core.log.info("Описание «%s» из Википедии не загрузилось: %s", name, message)
+        self.refresh()
+
+    def refresh(self):
+        """Кнопки, плашки и тексты — по тому, что известно о порте сейчас."""
+        port = self.port
+        if port is None:
+            return
+        disc = not self.ports_page.GITHUB
+        latest = port.get("latest") or {}
+        update = core.port_has_update(port)
+        self.update_button.setVisible(update)
+        self.updated_button.setVisible(update)
+        self.repo_button.setVisible(bool(port.get("repo")))
+        self.steam_button.setVisible(disc and not port.get("appid"))
+        origin = self.origin
+        self.collection_button.setVisible(origin is not None)
+        if origin is not None:
+            self.collection_button.setText(f"К коллекции «{origin['name']}»")
+        # «Крутить ещё» — когда эта игра сама крутится в рулетке
+        self.spin_button.setVisible(any(g is port for g in self.win.roulette_games()))
+        self.buttons.invalidate()
+
+        # Дисковая игра: карточка Steam (если связана и Steam её отдал), иначе статья из Википедии
+        store = (self.store or None) if disc and port.get("appid") else None
+        wiki = self._wiki() if disc and not store else None
+        loading = bool(disc and not store and not wiki and (
+            (port.get("appid") and self.store is None) or self._wiki_loading))
+
+        clear_layout(self.chips)
+        chips = [InfoChip("Запуск", os.path.basename(port["exe"]), None, self.chips_box)]
+        if self.win.play_tracker.playing(port):
+            chips.append(InfoChip("Наиграно", "играете сейчас", None, self.chips_box))
+        elif port.get("playtime"):
+            played = core.playtime_text(port["playtime"])
+            if port.get("last_played"):
+                played += " · последний раз " + time.strftime("%d.%m.%Y", time.localtime(port["last_played"]))
+            chips.append(InfoChip("Наиграно", played, None, self.chips_box))
+        if port.get("installed_tag"):
+            chips.append(InfoChip("Версия у вас", port["installed_tag"], None, self.chips_box))
+        if latest.get("tag"):
+            value = latest["tag"] + (f" · {latest['published']}" if latest.get("published") else "")
+            chips.append(InfoChip("Последняя на GitHub", value, latest.get("url"), self.chips_box))
+        if store:
+            release = (store.get("release_date") or "") + (" (ещё не вышла)" if store.get("coming_soon") else "")
+            for caption, value in (("Жанры", ", ".join(store.get("genres") or [])), ("Дата выхода", release),
+                                   ("Разработчик", ", ".join(store.get("developers") or []))):
+                if value.strip():
+                    chips.append(InfoChip(caption, value, None, self.chips_box))
+            reviews = self.store_reviews or {}
+            if reviews.get("total"):
+                percent = round(100 * reviews["positive"] / reviews["total"])
+                count = f"{reviews['total']:,}".replace(",", " ")
+                value = f"{reviews['score']} · {percent}% из {count}" if reviews.get("score") else f"{percent}% из {count}"
+                chips.append(InfoChip("Отзывы в Steam", value,
+                                      f"https://store.steampowered.com/app/{port['appid']}/#app_reviews_hash",
+                                      self.chips_box))
+            if store.get("metacritic"):
+                chips.append(InfoChip("Metacritic", f"{store['metacritic']} из 100", store.get("metacritic_url"),
+                                      self.chips_box))
+            chips.append(InfoChip("Магазин Steam", "Страница игры",
+                                  f"https://store.steampowered.com/app/{port['appid']}/", self.chips_box))
+            for title, url in self.press_links:
+                chips.append(InfoChip("Обзор", title, url, self.chips_box))
+        chips.append(InfoChip("How Long To Beat", "Сколько проходить", hltb_url(port["name"]), self.chips_box))
+        if disc:  # как запустить старую игру на современной системе
+            chips.append(InfoChip("PCGamingWiki", "Исправления и улучшения", pcgamingwiki_url(port["name"]),
+                                  self.chips_box))
+        if wiki:
+            chips.append(InfoChip("Википедия", wiki.get("title") or "Статья", wiki.get("url"), self.chips_box))
+        for chip in chips:
+            chip.linkClicked.connect(self._open_link)
+            self.chips.addWidget(chip)
+        self.chips.invalidate()
+
+        if disc:
+            if store:
+                description, notes = store.get("description") or "", store.get("about") or ""
+            else:
+                description, notes = (wiki or {}).get("text") or "", ""
+            own = [] if store else [description]  # Википедию переводим сами; карточку Steam переводит core
+            self.about_title.setText("Об игре")
+            self.notes_title.setText("")
+        else:
+            description = (port.get("about") or {}).get("description", "")
+            notes = latest.get("notes") or ""
+            own = [description, notes]
+            title = latest.get("title") or latest.get("tag") or ""
+            self.about_title.setText("О проекте")
+            self.notes_title.setText(f"Что нового в {title}" if title else "")
+        shown = description if store else self._shown(description)
+        self.about_title.setVisible(bool(description) or loading)
+        self.description.setText(shown or ("Загружаю описание…" if loading else ""))
+        self.description.setVisible(bool(description) or loading)
+        self.notes_title.setVisible(bool(notes) and bool(self.notes_title.text()))
+        self.notes.setText(notes if store else self._shown(notes))
+        self.notes.setVisible(bool(notes))
+        self._translate(own)
+        self._update_translate_row(own)
+        if store:  # перевод карточки Steam — как на странице игры Steam, без «Показать оригинал»
+            note = "Перевожу описание на русский…" if self._store_translating else (
+                "Описание переведено автоматически" if store.get("translated") else "")
+            self.translated_note.setText(note)
+            self.translated_note.setVisible(bool(note))
+            self.original_button.hide()
+        source = ""
+        if store and description:
+            source = "Описание, оценки и отзывы — из магазина Steam."
+        elif wiki:
+            source = f"Описание — из Википедии, статья «{wiki.get('title', '')}»."
+        self.source_note.setText(source)
+        self.source_note.setVisible(bool(source))
+
+        history = self._history()
+        self.history_box.setVisible(len(history) > 1)
+        self.history_box.set_title(f"История версий ({len(history)})")
+        self._history_dirty = True
+        if self.history_box.expanded:
+            self._build_history()
+        if disc:  # обновлений с GitHub у дисковых игр нет — подсказка только о том, почему нет описания
+            asked = (port.get("wiki") or {}).get("query") == port["name"]
+            if description or loading:
+                hint = ""
+            elif not asked:
+                hint = "Описание не загрузилось: Википедия не ответила. Откройте страницу игры чуть позже."
+            elif port.get("appid"):
+                hint = ("Магазин Steam не отдаёт страницу этой игры, а в Википедии статьи о ней не нашлось. "
+                        "Связать с другой игрой Steam — правый клик по игре → «Найти в Steam».")
+            else:
+                hint = ("Описания нет: игра не связана с магазином Steam, а в Википедии статьи о ней не нашлось. "
+                        "Есть в Steam — нажмите «Найти в Steam». Нашлось не то или ничего — поправьте название: "
+                        "«Изменить…».")
+        elif update:
+            hint = (f"Вышла новая версия {latest['tag']} (у вас {port['installed_tag']}). Обновление скачиваете "
+                    "и ставите вы сами — со страницы релиза. Когда обновите, нажмите «Я обновил» или просто "
+                    "запустите игру: программа заметит новый файл запуска.")
+        elif not port.get("repo"):
+            hint = ("Ссылки на проект на GitHub нет — проверять обновления не по чему. Добавить: «Изменить…».")
+        elif port.get("check_error"):
+            hint = f"Обновления не проверились: {port['check_error']}"
+        elif latest.get("tag"):
+            hint = "У вас последняя версия."
+        else:
+            hint = "Обновления ещё не проверялись — это случится само, в течение нескольких минут."
+        self.hint.setText(hint)
+        self.hint.setVisible(bool(hint))
+
+    def _open_link(self, url):
+        # Релизы GitHub качают в обычном браузере, How Long To Beat ломается во встроенном; остальное
+        # (PCGamingWiki) — как выбрано в «Настройках» → «Открывать ссылки»
+        if url.startswith("https://github.com/") or external_only(url) or not self.win.web_page:
+            QDesktopServices.openUrl(QUrl(url))
+            return
+        choice = link_choice(self.win, url)
+        if choice == "outside":
+            QDesktopServices.openUrl(QUrl(url))
+        elif choice == "inside":
+            self.win.open_web(url)
+
+    def _spin_again(self):
+        self.win.switchTo(self.win.home_page)
+        self.win.home_page.spin_again()
+
+    # --- Перевод ---
+    # Переводы хранятся в порте ("translations": {ключ текста: перевод}): второй раз страница открывается
+    # сразу на русском. Ключ — от самого текста, поэтому сменилось описание на GitHub — переводится заново.
+    def _translation(self, text):
+        return (self.port.get("translations") or {}).get(text_key(text)) if text and self.port else None
+
+    def _shown(self, text):
+        translated = None if self._show_original else self._translation(text)
+        return translated or text
+
+    def _translate(self, texts):
+        """Перевести тексты, которых ещё нет на русском, — в фоне, по одному разу за открытие страницы."""
+        if self.port is None or not core.translation_enabled():
+            return
+        wanted = []
+        for text in texts:
+            key = text_key(text) if text else None
+            if key and key not in self._translating and core.needs_russian(text) and not self._translation(text):
+                self._translating.add(key)
+                wanted.append(text)
+        if wanted:
+            self._pending |= {text_key(t) for t in wanted}
+            self._run(_translate_texts, (wanted,), self._on_translated)
+
+    def _on_translated(self, result):
+        self._pending -= set(result["tried"])
+        if self.port is None:
+            return
+        if result["done"]:
+            translations = dict(self.port.get("translations") or {})
+            translations.update(result["done"])
+            keep = {text_key(t) for t in self._port_texts() if t}
+            self.port["translations"] = {k: v for k, v in translations.items() if k in keep}
+            self.ports_page.save()
+        self.refresh()
+
+    def _port_texts(self):
+        port = self.port
+        return [(port.get("about") or {}).get("description", ""), (port.get("latest") or {}).get("notes", ""),
+                (port.get("wiki") or {}).get("text", "")] + [item.get("notes", "") for item in port.get("history") or []]
+
+    def _update_translate_row(self, texts):
+        texts = list(texts) + ([item.get("notes", "") for item in self._history()] if self.history_box.expanded
+                               else [])
+        translated = any(self._translation(t) for t in texts if t)
+        waiting = bool(self._pending & {text_key(t) for t in texts if t})
+        if waiting and not translated:
+            self.translated_note.setText("Перевожу описание на русский…")
+        elif self._show_original:
+            self.translated_note.setText("Оригинал с GitHub" if self.ports_page.GITHUB else "Оригинал из Википедии")
+        else:
+            self.translated_note.setText("Переведено автоматически" if translated else "")
+        self.translated_note.setVisible(bool(self.translated_note.text()))
+        self.original_button.setVisible(translated)
+        self.original_button.setText("Показать перевод" if self._show_original else "Показать оригинал")
+
+    def _toggle_original(self):
+        self._show_original = not self._show_original
+        self.refresh()
+
+    # --- История версий ---
+    def _history(self):
+        if self.port is None:
+            return []
+        history = list(self.port.get("history") or [])
+        latest = self.port.get("latest") or {}
+        if latest.get("tag") and not any(item.get("tag") == latest["tag"] for item in history):
+            history.insert(0, latest)
+        return history
+
+    HISTORY_TRANSLATE = 10  # переводим описания стольких последних версий — старые редко кому нужны
+
+    def _build_history(self):
+        if not self._history_dirty or self.port is None:
+            return
+        self._history_dirty = False
+        body, layout = self.history_box.body, self.history_box.body_layout
+        clear_layout(layout)
+        history = self._history()
+        installed = self.port.get("installed_tag")
+        for item in history:
+            title = item.get("title") or ""
+            head = plain_label(item["tag"] + (f" — {title}" if title and title != item["tag"] else ""), body)
+            head.setFont(resized_font(head.font(), 1))
+            head_font = head.font()
+            head_font.setBold(True)
+            head.setFont(head_font)
+            meta = [item["published"]] if item.get("published") else []
+            if item["tag"] == installed:
+                meta.append("у вас эта версия")
+            if item.get("prerelease"):
+                meta.append("предварительная")
+            layout.addWidget(head)
+            if meta:
+                layout.addWidget(plain_label(" · ".join(meta), body, caption=True))
+            layout.addWidget(plain_label(self._shown(item.get("notes") or "") or "Описания у этой версии нет.", body,
+                                         selectable=True))
+            layout.addSpacing(10)
+        self._translate([item.get("notes") for item in history[:self.HISTORY_TRANSLATE]])
+        self._update_translate_row([(self.port.get("about") or {}).get("description", ""),
+                                    (self.port.get("latest") or {}).get("notes", "")])
+
+    # --- Подложка, как у страницы игры ---
+    def _on_backdrop(self, path):
+        pixmap = QPixmap.fromImage(QImage(path)) if path else QPixmap()  # файл мог смениться под тем же именем
+        if pixmap.isNull():
+            return
+        self.backdrop = pixmap
+        self.backdrop_anim.stop()
+        self.backdrop_anim.start()
+
+    def _set_backdrop_opacity(self, value):
+        self.backdrop_opacity = value
         self.update()
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        self.timer.start()
-
-    def hideEvent(self, event):
-        super().hideEvent(event)
-        self.timer.stop()  # на других вкладках фонарь не мигает
-
-    def _stripes(self, painter, rect):
-        """Доска барьера в косую оранжево-белую полосу."""
-        path = QPainterPath()
-        path.addRoundedRect(rect, 4, 4)
-        painter.save()
-        painter.setClipPath(path)
-        painter.fillRect(rect, self.WHITE_STRIPE)
-        painter.setBrush(self.ORANGE)
-        h, x = rect.height(), rect.left() - rect.height()
-        while x < rect.right():
-            painter.drawPolygon(QPolygonF([QPointF(x, rect.bottom()), QPointF(x + h, rect.top()),
-                                           QPointF(x + h + 16, rect.top()), QPointF(x + 16, rect.bottom())]))
-            x += 32
-        painter.restore()
-        painter.setPen(QPen(QColor(0, 0, 0, 60), 1))
-        painter.setBrush(Qt.NoBrush)
-        painter.drawPath(path)
-        painter.setPen(Qt.NoPen)
-
     def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setPen(Qt.NoPen)
-        dark = isDarkTheme()
-        painter.setBrush(QColor(0, 0, 0, 70 if dark else 35))  # тень на земле
-        painter.drawEllipse(QRectF(20, 200, 320, 22))
+        GamePage.paintEvent(self, event)
 
-        # Барьер: две стойки на ножках и две полосатые доски
-        post = QColor(90, 90, 98) if dark else QColor(120, 120, 128)
-        painter.setBrush(post)
-        for x in (62, 218):
-            painter.drawRoundedRect(QRectF(x, 70, 12, 138), 3, 3)
-            painter.drawRoundedRect(QRectF(x - 14, 202, 40, 8), 3, 3)
-        self._stripes(painter, QRectF(30, 88, 230, 34))
-        self._stripes(painter, QRectF(30, 138, 230, 26))
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, lambda: self.header.fit_width(self.scroll.viewport().width()))
 
-        # Фонарь на левой стойке — мигает
-        painter.setBrush(post)
-        painter.drawRect(QRectF(63, 56, 10, 16))
-        lamp = QRectF(56, 34, 24, 24)
-        if self.lamp_on:
-            glow = QRadialGradient(lamp.center(), 34)
-            glow.setColorAt(0, QColor(255, 170, 0, 160))
-            glow.setColorAt(1, QColor(255, 170, 0, 0))
-            painter.setBrush(glow)
-            painter.drawEllipse(lamp.center(), 34, 34)
-        painter.setBrush(QColor(255, 176, 0) if self.lamp_on else QColor(150, 95, 20))
-        painter.drawEllipse(lamp)
 
-        # Конус с двумя белыми полосами
-        center, top, bottom = 308, 70, 200
+class PlayTracker(QObject):
+    """Время в портах и дисковых играх: после запуска программа раз в несколько секунд смотрит, работает ли
+    что-нибудь из папки игры. Так считается и игра, которую запустил её лаунчер (Call of Duty: Launcher.exe →
+    CoDSP.exe), и запущенная с правами администратора. Закрылась — время сессии прибавляется к игре.
 
-        def half(y):
-            return 6 + (y - top) / (bottom - top) * 24
+    Программа только читает список запущенных программ Windows — ничего в них не трогает."""
 
-        painter.setBrush(self.ORANGE)
-        painter.drawPolygon(QPolygonF([QPointF(center - half(top), top), QPointF(center + half(top), top),
-                                       QPointF(center + half(bottom), bottom),
-                                       QPointF(center - half(bottom), bottom)]))
-        painter.setBrush(self.WHITE_STRIPE)
-        for y1, y2 in ((104, 120), (146, 162)):
-            painter.drawPolygon(QPolygonF([QPointF(center - half(y1), y1), QPointF(center + half(y1), y1),
-                                           QPointF(center + half(y2), y2), QPointF(center - half(y2), y2)]))
-        painter.setBrush(QColor(60, 60, 66))
-        painter.drawRoundedRect(QRectF(268, 198, 80, 10), 3, 3)
+    POLL_MS = 5000
+    START_WAIT = 120  # с: столько ждём, пока игра появится (окно прав администратора, долгий лаунчер)
+    GAP = 20  # с: из папки игры ничего не видно дольше — сессия закончилась (лаунчер передал запуск не мгновенно)
+    MIN_SESSION = 10  # с: короче — это не игра, а, например, лаунчер, который сразу закрыли
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.win = window
+        self.sessions = {}  # id игры → {"port", "page", "launched", "started", "last_seen", "seen"}
+        self._polling = False
+        self.timer = QTimer(self)
+        self.timer.setInterval(self.POLL_MS)
+        self.timer.timeout.connect(self._poll)
+
+    def playing(self, port):
+        session = self.sessions.get(port["id"])
+        return bool(session and session["seen"])
+
+    def start(self, port, page):
+        if port["id"] in self.sessions:
+            return  # эту игру уже считаем: второй запуск — то же время
+        now = time.time()
+        self.sessions[port["id"]] = {"port": port, "page": page, "launched": now, "started": now,
+                                     "last_seen": now, "seen": False}
+        if not self.timer.isActive():
+            self.timer.start()
+        QTimer.singleShot(2000, self._poll)
+
+    def _poll(self):
+        if self._polling or not self.sessions:
+            return
+        self._polling = True
+        worker = Worker(core.running_programs, parent=self)
+        worker.finished.connect(self._on_programs)
+        worker.failed.connect(self._on_failed)
+        worker.start()
+
+    def _on_failed(self, message):
+        self._polling = False
+        core.log.warning("Время в игре: список запущенных программ не прочитался: %s", message)
+
+    def _on_programs(self, programs):
+        self._polling = False
+        now, changed = time.time(), False
+        for port_id, session in list(self.sessions.items()):
+            if core.folder_running(session["port"]["folder"], programs):
+                if not session["seen"]:
+                    session["seen"], session["started"] = True, now
+                    changed = True  # на плитке и странице — «играете сейчас»
+                    core.log.info("Время в «%s»: игра запущена — считаю", session["port"]["name"])
+                session["last_seen"] = now
+            elif session["seen"] and now - session["last_seen"] > self.GAP:
+                self._finish(port_id)
+            elif not session["seen"] and now - session["launched"] > self.START_WAIT:
+                del self.sessions[port_id]
+                core.log.info("Время в «%s» не считается: игра так и не появилась среди запущенных программ "
+                              "(возможно, её лаунчер запускает программу из другой папки)", session["port"]["name"])
+        if not self.sessions:
+            self.timer.stop()
+        if changed:
+            self.win.portsChanged.emit()
+
+    def _finish(self, port_id, closing=False):
+        session = self.sessions.pop(port_id)
+        port = session["port"]
+        seconds = session["last_seen"] - session["started"]
+        if seconds < self.MIN_SESSION:
+            core.log.info("Время в «%s»: игра закрылась через %d с — слишком коротко, не засчитано",
+                          port["name"], int(seconds))
+            if not closing:
+                self.win.portsChanged.emit()
+            return
+        port["playtime"] = int((port.get("playtime") or 0) + seconds)
+        port["last_played"] = int(session["started"])
+        port["sessions"] = int(port.get("sessions") or 0) + 1
+        session["page"].save()
+        core.log.info("Время в «%s»: сессия %s, всего %s", port["name"], core.playtime_text(seconds),
+                      core.playtime_text(port["playtime"]))
+        if not closing:
+            self.win.portsChanged.emit()
+            notify("info", self.win, "Игра закрыта", f"«{port['name']}»: сыграно {core.playtime_text(seconds)}. "
+                                                     f"Всего — {core.playtime_text(port['playtime'])}.", 5000)
+
+    def flush(self):
+        """Программу закрывают, а игра ещё идёт — время до этой минуты всё равно засчитывается."""
+        now = time.time()
+        for port_id, session in list(self.sessions.items()):
+            if session["seen"]:
+                session["last_seen"] = now
+                self._finish(port_id, closing=True)
+        self.sessions.clear()
+        self.timer.stop()
 
 
 class NativePortsPage(QWidget):
-    """Вкладка «Игры Native Port's» — пока заглушка: раздел появится в одной из следующих версий."""
+    """Вкладка «Игры Native Port's»: порты и другие игры, которые уже стоят на ПК и запускаются своим .exe.
+
+    Добавить — папкой, где у каждого порта своя папка, или по одному. Плитка с обложками, правый клик, двойной
+    клик — запуск. Страница порта — по клику «Открыть страницу». Обновления проверяются на GitHub сами.
+    Вкладка «Дисковые игры» — та же самая, только со своим списком, своей папкой и без GitHub (DiscGamesPage).
+    """
+
+    OBJECT_NAME = "nativePortsPage"
+    LIBRARY = "ports"  # список на главном окне: win.ports
+    ROOT_SETTING = "ports_root"
+    GITHUB = True
+    T = {
+        "title": "Игры Native Port's",
+        "empty_title": "Порты и игры, которые уже стоят на ПК",
+        "empty_text": "Фанатские порты (Ship of Harkinian, OpenMW и другие) и любые игры, которые запускаются своим "
+                      ".exe. Укажите папку, в которой у каждой игры своя папка, — программа найдёт файлы запуска. "
+                      "Обложки, фоны и логотипы — из SteamGridDB, а по ссылке на проект на GitHub программа "
+                      "сообщит о новой версии.",
+        "root_button": "Добавить папку с портами",
+        "add_button": "Добавить порт",
+        "add_title": "Добавить порт",
+        "one_folder": "Папка порта — где лежит сама игра",
+        "count": "Портов: {n}",
+        "none": "Портов пока нет",
+        "scan_busy": "Ищу порты…",
+        "scan_title": "Найдены порты",
+        "nothing_new": "Новых портов не нашлось",
+        "all_known": "Все порты из этой папки уже в списке ({n}).",
+        "add_busy": "Добавляю порты…",
+        "added": "Добавлено портов: {n}",
+        "not_added": "Порты не добавлены",
+        "already": "Этот порт уже в списке",
+        "no_folder": "Папки порта нет",
+        "no_folder_text": "Порт перенесли или удалили. Укажите новую: «Изменить…».",
+        "root_missing": "Папки с портами нет",
+        "root_missing_text": "Выберите её заново: «Добавить папку с портами».",
+        "saved": "Порт сохранён",
+        "removed": "Убрано портов: {n}",
+        "remove_confirm": "{names} — портов: {n}. Сами файлы на диске останутся, программа их не трогает.",
+        "remove_tip": "Сами файлы порта на диске останутся",
+        "edit_tip": "Название, папка, файл запуска и ссылка на GitHub",
+        "exe_missing": "«{name}»: {exe} не найден — порт перенесли или удалили. Укажите новое место: «Изменить…».",
+        "exe_changed": "«{name}»: {exe} — уже не тот файл, что был при добавлении порта. Если вы обновили порт — "
+                       "всё в порядке. Если нет — файл мог заменить кто-то другой, и запускать его не стоит."
+                       "\n\nЗапустить?",
+        "not_launched": "Порт не запустился",
+        "back": "К портам",
+    }
 
     def __init__(self, window):
         super().__init__()
-        self.setObjectName("nativePortsPage")
+        self.setObjectName(self.OBJECT_NAME)
         self.win = window
-        art = RoadWorksArt(self)
-        title = TitleLabel("Coming Soon", self)
-        text = BodyLabel("Здесь будут игры Native Port's. Раздел ещё строится — он появится в одной из "
-                         "следующих версий.", self)
-        text.setAlignment(Qt.AlignCenter)
-        text.setWordWrap(True)
-        text.setMaximumWidth(460)
+        self._checking = False
+        T = self.T
 
+        # Список
+        self.list_view = QWidget(self)
+        self.title = TitleLabel(T["title"], self.list_view)
+        self.count_label = CaptionLabel("", self.list_view)
+        self.search = SearchLineEdit(self.list_view)
+        self.search.setPlaceholderText("Поиск по названию")
+        self.search.textChanged.connect(self.refresh)
+        self.thumbs = CoverThumbs(CoverTileDelegate.COVER, self)
+        self.grid = QListWidget(self.list_view)
+        self.grid.setViewMode(QListView.IconMode)
+        self.grid.setResizeMode(QListView.Adjust)
+        self.grid.setMovement(QListView.Static)
+        self.grid.setUniformItemSizes(True)
+        self.grid.setSpacing(4)
+        self.grid.setFrameShape(QFrame.NoFrame)
+        self.grid.setMouseTracking(True)
+        self.grid.viewport().setMouseTracking(True)
+        self.grid.viewport().setAttribute(Qt.WA_Hover)
+        self.grid.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.grid.verticalScrollBar().setSingleStep(30)
+        self.grid.setItemDelegate(PortTileDelegate(self.thumbs, self.grid))
+        self.grid.setStyleSheet("QListWidget {background: transparent; border: none; outline: none}")
+        if SmoothScrollDelegate:
+            self._grid_scroll = SmoothScrollDelegate(self.grid)
+        self.thumbs.updated = self.grid.viewport().update
+        # Как на вкладке «Игры Steam»: списком или плиткой, выбор запоминается
+        self.list = ListWidget(self.list_view)
+        for view in (self.list, self.grid):
+            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            view.setContextMenuPolicy(Qt.CustomContextMenu)
+            view.customContextMenuRequested.connect(lambda pos, v=view: self.show_menu(v, pos))
+            # Двойной щелчок — страница игры (как на «Играх Steam» и в коллекциях); запуск — с неё или из меню
+            view.itemDoubleClicked.connect(lambda item: self.open_from_list(self.port_of(item)))
+        self.views = QStackedWidget(self.list_view)
+        self.views.addWidget(self.list)
+        self.views.addWidget(self.grid)
+        self.list_button = TransparentToggleToolButton(FIF.MENU, self.list_view)
+        self.list_button.setToolTip("Списком")
+        self.list_button.clicked.connect(lambda: self.set_view("list"))
+        self.grid_button = TransparentToggleToolButton(FIF.PHOTO, self.list_view)
+        self.grid_button.setToolTip("Плиткой с обложками")
+        self.grid_button.clicked.connect(lambda: self.set_view("grid"))
+        self.sort_box = make_sort_box(self.list_view, self.SORTS, f"{self.LIBRARY}_sort", self.refresh)
+        self.search_box = QWidget(self.list_view)
+        search_row = QHBoxLayout(self.search_box)
+        search_row.setContentsMargins(0, 0, 0, 0)
+        search_row.setSpacing(6)
+        search_row.addWidget(self.search, 1)
+        search_row.addSpacing(6)
+        search_row.addWidget(self.sort_box)
+        search_row.addSpacing(6)
+        search_row.addWidget(self.list_button)
+        search_row.addWidget(self.grid_button)
+
+        # Пусто — объясняем, что это за раздел
+        self.empty_box = QWidget(self.list_view)
+        empty = QVBoxLayout(self.empty_box)
+        empty.addStretch(1)
+        empty_title = SubtitleLabel(T["empty_title"], self.empty_box)
+        empty_text = plain_label(T["empty_text"], self.empty_box)
+        empty_text.setAlignment(Qt.AlignCenter)
+        # С переносом строк и выравниванием по центру Qt даёт надписи высоту по своей прикидке, и конец текста
+        # обрезался. Поэтому ширину и высоту считаем сами — под окно (_fit_empty_text)
+        self.empty_text = empty_text
+        empty.addWidget(empty_title, 0, Qt.AlignHCenter)
+        empty.addWidget(empty_text, 0, Qt.AlignHCenter)
+        empty.addStretch(1)
+
+        self.root_button = PrimaryPushButton(T["root_button"], self.list_view,
+                                             fluent_icon("FOLDER_ADD", FIF.FOLDER))
+        self.root_button.setToolTip("Папка, в которой у каждой игры своя папка. Ничего не запускается — "
+                                    "программа только смотрит, какие .exe там лежат")
+        self.root_button.clicked.connect(self.add_root)
+        self.rescan_button = PushButton("Найти новые", self.list_view, FIF.SYNC)
+        self.rescan_button.clicked.connect(self.find_new)
+        self.add_button = PushButton(T["add_button"], self.list_view, FIF.ADD)
+        self.add_button.clicked.connect(self.add_one)
+        self.updates_button = PushButton("Проверить обновления", self.list_view, FIF.UPDATE)
+        self.updates_button.setToolTip("Спросить GitHub о новых версиях всех портов со ссылкой на проект")
+        self.updates_button.clicked.connect(lambda: self.check_updates(force=True))
+        self.delete_button = PushButton("Убрать выбранные", self.list_view, FIF.DELETE)
+        self.delete_button.setToolTip("Убрать из списка — " + T["remove_tip"][:1].lower() + T["remove_tip"][1:])
+        self.delete_button.clicked.connect(self.remove_selected)
+        # Кнопки — по левому краю; в узком окне (половина экрана) переносятся на вторую строку, а не сжимаются
+        buttons_box = QWidget(self.list_view)
+        buttons = CenteredFlowLayout(buttons_box, spacing=12, center=False)
+        for button in (self.root_button, self.rescan_button, self.add_button, self.updates_button,
+                       self.delete_button):
+            buttons.addWidget(button)
+        self.buttons = buttons
+
+        list_layout = QVBoxLayout(self.list_view)
+        list_layout.setContentsMargins(36, 20, 36, 28)
+        list_layout.setSpacing(12)
+        list_layout.addWidget(self.title)
+        list_layout.addWidget(self.count_label)
+        list_layout.addWidget(self.search_box)
+        list_layout.addWidget(self.views, 1)
+        list_layout.addWidget(self.empty_box, 1)
+        list_layout.addWidget(buttons_box)
+
+        # Страница порта
+        self.page = PortPage(self)
+        self.stack = QStackedWidget(self)
+        self.stack.addWidget(self.list_view)
+        self.stack.addWidget(self.page)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(36, 20, 36, 28)
-        layout.setSpacing(12)
-        layout.addStretch(1)
-        layout.addWidget(art, 0, Qt.AlignHCenter)
-        layout.addSpacing(12)
-        layout.addWidget(title, 0, Qt.AlignHCenter)
-        layout.addWidget(text, 0, Qt.AlignHCenter)
-        layout.addStretch(1)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.stack)
+        self.mini = MiniPlayerSpot(self, self.title)
+        # Выделили игры — за списком их обложки под матовым стеклом (у страницы игры своя подложка)
+        self.backdrop = SelectionBackdrop(self.list_view)
+        for view in (self.list, self.grid):
+            view.itemSelectionChanged.connect(self._on_selection)
+
+        escape = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        escape.setContext(Qt.WidgetWithChildrenShortcut)
+        escape.activated.connect(self._on_escape)
+        self.win.portsChanged.connect(self.refresh)
+        self.win.covers.coverReady.connect(self.cover_changed)
+        view = core.load_settings().get(f"{self.LIBRARY}_view", "grid")
+        self.set_view(view if view in ("list", "grid") else "grid", save=False)
+        self.refresh()
+
+    SORTS = ("name", "name_desc", "new", "old", "played", "recent")
+
+    def _on_selection(self):
+        self.backdrop.set_names([item.data(Qt.UserRole) for item in self.current_view().selectedItems()])
+
+    def set_view(self, view, save=True):
+        self.views.setCurrentWidget(self.grid if view == "grid" else self.list)
+        self.list_button.setChecked(view == "list")
+        self.grid_button.setChecked(view == "grid")
+        self._on_selection()
+        if save:
+            core.save_settings(**{f"{self.LIBRARY}_view": view})
+            core.log.info("Вкладка «%s»: вид — %s", self.T["title"], "плиткой" if view == "grid" else "списком")
+
+    def current_view(self):
+        return self.views.currentWidget()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.mini.place()
+        self._fit_empty_text()
+
+    def _fit_empty_text(self):
+        """Пояснение на пустой вкладке: до 560 точек в ширину (уже — если окно узкое) и ровно той высоты,
+        сколько строк получилось, — чтобы конец текста не обрезался ни на весь экран, ни на половину."""
+        label = self.empty_text
+        width = max(240, min(560, self.width() - 2 * 36 - 24))
+        rect = QFontMetrics(label.font()).boundingRect(QRect(0, 0, width, 10000),
+                                                       int(Qt.AlignCenter | Qt.TextWordWrap), label.text())
+        label.setFixedSize(width, rect.height() + 6)
+
+    # --- Список ---
+    @property
+    def lib(self):
+        """Свой список: порты или дисковые игры (core.PortLibrary)."""
+        return getattr(self.win, self.LIBRARY)
+
+    def save(self):
+        return self.win.save_ports(self.lib)
+
+    def refresh(self):
+        ports = self.lib.ports
+        query = self.search.text().casefold().strip()
+        selected = {item.data(Qt.UserRole + 1) for item in self.current_view().selectedItems()}
+        self.list.clear()
+        self.grid.clear()
+        tile = CoverTileDelegate.COVER
+        tracker = self.win.play_tracker
+        for port in sort_games(ports, self.sort_box.mode()):
+            if query and query not in port["name"].casefold():
+                continue
+            update = core.port_has_update(port)
+            details = []
+            if tracker.playing(port):
+                details.append("играете сейчас")
+            elif port.get("playtime"):
+                details.append("наиграно " + core.playtime_text(port["playtime"]))
+            if update:
+                details.append(f"новая версия {port['latest']['tag']}")
+            for view in (self.list, self.grid):
+                text = port["name"] + (f"   ·   {', '.join(details)}" if details else "")
+                item = QListWidgetItem(text if view is self.list else "")
+                item.setData(Qt.UserRole, port["name"])
+                item.setData(Qt.UserRole + 1, port["id"])
+                item.setToolTip(port["name"] + "".join(f"\n{d[:1].upper()}{d[1:]}" for d in details))
+                if view is self.grid:
+                    item.setData(PortTileDelegate.UPDATE_ROLE, update)
+                    item.setSizeHint(QSize(tile.width() + 2 * CoverTileDelegate.PAD,
+                                           tile.height() + CoverTileDelegate.TEXT_H + 2 * CoverTileDelegate.PAD))
+                view.addItem(item)
+                item.setSelected(port["id"] in selected)
+        updates = sum(core.port_has_update(p) for p in ports)
+        text = self.T["count"].format(n=len(ports)) if ports else self.T["none"]
+        total = sum(p.get("playtime") or 0 for p in ports)
+        if total >= 60:
+            text += f" · наиграно всего: {core.playtime_text(total)}"
+        if updates:
+            text += f" · с новой версией на GitHub: {updates} — отмечены стрелкой"
+        self.count_label.setText(text)
+        self.views.setVisible(bool(ports))
+        self.search_box.setVisible(bool(ports))
+        self.empty_box.setVisible(not ports)
+        self.delete_button.setVisible(bool(ports))
+        self.updates_button.setVisible(self.GITHUB and any(p.get("repo") for p in ports))
+        self.rescan_button.setVisible(bool(core.load_settings().get(self.ROOT_SETTING)))
+        self.buttons.invalidate()
+        if self.page.port is not None:
+            if any(p is self.page.port for p in ports):
+                self.page.refresh()
+            elif self.stack.currentWidget() is self.page:
+                self.show_list()  # игру убрали из списка
+
+    def port_of(self, item):
+        return self.lib.find(item.data(Qt.UserRole + 1)) if item else None
+
+    def cover_changed(self, name):
+        self.thumbs.forget(name)
+        self.grid.viewport().update()
+        self.backdrop.refresh(name)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self.mini.place)
+        self._fit_empty_text()
+        ratio = self.devicePixelRatioF()
+        if ratio != self.thumbs.ratio:
+            self.thumbs.ratio = ratio
+            self.thumbs.clear()
+
+    def _on_escape(self):
+        if self.stack.currentWidget() is self.page:
+            self.show_list()
+        elif self.search.hasFocus() and self.search.text():
+            self.search.clear()
+        else:
+            for view in (self.list, self.grid):
+                view.clearSelection()
+
+    def show_menu(self, view, pos):
+        item = view.itemAt(pos)
+        port = self.port_of(item)
+        if not port:
+            return
+        if not item.isSelected():
+            view.clearSelection()
+            item.setSelected(True)
+        menu = RoundMenu(parent=self)
+        play = Action(FIF.PLAY, "Играть", menu)
+        play.triggered.connect(lambda: self.launch(port))
+        page = Action(FIF.GAME, "Открыть страницу", menu)
+        page.triggered.connect(lambda: self.open_from_list(port))
+        folder = Action(FIF.FOLDER, "Открыть папку", menu)
+        folder.triggered.connect(lambda: self.open_folder(port))
+        menu.addActions([play, page, folder])
+        if core.port_has_update(port):
+            release = Action(FIF.DOWNLOAD, f"Скачать обновление {port['latest']['tag']}", menu)
+            release.triggered.connect(lambda: self.open_release(port))
+            done = Action(FIF.ACCEPT, "Я обновил", menu)
+            done.triggered.connect(lambda: self.mark_updated(port))
+            menu.addActions([release, done])
+        menu.addSeparator()
+        edit = Action(fluent_icon("EDIT", FIF.SETTING), "Изменить…", menu)
+        edit.setToolTip(self.T["edit_tip"])
+        edit.triggered.connect(lambda: self.edit(port))
+        own_cover = Action(FIF.PHOTO, "Своя обложка…", menu)
+        own_cover.triggered.connect(lambda: self.win.library_page.choose_cover(port))
+        menu.addActions([edit, own_cover])
+        if not self.GITHUB:  # дисковая игра: описание, оценки и отзывы — из её страницы в Steam
+            link = Action(FIF.SEARCH, "Связать с другой игрой Steam…" if port.get("appid") else "Найти в Steam…", menu)
+            link.triggered.connect(lambda: self.link_steam(port))
+            menu.addAction(link)
+            if port.get("appid"):
+                unlink = Action(FIF.CLOSE, "Отвязать от Steam", menu)
+                unlink.setToolTip("Описание будет из Википедии")
+                unlink.triggered.connect(lambda: self.unlink_steam(port))
+                menu.addAction(unlink)
+        if core.griddb_key():
+            grid_cover = Action(FIF.DOWNLOAD, "Обложка из SteamGridDB", menu)
+            grid_cover.triggered.connect(lambda: self.win.library_page.cover_from_griddb(port))
+            menu.addAction(grid_cover)
+        menu.addSeparator()
+        add_collection_menu(self.win, menu, [self.port_of(i) for i in view.selectedItems()])
+        menu.addSeparator()
+        count = len(view.selectedItems())
+        remove = Action(FIF.DELETE, "Убрать из списка" if count == 1 else f"Убрать выбранные ({count})", menu)
+        remove.setToolTip(self.T["remove_tip"])
+        remove.triggered.connect(self.remove_selected)
+        menu.addAction(remove)
+        menu.exec(view.viewport().mapToGlobal(pos))
+
+    def open_from_list(self, port):
+        """Страница игры, открытая из своего списка, — «назад» ведёт в этот список, а не в коллекцию."""
+        if port:
+            self.win.game_origin = None
+            self.open_port(port)
+
+    def open_port(self, port):
+        self.page.show_port(port)
+        self.stack.setCurrentWidget(self.page)
+
+    def show_list(self):
+        self.stack.setCurrentWidget(self.list_view)
+        if self.page.port is not None:
+            view = self.current_view()
+            for row in range(view.count()):
+                item = view.item(row)
+                if item.data(Qt.UserRole + 1) == self.page.port["id"]:
+                    view.clearSelection()
+                    item.setSelected(True)
+                    view.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                    break
+
+    def open_folder(self, port):
+        if port and os.path.isdir(port["folder"]):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(port["folder"]))
+        elif port:
+            notify("warning", self.win, self.T["no_folder"], self.T["no_folder_text"])
+
+    # --- Добавление ---
+    def add_root(self):
+        start = core.load_settings().get(self.ROOT_SETTING) or ""
+        root = QFileDialog.getExistingDirectory(self, "Папка, в которой у каждой игры своя папка", start)
+        if not root:
+            return
+        core.save_settings(**{self.ROOT_SETTING: os.path.normpath(root)})
+        self._scan_root(root)
+
+    def find_new(self):
+        root = core.load_settings().get(self.ROOT_SETTING)
+        if not root or not os.path.isdir(root):
+            notify("warning", self.win, self.T["root_missing"], self.T["root_missing_text"])
+            return
+        self._scan_root(root)
+
+    def _scan_root(self, root):
+        show_busy(self.win, self.T["scan_busy"], "Смотрю, какие файлы .exe лежат в папках игр. Ничего не запускаю.")
+        worker = Worker(core.scan_ports_root, root, self.lib.folders(), self.GITHUB, parent=self)
+        worker.finished.connect(self._on_scanned)
+        worker.failed.connect(lambda message: (hide_busy(self.win), notify(
+            "error", self.win, "Папку не удалось просмотреть", message.split(": ", 1)[-1])))
+        worker.start()
+
+    def _on_scanned(self, scan):
+        hide_busy(self.win)
+        if not scan["found"]:
+            text = (self.T["all_known"].format(n=scan["known"]) if scan["known"] else
+                    "В папках нет файлов .exe. Нужна папка, в которой у каждой игры своя папка.")
+            notify("info", self.win, self.T["nothing_new"], text, 6000)
+            return
+        dialog = PortScanDialog(self.win, scan, self.T["scan_title"], github=self.GITHUB)
+        core.log.info("Открыто окно «%s»: %d", self.T["scan_title"], len(scan["found"]))
+        accepted = dialog.exec()
+        items = dialog.selected()
+        dialog.deleteLater()
+        if accepted and items:
+            self._add_ports(items)
+
+    def add_one(self):
+        folder = QFileDialog.getExistingDirectory(self, self.T["one_folder"],
+                                                  core.load_settings().get(self.ROOT_SETTING) or "")
+        if not folder:
+            return
+        if any(core.same_path(folder, f) for f in self.lib.folders()):
+            notify("info", self.win, self.T["already"], os.path.basename(folder))
+            return
+        # В фоне: поиск ссылки на GitHub читает и сами .exe — большие файлы это пара секунд
+        show_busy(self.win, "Смотрю папку игры…", "Ищу файлы запуска" + (" и ссылку на проект на GitHub"
+                                                                          if self.GITHUB else "") + ". Ничего не запускаю.")
+        worker = Worker(core.scan_port_folder, folder, self.GITHUB, parent=self)
+        worker.finished.connect(self._on_one_scanned)
+        worker.failed.connect(lambda message: (hide_busy(self.win), notify(
+            "error", self.win, "Папку не удалось просмотреть", message.split(": ", 1)[-1])))
+        worker.start()
+
+    def _on_one_scanned(self, found):
+        hide_busy(self.win)
+        if not found:
+            notify("warning", self.win, "В папке нет файлов .exe",
+                   "Выберите папку, где лежит сама игра (или её подпапку bin).", 6000)
+            return
+        dialog = PortEditDialog(self.win, found, self.T["add_title"], github=self.GITHUB)
+        accepted = dialog.exec()
+        result = dialog.result_port
+        dialog.deleteLater()
+        if accepted and result:
+            self._add_ports([result])
+
+    def _add_ports(self, items):
+        """Отпечатки файлов запуска — в фоне (большие .exe считаются пару секунд), потом в список."""
+        show_busy(self.win, self.T["add_busy"], "Запоминаю контрольные суммы файлов запуска: по ним программа "
+                                                "заметит, если файл поменяется.")
+        worker = Worker(_port_fingerprints, items, parent=self)
+        worker.finished.connect(lambda prints: self._on_fingerprints(items, prints))
+        worker.failed.connect(lambda message: (hide_busy(self.win), notify("error", self.win,
+                                                                            self.T["not_added"], message)))
+        worker.start()
+
+    def _on_fingerprints(self, items, prints):
+        hide_busy(self.win)
+        added, failed = [], []
+        for item, fingerprint in zip(items, prints):
+            if fingerprint.get("error"):
+                failed.append(f"«{item['name']}»: {fingerprint['error']}")
+                continue
+            added.append(self.lib.add(item["name"], item["folder"], item["exe"], item.get("repo") or "",
+                                      fingerprint))
+        if added and not self.save():
+            return
+        for port in added:
+            core.log.info("%s: добавлена «%s», запуск %s%s", self.T["title"], port["name"],
+                          os.path.basename(port["exe"]), f", GitHub {port['repo']}" if port["repo"] else "")
+        self.win.portsChanged.emit()
+        if failed:
+            notify("warning", self.win, f"Не добавлено: {len(failed)}", "\n".join(failed[:4]), 8000)
+        if added:
+            names = ", ".join(f"«{p['name']}»" for p in added[:4]) + ("…" if len(added) > 4 else "")
+            notify("success", self.win, self.T["added"].format(n=len(added)), names + ". Обложки скачиваются.", 6000)
+            if any(p["repo"] for p in added):
+                self.check_updates(force=True, quiet=True, only=[p["id"] for p in added])
+
+    # --- Изменение и удаление ---
+    def edit(self, port):
+        if not port:
+            return
+        found = core.scan_port_folder(port["folder"], hint=False) if os.path.isdir(port["folder"]) else None
+        dialog = PortEditDialog(self.win, dict(port, exes=(found or {}).get("exes") or []), f"«{port['name']}»",
+                                find_repo=self.GITHUB and not port.get("repo"), github=self.GITHUB)
+        accepted = dialog.exec()
+        result = dialog.result_port
+        dialog.deleteLater()
+        if not accepted or not result or not any(p is port for p in self.lib.ports):
+            return
+        old_name = port["name"]
+        name = self.lib.unique_name(result["name"], skip=port)
+        if name != old_name:
+            self._move_cover(old_name, name, port)
+            port["name"] = name
+        if result["repo"].casefold() != (port.get("repo") or "").casefold():
+            # Другой проект — прежние версии, история и переводы к нему не относятся
+            port.update(repo=result["repo"], latest=None, history=[], installed_tag="", checked=0,
+                        about=result.get("about"), translations={})
+            port.pop("check_error", None)
+            port.pop("notified_tag", None)
+        exe_changed = not core.same_path(result["folder"], port["folder"]) or result["exe"] != port["exe"]
+        port.update(folder=result["folder"], exe=result["exe"])
+        if exe_changed:
+            port["fingerprint"] = {}  # пересчитаем: новый файл запуска выбрал сам пользователь
+            worker = Worker(core.port_fingerprint, dict(port), parent=self)
+            worker.finished.connect(lambda fingerprint: (port.update(fingerprint=fingerprint), self.save()))
+            worker.start()
+        if not self.save():
+            return
+        core.log.info("%s: «%s» изменена", self.T["title"], port["name"])
+        self.win.portsChanged.emit()
+        if port.get("repo") and not port.get("latest"):
+            self.check_updates(force=True, quiet=True, only=[port["id"]])
+        if self.page.port is port:
+            self.page.show_port(port, keep_origin=True)
+        notify("success", self.win, self.T["saved"], f"«{port['name']}»")
+
+    # --- Связь дисковой игры со Steam ---
+    def link_steam(self, port):
+        """«Найти в Steam» для дисковой игры: из её страницы в магазине — описание, оценки и отзывы. Запуск не
+        меняется: игра по-прежнему запускается своим файлом из своей папки, Steam для этого не нужен."""
+        if not port:
+            return
+        dialog = AddGameDialog(self.win, port, for_disc=True)
+        core.log.info("Открыто окно «Найти в Steam» для дисковой игры «%s»", port["name"])
+        accepted = dialog.exec()
+        choice = dialog.choice
+        dialog.deleteLater()
+        if not accepted or not choice or not any(p is port for p in self.lib.ports):
+            return
+        old = port.get("appid")
+        port["appid"] = choice["appid"]
+        if not self.save():
+            port["appid"] = old
+            return
+        core.log.info("Дисковая игра «%s» связана со Steam: «%s» (%s)", port["name"], choice["name"], choice["appid"])
+        self.win.covers.forget(port["name"])  # с номером в Steam найдутся и картинки Steam
+        self.win.portsChanged.emit()
+        if self.page.port is port:
+            self.page.show_port(port, keep_origin=True)
+        notify("success", self.win, "Игра связана со Steam",
+               f"«{port['name']}» → «{choice['name']}». Описание, оценки и отзывы — оттуда; запускается игра "
+               "по-прежнему своим файлом.", 7000)
+
+    def unlink_steam(self, port):
+        if not port or not port.get("appid"):
+            return
+        old = port.pop("appid")
+        if not self.save():
+            port["appid"] = old
+            return
+        core.log.info("Дисковая игра «%s» отвязана от Steam", port["name"])
+        self.win.portsChanged.emit()
+        if self.page.port is port:
+            self.page.show_port(port, keep_origin=True)
+        notify("success", self.win, "Игра отвязана от Steam", f"«{port['name']}»: описание теперь из Википедии.")
+
+    def _move_cover(self, old, new, port):
+        """Обложки хранятся по названию — переименовали игру, переносим и обложку (если она только её)."""
+        path = core.find_cover(old)
+        if not path or self.win.name_in_use(old, skip=port) or core.find_cover(new):
+            return
+        try:
+            os.replace(path, os.path.join(core.COVERS_DIR, core.clean_name(new) + os.path.splitext(path)[1]))
+        except OSError as e:
+            core.log.warning("Обложка «%s» не переименовалась: %s", old, e)
+
+    def remove_selected(self):
+        ports = [self.port_of(item) for item in self.current_view().selectedItems()]
+        ports = [p for p in ports if p]
+        if not ports:
+            notify("info", self.win, "Ничего не выбрано", "Выделите игры в списке (Ctrl или Shift — несколько).")
+            return
+        names = ", ".join(f"«{p['name']}»" for p in ports[:3]) + ("…" if len(ports) > 3 else "")
+        if not confirm(self.win, "Убрать из списка?", self.T["remove_confirm"].format(names=names, n=len(ports)),
+                       "Убрать"):
+            return
+        for port in ports:
+            self.lib.remove(port)
+            if not self.win.name_in_use(port["name"]):  # у игры с тем же названием обложка общая
+                try:
+                    core.delete_cover(port["name"])
+                except OSError:
+                    pass
+        if self.save():
+            self.win.portsChanged.emit()
+            notify("success", self.win, self.T["removed"].format(n=len(ports)), "Файлы на диске не тронуты.")
+
+    # --- Запуск ---
+    def launch(self, port):
+        if not port:
+            return
+        worker = Worker(core.check_port_exe, dict(port), parent=self)
+        worker.finished.connect(lambda result: self._on_exe_checked(port, result))
+        worker.failed.connect(lambda message: notify("error", self.win, self.T["not_launched"],
+                                                     message.split(": ", 1)[-1]))
+        worker.start()
+
+    def _on_exe_checked(self, port, result):
+        exe = os.path.basename(port["exe"])
+        if result["state"] == "missing":
+            notify("error", self.win, "Файла запуска нет", self.T["exe_missing"].format(name=port["name"], exe=exe),
+                   8000)
+            return
+        if result["state"] == "changed":
+            latest = (port.get("latest") or {}).get("tag")
+            update = bool(latest and latest != port.get("installed_tag"))
+            core.log.info("«%s»: файл запуска изменился с добавления", port["name"])
+            if not confirm(self.win, "Файл запуска изменился", self.T["exe_changed"].format(name=port["name"], exe=exe),
+                           "Запустить"):
+                return
+            port["fingerprint"] = result["fingerprint"]
+            if update:
+                port["installed_tag"] = latest  # файл новый — значит, обновили до последней версии
+            self.save()
+            self.win.portsChanged.emit()
+        elif result["fingerprint"] != port.get("fingerprint"):
+            port["fingerprint"] = result["fingerprint"]  # тот же файл, просто сменилось время — запоминаем
+            self.save()
+        try:
+            core.launch_port(port)
+        except OSError as e:
+            core.log.warning("«%s» не запустилась: %s", port["name"], e)
+            notify("error", self.win, self.T["not_launched"], f"«{port['name']}»: {e}", 8000)
+            return
+        self.win.play_tracker.start(port, self)  # время в игре — пока она запущена
+        notify("success", self.win, "Запускаю", f"«{port['name']}». Приятной игры 🎮", 3000)
+
+    # --- Обновления ---
+    def open_release(self, port):
+        url = (port.get("latest") or {}).get("url") if port else None
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+
+    def mark_updated(self, port):
+        latest = (port.get("latest") or {}).get("tag") if port else None
+        if not latest:
+            return
+        port["installed_tag"] = latest
+        if self.save():
+            core.log.info("Порт «%s»: отмечен как обновлённый до %s", port["name"], latest)
+            self.win.portsChanged.emit()
+
+    def check_updates(self, force=False, quiet=False, only=None):
+        """Спросить GitHub о новых версиях. quiet — без уведомления «всё актуально» (при запуске программы)."""
+        if self._checking or not self.GITHUB:
+            return
+        ports = [p for p in self.lib.ports if p.get("repo") and (only is None or p["id"] in only)]
+        if not ports:
+            return
+        self._checking = True
+        self.updates_button.setEnabled(False)
+        self.updates_button.setText("Проверяю…")
+        worker = Worker(core.check_ports_updates, [dict(p) for p in ports], force, parent=self)
+        worker.finished.connect(lambda result: self._on_updates(result, quiet))
+        worker.failed.connect(lambda message: self._on_updates({"results": {}, "limit": None, "error": message}, quiet))
+        worker.start()
+
+    def _on_updates(self, result, quiet):
+        self._checking = False
+        self.updates_button.setEnabled(True)
+        self.updates_button.setText("Проверить обновления")
+        now, fresh = int(time.time()), []
+        for port_id, found in result["results"].items():
+            port = self.lib.find(port_id)
+            if not port:
+                continue
+            port["checked"] = now
+            if found.get("error"):
+                port["check_error"] = found["error"]
+                continue
+            port.pop("check_error", None)
+            release = found.get("latest")
+            port["latest"] = release
+            port["history"] = core.merge_port_history(port.get("history"), found.get("history"))
+            if release and not port.get("installed_tag"):
+                port["installed_tag"] = release["tag"]  # первая проверка: считаем, что стоит последняя версия
+            if core.port_has_update(port) and port.get("notified_tag") != release["tag"]:
+                port["notified_tag"] = release["tag"]
+                fresh.append(port)
+        if result["results"]:
+            self.save()
+            self.win.portsChanged.emit()
+        if fresh:
+            names = ", ".join(f"«{p['name']}» {p['latest']['tag']}" for p in fresh[:4]) + ("…" if len(fresh) > 4 else "")
+            notify("info", self.win, "Вышли новые версии портов",
+                   f"{names}. Скачать — правый клик по порту → «Скачать обновление».", 9000)
+        elif result.get("limit"):
+            if not quiet:
+                notify("warning", self.win, "GitHub просит подождать", result["limit"], 8000)
+        elif result.get("error"):
+            if not quiet:
+                notify("warning", self.win, "Обновления не проверились", result["error"].split(": ", 1)[-1], 7000)
+        elif not quiet:
+            errors = [self.lib.find(i) for i, r in result["results"].items() if r.get("error")]
+            if errors:
+                notify("warning", self.win, f"Не проверились: {len(errors)}",
+                       "; ".join(f"«{p['name']}»: {p['check_error']}" for p in errors[:3] if p), 8000)
+            else:
+                notify("success", self.win, "Обновлений нет", "У всех портов со ссылкой на GitHub последние версии.")
+
+
+class DiscGamesPage(NativePortsPage):
+    """Вкладка «Дисковые игры»: игры с дисков (и любые другие), установленные каждая в свою папку.
+
+    Всё как у портов — папка с играми или по одной, плитка, страница игры с фоном из SteamGridDB, запуск
+    с проверкой файла, — только без GitHub: обновлений у таких игр нет. Свой список — discs.json.
+    """
+
+    OBJECT_NAME = "discGamesPage"
+    LIBRARY = "discs"
+    ROOT_SETTING = "discs_root"
+    GITHUB = False
+    T = {
+        "title": "Дисковые игры",
+        "empty_title": "Игры с дисков, которые уже стоят на ПК",
+        "empty_text": "Игры, установленные с дисков, и любые другие, у которых своя папка и свой .exe. Укажите "
+                      "папку, в которой у каждой игры своя папка, — программа найдёт файлы запуска. Обложки, фоны "
+                      "и логотипы — из SteamGridDB, описание — из Steam («Найти в Steam») или из Википедии. "
+                      "Игры можно крутить в рулетке вместе с остальными.",
+        "root_button": "Добавить папку с играми",
+        "add_button": "Добавить игру",
+        "add_title": "Добавить игру",
+        "one_folder": "Папка игры — где она установлена",
+        "count": "Игр: {n}",
+        "none": "Игр пока нет",
+        "scan_busy": "Ищу игры…",
+        "scan_title": "Найдены игры",
+        "nothing_new": "Новых игр не нашлось",
+        "all_known": "Все игры из этой папки уже в списке ({n}).",
+        "add_busy": "Добавляю игры…",
+        "added": "Добавлено игр: {n}",
+        "not_added": "Игры не добавлены",
+        "already": "Эта игра уже в списке",
+        "no_folder": "Папки игры нет",
+        "no_folder_text": "Игру перенесли или удалили. Укажите новую папку: «Изменить…».",
+        "root_missing": "Папки с играми нет",
+        "root_missing_text": "Выберите её заново: «Добавить папку с играми».",
+        "saved": "Игра сохранена",
+        "removed": "Убрано игр: {n}",
+        "remove_confirm": "{names} — игр: {n}. Сами игры на диске останутся, программа их не трогает.",
+        "remove_tip": "Сама игра на диске останется",
+        "edit_tip": "Название, папка и файл запуска",
+        "exe_missing": "«{name}»: {exe} не найден — игру перенесли или удалили. Укажите новое место: «Изменить…».",
+        "exe_changed": "«{name}»: {exe} — уже не тот файл, что был при добавлении игры. Если вы поставили патч "
+                       "или переустановили игру — всё в порядке. Если нет — файл мог заменить кто-то другой, "
+                       "и запускать его не стоит.\n\nЗапустить?",
+        "not_launched": "Игра не запустилась",
+        "back": "К дисковым играм",
+    }
+
+
+# --- Коллекции ------------------------------------------------------------------
+COLLECTION_ICON = fluent_icon("ALBUM", FIF.FOLDER)
+GAME_KIND_NAMES = {"steam": "Игра Steam", "port": "Порт", "disc": "Дисковая игра"}
+
+
+def game_word(n):
+    """«1 игра», «3 игры», «12 игр»."""
+    if n % 10 == 1 and n % 100 != 11:
+        word = "игра"
+    elif 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        word = "игры"
+    else:
+        word = "игр"
+    return f"{n} {word}"
+
+
+def game_kind(game):
+    return ("disc" if core.is_disc(game) else "port") if core.is_port(game) else "steam"
+
+
+def add_collection_menu(win, menu, games):
+    """«Добавить в коллекцию» в меню игры на любой вкладке. Коллекций нет — сразу окно с названием новой;
+    есть — подменю со списком (где игры уже есть — галочка, выбрать — убрать оттуда) и «Новая коллекция…»."""
+    games = [g for g in games if g]
+    page = getattr(win, "collections_page", None)
+    if not games or page is None:
+        return
+    refs = [core.collection_ref(g) for g in games]
+    collections = win.collections.collections
+    if not collections:
+        action = Action(COLLECTION_ICON, "Добавить в коллекцию…", menu)
+        action.setToolTip("Коллекций пока нет — назовите первую, и " + ("игра попадёт" if len(games) == 1
+                                                                        else "игры попадут") + " в неё")
+        action.triggered.connect(lambda: page.new_collection(games))
+        menu.addAction(action)
+        return
+    sub = RoundMenu("Добавить в коллекцию", menu)
+    if hasattr(sub, "setIcon"):
+        sub.setIcon(COLLECTION_ICON)
+    for collection in collections:
+        inside = all(win.collections.has(collection, ref) for ref in refs)
+        action = Action(FIF.ACCEPT if inside else COLLECTION_ICON, collection["name"], sub)
+        action.setToolTip("Уже в этой коллекции — выберите, чтобы убрать оттуда" if inside else
+                          f"В коллекции: {game_word(len(win.collection_games(collection)))}")
+        action.triggered.connect(lambda _=False, c=collection, i=inside: page.toggle_games(c, games, remove=i))
+        sub.addAction(action)
+    sub.addSeparator()
+    new = Action(FIF.ADD, "Новая коллекция…", sub)
+    new.triggered.connect(lambda: page.new_collection(games))
+    sub.addAction(new)
+    menu.addMenu(sub)
+
+
+class CollectionNameDialog(MessageBoxBase):
+    """Название новой коллекции или новое название для старой."""
+
+    def __init__(self, parent, title, name="", skip=None):
+        super().__init__(parent)
+        self.win, self.skip = parent, skip
+        self.viewLayout.addWidget(SubtitleLabel(title, self))
+        self.edit = LineEdit(self)
+        self.edit.setText(name)
+        self.edit.setPlaceholderText("Например: «На выходные», «Хорроры», «С друзьями»")
+        self.edit.setMaxLength(core.COLLECTION_NAME_MAX)
+        self.viewLayout.addWidget(self.edit)
+        self.error = CaptionLabel("", self)
+        self.error.setTextColor(*WARNING_TEXT)
+        self.error.hide()
+        self.viewLayout.addWidget(self.error)
+        self.yesButton.setText("Сохранить")
+        self.cancelButton.setText("Отмена")
+        self.widget.setMinimumWidth(440)
+        QTimer.singleShot(0, self.edit.setFocus)
+
+    def name(self):
+        return core.title_name(self.edit.text())
+
+    def validate(self):
+        name = self.name()
+        message = ("Введите название коллекции." if not name else
+                   "Коллекция с таким названием уже есть." if self.win.collections.name_taken(name, self.skip) else "")
+        self.error.setText(message)
+        self.error.setVisible(bool(message))
+        return not message
+
+
+class CollectionTileDelegate(QStyledItemDelegate):
+    """Плитка коллекции — размером с обложку игры, вид на выбор («Вид плиток» на вкладке):
+
+    - «Стекло» — коллаж из обложек её игр под матовым стеклом с бликом, название по центру на стеклянной плашке;
+    - «Коробка от диска» — пластиковая коробка с корешком: на лицевой стороне обложки игр, на корешке и на
+      ленте снизу — название.
+
+    Под плиткой — сколько в ней игр."""
+
+    COVER, PAD, TEXT_H = CoverTileDelegate.COVER, CoverTileDelegate.PAD, CoverTileDelegate.TEXT_H
+    SPINE = 16  # ширина корешка коробки
+
+    def __init__(self, page, parent=None):
+        super().__init__(parent)
+        self.page = page
+
+    def sizeHint(self, option, index):
+        return QSize(self.COVER.width() + 2 * self.PAD, self.COVER.height() + self.TEXT_H + 2 * self.PAD)
+
+    def paint(self, painter, option, index):
+        collection = self.page.win.collections.find(index.data(Qt.UserRole))
+        if collection is None:
+            return
+        dark = isDarkTheme()
+        selected = bool(option.state & QStyle.State_Selected)
+        hover = bool(option.state & QStyle.State_MouseOver)
+        rect = QRectF(option.rect)
+        games = self.page.win.collection_games(collection)
+        tile = QRectF(rect.x() + (rect.width() - self.COVER.width()) / 2, rect.y() + self.PAD,
+                      self.COVER.width(), self.COVER.height())
+        painter.save()
+        painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
+        style = self.page.tile_style()
+        if style == "case":
+            self._paint_case(painter, option, collection, games, tile, dark, selected, hover)
+        else:
+            self._paint_collage(painter, option, collection, tile, dark, selected, hover)
+        # Под плиткой — только сколько игр
+        text_rect = QRectF(rect.x() + 4, tile.bottom() + 6, rect.width() - 8, self.TEXT_H - 6)
+        painter.setFont(option.font)
+        painter.setPen(QColor(255, 255, 255, 190) if dark else QColor(0, 0, 0, 170))
+        painter.drawText(text_rect, Qt.AlignHCenter | Qt.AlignTop, game_word(len(games)) if games else "Пока пусто")
+        painter.restore()
+
+    @staticmethod
+    def _border(dark):
+        return QColor(255, 255, 255, 46) if dark else QColor(0, 0, 0, 30)
+
+    def _hover_back(self, painter, tile, dark, selected, hover):
+        if selected or hover:
+            painter.setPen(Qt.NoPen)
+            alpha = (22 if selected else 12) if dark else (14 if selected else 8)
+            painter.setBrush(QColor(255, 255, 255, alpha) if dark else QColor(0, 0, 0, alpha))
+            painter.drawRoundedRect(tile.adjusted(-6, -6, 6, 6), 12, 12)
+
+    def _name_plate(self, painter, option, name, area, dark, lines=4):
+        """Название по центру area — на стеклянной плашке, до lines строк."""
+        font = QFont(option.font)
+        font.setPixelSize(15)
+        font.setBold(True)
+        painter.setFont(font)
+        flags = Qt.AlignCenter | Qt.TextWordWrap
+        used = painter.boundingRect(QRectF(0, 0, area.width() - 32, 1000), flags, name)
+        height = min(used.height(), QFontMetrics(font).lineSpacing() * lines)
+        band = QRectF(area.x() + 8, area.center().y() - height / 2 - 10, area.width() - 16, height + 20)
+        painter.setPen(QPen(QColor(255, 255, 255, 50) if dark else QColor(0, 0, 0, 25), 1))
+        painter.setBrush(QColor(22, 22, 26, 165) if dark else QColor(255, 255, 255, 190))
+        painter.drawRoundedRect(band, 8, 8)
+        painter.setPen(WHITE if dark else QColor(0, 0, 0, 225))
+        painter.drawText(band.adjusted(8, 10, -8, -10), flags, name)
+
+    def _paint_collage(self, painter, option, collection, tile, dark, selected, hover):
+        """«Стекло»: коллаж из обложек под матовым стеклом с бликом сверху, название по центру."""
+        self._hover_back(painter, tile, dark, selected, hover)
+        cover = QRectF(tile)
+        radius = 12
+        path = QPainterPath()
+        path.addRoundedRect(cover, radius, radius)
+        painter.save()
+        painter.setClipPath(path)
+        pixmap = self.page.tile_pixmap(collection["id"])
+        if pixmap is not None:
+            painter.drawPixmap(cover, pixmap, QRectF(pixmap.rect()))
+        else:  # обложек пока нет — стекло цвета темы
+            gradient = QLinearGradient(cover.topLeft(), cover.bottomRight())
+            accent = QColor(themeColor())
+            accent.setAlpha(90)
+            gradient.setColorAt(0, accent)
+            gradient.setColorAt(1, QColor(255, 255, 255, 20) if dark else QColor(0, 0, 0, 12))
+            painter.fillRect(cover, gradient)
+        painter.fillRect(cover, QColor(16, 16, 20, 70) if dark else QColor(255, 255, 255, 60))  # матовое стекло
+        shine = QLinearGradient(cover.topLeft(), cover.center())  # блик сверху, как на стекле
+        shine.setColorAt(0, QColor(255, 255, 255, 46))
+        shine.setColorAt(1, QColor(255, 255, 255, 0))
+        painter.fillRect(cover, shine)
+        self._name_plate(painter, option, collection["name"], cover, dark)
+        painter.restore()
+        painter.setBrush(Qt.NoBrush)
+        if selected:
+            painter.setPen(QPen(themeColor(), 3))
+            painter.drawRoundedRect(cover.adjusted(-1.5, -1.5, 1.5, 1.5), radius + 1, radius + 1)
+        else:
+            painter.setPen(QPen(self._border(dark), 1))
+            painter.drawPath(path)
+
+    def _paint_case(self, painter, option, collection, games, tile, dark, selected, hover):
+        """«Коробка от диска»: тёмный пластик, корешок слева с названием, на лицевой стороне — до четырёх обложек
+        за прозрачной плёнкой, снизу — лента с названием."""
+        self._hover_back(painter, tile, dark, selected, hover)
+        box = tile.adjusted(4, 2, -4, -2)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 80))
+        painter.drawRoundedRect(box.translated(2, 4), 6, 6)  # тень
+        plastic = QLinearGradient(box.topLeft(), box.topRight())
+        plastic.setColorAt(0, QColor(28, 28, 32))
+        plastic.setColorAt(1, QColor(46, 46, 52))
+        painter.setPen(QPen(themeColor() if selected else QColor(255, 255, 255, 40), 3 if selected else 1))
+        painter.setBrush(plastic)
+        painter.drawRoundedRect(box, 6, 6)
+
+        # Корешок: рёбра и название сверху вниз
+        spine = QRectF(box.x(), box.y(), self.SPINE, box.height())
+        painter.setPen(QPen(QColor(255, 255, 255, 30), 1))
+        for x in (spine.right() - 3, spine.right()):
+            painter.drawLine(QPointF(x, box.y() + 6), QPointF(x, box.bottom() - 6))
+        painter.save()
+        painter.translate(spine.center())
+        painter.rotate(90)
+        spine_font = QFont(option.font)
+        spine_font.setPixelSize(10)
+        spine_font.setBold(True)
+        painter.setFont(spine_font)
+        painter.setPen(QColor(255, 255, 255, 200))
+        length = spine.height() - 20
+        spine_text = QFontMetrics(spine_font).elidedText(collection["name"], Qt.ElideRight, round(length))
+        painter.drawText(QRectF(-length / 2, -spine.width() / 2, length, spine.width()), Qt.AlignCenter, spine_text)
+        painter.restore()
+
+        # Лицевая сторона — обложки игр (одна целиком, две-три рядом, четыре — 2×2)
+        front = QRectF(spine.right() + 3, box.y() + 5, box.right() - spine.right() - 8, box.height() - 10)
+        path = QPainterPath()
+        path.addRoundedRect(front, 3, 3)
+        painter.save()
+        painter.setClipPath(path)
+        names = [g["name"] for g in games[:4]]
+        if names:
+            rows = 2 if len(names) == 4 else 1
+            per_row = math.ceil(len(names) / rows)
+            for i, name in enumerate(names):
+                row, col = divmod(i, per_row)
+                cell = QRectF(front.x() + col * front.width() / per_row, front.y() + row * front.height() / rows,
+                              front.width() / per_row, front.height() / rows)
+                pixmap = self.page.thumbs.get(name)
+                if isinstance(pixmap, QPixmap):
+                    scale = max(cell.width() / pixmap.width(), cell.height() / pixmap.height())
+                    source = QRectF(0, 0, cell.width() / scale, cell.height() / scale)
+                    source.moveCenter(QPointF(pixmap.rect().center()))
+                    painter.drawPixmap(cell, pixmap, source)
+                else:
+                    painter.fillRect(cell, QColor(60, 60, 68))
+        else:
+            accent = QColor(themeColor())
+            accent.setAlpha(70)
+            painter.fillRect(front, accent)
+        # Прозрачная плёнка: блик по диагонали
+        shine = QLinearGradient(front.topLeft(), front.bottomRight())
+        shine.setColorAt(0, QColor(255, 255, 255, 60))
+        shine.setColorAt(0.35, QColor(255, 255, 255, 8))
+        shine.setColorAt(1, QColor(255, 255, 255, 0))
+        painter.fillRect(front, shine)
+        # Лента с названием снизу
+        font = QFont(option.font)
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = QFontMetrics(font)
+        text = two_lines(collection["name"], metrics, round(front.width() - 16))
+        band_h = metrics.lineSpacing() * (text.count("\n") + 1) + 12
+        band = QRectF(front.x(), front.bottom() - band_h, front.width(), band_h)
+        painter.fillRect(band, QColor(12, 12, 16, 200))
+        painter.setPen(WHITE)
+        painter.drawText(band.adjusted(8, 0, -8, 0), Qt.AlignCenter, text)
+        painter.restore()
+
+
+class CollectionGameDelegate(CoverTileDelegate):
+    """Игра в открытой коллекции — как на других вкладках. Пока обложки «раздаются» (DealOverlay), плитки
+    не рисуются: на их места как раз ложатся летящие обложки."""
+
+    def __init__(self, thumbs, parent=None):
+        super().__init__(thumbs, parent)
+        self.hidden = False
+
+    def paint(self, painter, option, index):
+        if not self.hidden:
+            super().paint(painter, option, index)
+
+
+class DealOverlay(QWidget):
+    """Открытие коллекции: обложки её игр «раздаются» из плитки коллекции, как карты из колоды, — одна за другой
+    слетают со стопки, на лету выпрямляются и ложатся на свои места в сетке."""
+
+    finished = Signal()
+    CARD_MS, STAGGER_MS, MAX_CARDS = 440, 30, 24
+
+    def __init__(self, host, thumbs, start, cards):
+        super().__init__(host)
+        self.thumbs, self.start = thumbs, start
+        self.cards = [(name, end, random.uniform(-10, 10), i * self.STAGGER_MS)
+                      for i, (name, end) in enumerate(cards[:self.MAX_CARDS])]
+        self.elapsed = 0.0
+        self.setGeometry(host.rect())
+        self.show()
+        self.raise_()
+        total = self.CARD_MS + self.STAGGER_MS * max(0, len(self.cards) - 1)
+        self.anim = QVariantAnimation(self)
+        self.anim.setDuration(total)
+        self.anim.setStartValue(0.0)
+        self.anim.setEndValue(float(total))
+        self.anim.valueChanged.connect(self._set_elapsed)
+        self.anim.finished.connect(self._done)
+        self.anim.start()
+
+    def mousePressEvent(self, event):
+        event.accept()  # пока раздаются — щелчки не проходят к сетке под ними
+
+    def _set_elapsed(self, value):
+        self.elapsed = float(value)
+        self.update()
+
+    def _done(self):
+        self.finished.emit()
+        self.deleteLater()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        waiting = [card for card in self.cards if self.elapsed < card[3]]
+        for name, _end, angle, _delay in waiting[:4][::-1]:  # колода: верхние карты чуть веером
+            self._card(painter, name, self.start, angle * 0.5)
+        for name, end, angle, delay in self.cards:
+            if self.elapsed < delay:
+                continue
+            t = min(1.0, (self.elapsed - delay) / self.CARD_MS)
+            e = 1 - (1 - t) ** 3
+            rect = QRectF(self.start.x() + (end.x() - self.start.x()) * e,
+                          self.start.y() + (end.y() - self.start.y()) * e - math.sin(math.pi * t) * 28,  # дуга
+                          self.start.width() + (end.width() - self.start.width()) * e,
+                          self.start.height() + (end.height() - self.start.height()) * e)
+            self._card(painter, name, rect, angle * (1 - e))
+
+    def _card(self, painter, name, rect, angle):
+        dark = isDarkTheme()
+        painter.save()
+        painter.translate(rect.center())
+        painter.rotate(angle)
+        card = QRectF(-rect.width() / 2, -rect.height() / 2, rect.width(), rect.height())
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 60))
+        painter.drawRoundedRect(card.translated(0, 4), 8, 8)  # тень
+        path = QPainterPath()
+        path.addRoundedRect(card, 8, 8)
+        painter.setClipPath(path)
+        pixmap = self.thumbs.get(name)
+        if isinstance(pixmap, QPixmap):
+            painter.drawPixmap(card, pixmap, QRectF(pixmap.rect()))
+        else:
+            painter.fillRect(card, QColor(60, 60, 66) if dark else QColor(225, 225, 230))
+        painter.setClipping(False)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(255, 255, 255, 50) if dark else QColor(0, 0, 0, 35), 1))
+        painter.drawPath(path)
+        painter.restore()
+
+
+class CollectionsPage(QWidget):
+    """Вкладка «Коллекции»: свои подборки игр из Steam, портов и дисковых. Вид плиток — на выбор (STYLES).
+    Двойной щелчок — коллекция открывается: обложки «раздаются» из её плитки по местам. Добавить игру —
+    правый клик по ней на любой вкладке → «Добавить в коллекцию». Коллекцию можно крутить в рулетке."""
+
+    TILE_DELAY_MS = 600  # скачиваются обложки — коллажи плиток пересобираются не на каждую
+
+    def __init__(self, window):
+        super().__init__()
+        self.setObjectName("collectionsPage")
+        self.win = window
+        self.current = None  # открытая коллекция
+        self.detail_games = []
+        self._overlay = None
+        self.tiles = {}  # номер коллекции → (обложки, из которых собран коллаж, QPixmap или None)
+        self._tile_pending = {}  # номер коллекции → обложки, из которых коллаж собирается сейчас
+        self._dirty = set()
+        self.tile_timer = QTimer(self)
+        self.tile_timer.setSingleShot(True)
+        self.tile_timer.setInterval(self.TILE_DELAY_MS)
+        self.tile_timer.timeout.connect(self._update_tiles)
+        # Обложки — и для вееров на плитках, и для игр внутри коллекции
+        self.thumbs = CoverThumbs(CoverTileDelegate.COVER, self)
+
+        # Список коллекций
+        self.list_view = QWidget(self)
+        self.title = TitleLabel("Коллекции", self.list_view)
+        self.count_label = CaptionLabel("", self.list_view)
+        self.grid = self._make_grid(self.list_view)
+        self.grid.setItemDelegate(CollectionTileDelegate(self, self.grid))
+        self.grid.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.grid.itemDoubleClicked.connect(lambda item: self.open_collection(self._collection_of(item), item))
+        self.grid.customContextMenuRequested.connect(self._tile_menu)
+        self.grid.itemSelectionChanged.connect(self._on_tile_selection)
+
+        self.empty_box = QWidget(self.list_view)
+        empty = QVBoxLayout(self.empty_box)
+        empty.addStretch(1)
+        empty.addWidget(SubtitleLabel("Свои подборки игр", self.empty_box), 0, Qt.AlignHCenter)
+        self.empty_text = plain_label(
+            "Соберите игры из Steam, портов и дисковых в свои коллекции: «На выходные», «Хорроры», «С друзьями». "
+            "Добавить игру — правый клик по ней на любой вкладке с играми → «Добавить в коллекцию». Любую "
+            "коллекцию можно крутить в рулетке.", self.empty_box)
+        self.empty_text.setAlignment(Qt.AlignCenter)
+        empty.addWidget(self.empty_text, 0, Qt.AlignHCenter)
+        empty.addStretch(1)
+
+        new_button = PrimaryPushButton("Новая коллекция", self.list_view, FIF.ADD)
+        new_button.clicked.connect(lambda: self.new_collection([]))
+        list_buttons_box = QWidget(self.list_view)
+        list_buttons = CenteredFlowLayout(list_buttons_box, spacing=12, center=False)
+        list_buttons.addWidget(new_button)
+        self.style_button = PushButton("Вид плиток", self.list_view, fluent_icon("PALETTE", FIF.VIEW))
+        self.style_button.setToolTip("Как выглядят плитки коллекций: стекло или коробка от диска")
+        self.style_button.clicked.connect(self._style_menu)
+        list_buttons.addWidget(self.style_button)
+
+        list_layout = QVBoxLayout(self.list_view)
+        list_layout.setContentsMargins(36, 20, 36, 28)
+        list_layout.setSpacing(12)
+        list_layout.addWidget(self.title)
+        list_layout.addWidget(self.count_label)
+        list_layout.addWidget(self.grid, 1)
+        list_layout.addWidget(self.empty_box, 1)
+        list_layout.addWidget(list_buttons_box)
+        self.list_backdrop = SelectionBackdrop(self.list_view)  # выделили коллекцию — за ней обложки её игр
+
+        # Открытая коллекция
+        self.detail_view = QWidget(self)
+        back_button = TransparentPushButton("К коллекциям", self.detail_view, FIF.LEFT_ARROW)
+        back_button.clicked.connect(self.show_list)
+        self.detail_title = TitleLabel("", self.detail_view)
+        self.detail_count = CaptionLabel("", self.detail_view)
+        self.games = self._make_grid(self.detail_view)
+        self.games_delegate = CollectionGameDelegate(self.thumbs, self.games)
+        self.games.setItemDelegate(self.games_delegate)
+        self.thumbs.updated = lambda: (self.games.viewport().update(), self.grid.viewport().update())
+        self.games.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.games.itemDoubleClicked.connect(lambda item: self.open_game(self._game_of(item)))
+        self.games.customContextMenuRequested.connect(self._game_menu)
+        self.games.itemSelectionChanged.connect(self._on_game_selection)
+        self.detail_empty = plain_label("В коллекции пока нет игр. Добавить — правый клик по игре на любой вкладке "
+                                        "с играми → «Добавить в коллекцию».", self.detail_view, caption=True)
+        self.spin_button = PrimaryPushButton("Крутить эту коллекцию", self.detail_view, FIF.SYNC)
+        self.spin_button.setToolTip("Рулетка будет крутить только игры этой коллекции. Вернуть — «Что крутить» "
+                                    "рядом с кнопкой «Крутить»")
+        self.spin_button.clicked.connect(lambda: self.spin_collection(self.current))
+        rename_button = PushButton("Переименовать…", self.detail_view, fluent_icon("EDIT", FIF.SETTING))
+        rename_button.clicked.connect(lambda: self.rename(self.current))
+        self.remove_button = PushButton("Убрать выбранные", self.detail_view, fluent_icon("REMOVE", FIF.DELETE))
+        self.remove_button.setToolTip("Убрать из коллекции — сами игры останутся в своих списках")
+        self.remove_button.clicked.connect(self.remove_selected)
+        detail_buttons_box = QWidget(self.detail_view)
+        detail_buttons = CenteredFlowLayout(detail_buttons_box, spacing=12, center=False)
+        for button in (self.spin_button, rename_button, self.remove_button, back_button):
+            detail_buttons.addWidget(button)
+        self.detail_buttons = detail_buttons
+
+        detail_layout = QVBoxLayout(self.detail_view)
+        detail_layout.setContentsMargins(36, 20, 36, 28)
+        detail_layout.setSpacing(12)
+        detail_layout.addWidget(self.detail_title)
+        detail_layout.addWidget(self.detail_count)
+        detail_layout.addWidget(self.games, 1)
+        detail_layout.addWidget(self.detail_empty)
+        detail_layout.addWidget(detail_buttons_box)
+        self.detail_backdrop = SelectionBackdrop(self.detail_view)
+
+        self.stack = QStackedWidget(self)
+        self.stack.addWidget(self.list_view)
+        self.stack.addWidget(self.detail_view)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.stack)
+        self.mini = MiniPlayerSpot(self, self.title)
+
+        escape = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        escape.setContext(Qt.WidgetWithChildrenShortcut)
+        escape.activated.connect(self._on_escape)
+        for signal in (self.win.libraryChanged, self.win.portsChanged, self.win.collectionsChanged):
+            signal.connect(self.refresh)
+        self.win.covers.coverReady.connect(self.cover_changed)
+        self.refresh()
+
+    @staticmethod
+    def _make_grid(parent):
+        grid = QListWidget(parent)
+        grid.setViewMode(QListView.IconMode)
+        grid.setResizeMode(QListView.Adjust)
+        grid.setMovement(QListView.Static)
+        grid.setUniformItemSizes(True)
+        grid.setSpacing(4)
+        grid.setFrameShape(QFrame.NoFrame)
+        grid.setMouseTracking(True)
+        grid.viewport().setMouseTracking(True)
+        grid.viewport().setAttribute(Qt.WA_Hover)
+        grid.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        grid.verticalScrollBar().setSingleStep(30)
+        grid.setStyleSheet("QListWidget {background: transparent; border: none; outline: none}")
+        grid.setContextMenuPolicy(Qt.CustomContextMenu)
+        if SmoothScrollDelegate:
+            grid._smooth_scroll = SmoothScrollDelegate(grid)
+        return grid
+
+    @staticmethod
+    def _tile_size():
+        cover = CoverTileDelegate.COVER
+        return QSize(cover.width() + 2 * CoverTileDelegate.PAD,
+                     cover.height() + CoverTileDelegate.TEXT_H + 2 * CoverTileDelegate.PAD)
+
+    # --- Список коллекций ---
+    def refresh(self):
+        collections = self.win.collections.collections
+        selected = {item.data(Qt.UserRole) for item in self.grid.selectedItems()}
+        self.grid.clear()
+        for collection in collections:
+            item = QListWidgetItem("")
+            item.setData(Qt.UserRole, collection["id"])
+            item.setToolTip(f"{collection['name']}\n{game_word(len(self.win.collection_games(collection)))}"
+                            " · двойной щелчок — открыть")
+            item.setSizeHint(self._tile_size())
+            self.grid.addItem(item)
+            item.setSelected(collection["id"] in selected)
+        self.count_label.setText(f"Коллекций: {len(collections)}" if collections else "Коллекций пока нет")
+        self.grid.setVisible(bool(collections))
+        self.empty_box.setVisible(not collections)
+        self.style_button.setVisible(bool(collections))
+        self._update_tiles()
+        self.grid.viewport().update()
+        if self.current is not None:
+            if any(c is self.current for c in collections):
+                self.refresh_detail()
+            else:
+                self.current = None
+                self.show_list()  # коллекцию удалили
+
+    def _collection_of(self, item):
+        return self.win.collections.find(item.data(Qt.UserRole)) if item else None
+
+    def _on_tile_selection(self):
+        names = []
+        for item in self.grid.selectedItems():
+            collection = self._collection_of(item)
+            if collection:
+                names += [g["name"] for g in self.win.collection_games(collection)]
+        self.list_backdrop.set_names(names)
+
+    def cover_changed(self, name):
+        self.thumbs.forget(name)
+        self.games.viewport().update()
+        self.grid.viewport().update()  # обложка могла быть на плитке
+        self.detail_backdrop.refresh(name)
+        self.list_backdrop.refresh(name)
+        for collection in self.win.collections.collections:
+            if any(g["name"] == name for g in self.win.collection_games(collection)):
+                self._dirty.add(collection["id"])
+        if self._dirty:
+            self.tile_timer.start()
+
+    # --- Вид плиток ---
+    STYLES = (("glass", "Стекло", "Коллаж из обложек под матовым стеклом, название по центру"),
+              ("case", "Коробка от диска", "Пластиковая коробка с корешком, на лицевой стороне — обложки игр"))
+
+    def tile_style(self):
+        style = self.win.settings.get("collections_style", "glass")
+        return style if style in dict((k, t) for k, t, _ in self.STYLES) else "glass"  # «Колоды» и «Веера» больше нет
+
+    def _style_menu(self):
+        menu = RoundMenu(parent=self)
+        current = self.tile_style()
+        for key, title, tip in self.STYLES:
+            action = Action(FIF.ACCEPT if key == current else COLLECTION_ICON, title, menu)
+            action.setToolTip(tip)
+            action.triggered.connect(lambda _=False, k=key: self.set_tile_style(k))
+            menu.addAction(action)
+        button = self.style_button
+        menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
+
+    def set_tile_style(self, style):
+        self.win.settings["collections_style"] = style
+        core.save_settings(collections_style=style)
+        core.log.info("Вид плиток коллекций: %s", dict((k, t) for k, t, _ in self.STYLES)[style])
+        self._update_tiles()
+        self.grid.viewport().update()
+
+    # --- Картинки плиток «Колода» и «Стекло»: коллаж из обложек, собирается в фоне ---
+    def tile_pixmap(self, collection_id):
+        tile = self.tiles.get(collection_id)
+        return tile[1] if tile else None
+
+    def _tile_paths(self, collection):
+        paths = []
+        for game in self.win.collection_games(collection):
+            path = core.find_cover(game["name"])
+            if path:
+                paths.append(path)
+                if len(paths) == 4:
+                    break
+        return tuple(paths)
+
+    def _update_tiles(self):
+        if self.tile_style() != "glass":
+            return  # коробке коллаж не нужен — обложки рисуются как есть
+        for collection in self.win.collections.collections:
+            cid, paths = collection["id"], self._tile_paths(collection)
+            tile = self.tiles.get(cid)
+            fresh = tile is not None and tile[0] == paths and cid not in self._dirty
+            if fresh or self._tile_pending.get(cid) == paths:
+                continue
+            self._dirty.discard(cid)
+            if not paths:
+                self.tiles[cid] = (paths, None)
+                self._tile_pending.pop(cid, None)
+                continue
+            self._tile_pending[cid] = paths
+            worker = Worker(core.collection_cover, list(paths), parent=self)
+            worker.finished.connect(lambda image, c=cid, p=paths: self._on_tile(c, p, image))
+            worker.failed.connect(lambda message, c=cid: (self._tile_pending.pop(c, None), core.log.warning(
+                "Картинка коллекции не собралась: %s", message)))
+            worker.start()
+        self.grid.viewport().update()
+
+    def _on_tile(self, cid, paths, image):
+        if self._tile_pending.get(cid) != paths:
+            return  # пока собиралась, обложки сменились — соберётся заново
+        self._tile_pending.pop(cid, None)
+        self.tiles[cid] = (paths, pil_pixmap(image))
+        self.grid.viewport().update()
+
+    # --- Открытая коллекция ---
+    def open_collection(self, collection, item=None):
+        if collection is None:
+            return
+        start = None
+        if item is not None:  # обложки полетят из этой плитки
+            cover = CoverTileDelegate.COVER
+            rect = self.grid.visualItemRect(item)
+            corner = self.grid.viewport().mapTo(self, QPoint(rect.x() + (rect.width() - cover.width()) // 2,
+                                                             rect.y() + CoverTileDelegate.PAD))
+            start = QRectF(corner.x(), corner.y(), cover.width(), cover.height())
+        self.current = collection
+        self.games.clearSelection()
+        self.refresh_detail()
+        self.stack.setCurrentWidget(self.detail_view)
+        core.log.info("Коллекция «%s» открыта: %s", collection["name"], game_word(len(self.detail_games)))
+        if start is not None and self.detail_games:
+            self.games_delegate.hidden = True
+            QTimer.singleShot(0, lambda: self._deal(start))
+
+    def _deal(self, start):
+        self.games.doItemsLayout()  # сетка раскладывается с задержкой — места обложек нужны сейчас
+        viewport, cover = self.games.viewport(), CoverTileDelegate.COVER
+        cards = []
+        for row in range(self.games.count()):
+            item = self.games.item(row)
+            rect = self.games.visualItemRect(item)
+            if rect.top() > viewport.height():
+                break
+            corner = viewport.mapTo(self, QPoint(rect.x() + (rect.width() - cover.width()) // 2,
+                                                 rect.y() + CoverTileDelegate.PAD))
+            cards.append((item.data(Qt.UserRole), QRectF(corner.x(), corner.y(), cover.width(), cover.height())))
+            if len(cards) >= DealOverlay.MAX_CARDS:
+                break
+        for name, _rect in cards:
+            self.thumbs.get(name)  # обложки читаются, пока карты летят
+        if not cards or self.stack.currentWidget() is not self.detail_view:
+            self._dealt()
+            return
+        self._overlay = DealOverlay(self, self.thumbs, start, cards)
+        self._overlay.finished.connect(self._dealt)
+
+    def _dealt(self):
+        self._overlay = None
+        self.games_delegate.hidden = False
+        self.games.viewport().update()
+
+    def refresh_detail(self):
+        collection = self.current
+        if collection is None:
+            return
+        games = self.win.collection_games(collection)
+        selected = {id(g) for g in (self._game_of(item) for item in self.games.selectedItems()) if g}
+        self.detail_games = games
+        self.games.clear()
+        for row, game in enumerate(games):
+            item = QListWidgetItem("")
+            item.setData(Qt.UserRole, game["name"])
+            item.setData(Qt.UserRole + 1, row)
+            item.setToolTip(f"{game['name']}\n{GAME_KIND_NAMES[game_kind(game)]}")
+            item.setSizeHint(self._tile_size())
+            self.games.addItem(item)
+            item.setSelected(id(game) in selected)
+        self.detail_title.setText(collection["name"])
+        kinds = {"steam": 0, "port": 0, "disc": 0}
+        for game in games:
+            kinds[game_kind(game)] += 1
+        parts = [f"{title} {kinds[k]}" for k, title in (("steam", "Steam"), ("port", "порты"), ("disc", "дисковые"))
+                 if kinds[k]]
+        missing = len(collection["items"]) - len(games)
+        text = game_word(len(games)) + (f" · {', '.join(parts)}" if len(parts) > 1 else "")
+        if missing:
+            text += f" · ещё {game_word(missing)} сейчас нет в списках — вернутся, если их добавить снова"
+        self.detail_count.setText(text)
+        self.games.setVisible(bool(games))
+        self.detail_empty.setVisible(not games)
+        self.spin_button.setEnabled(bool(games))
+        self.remove_button.setVisible(bool(games))
+        self.detail_buttons.invalidate()
+
+    def _game_of(self, item):
+        row = item.data(Qt.UserRole + 1) if item else None
+        return self.detail_games[row] if isinstance(row, int) and 0 <= row < len(self.detail_games) else None
+
+    def reveal(self, game):
+        """Вернулись со страницы игры — она выделена в открытой коллекции."""
+        if not game:
+            return
+        for row in range(self.games.count()):
+            item = self.games.item(row)
+            if self._game_of(item) is game:
+                self.games.clearSelection()
+                item.setSelected(True)
+                self.games.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                break
+
+    def _on_game_selection(self):
+        self.detail_backdrop.set_names([item.data(Qt.UserRole) for item in self.games.selectedItems()])
+
+    def show_list(self):
+        if self._overlay is not None:
+            self._overlay.deleteLater()
+            self._dealt()
+        self.stack.setCurrentWidget(self.list_view)
+        if self.current is not None:
+            for row in range(self.grid.count()):
+                item = self.grid.item(row)
+                if item.data(Qt.UserRole) == self.current["id"]:
+                    self.grid.clearSelection()
+                    item.setSelected(True)
+                    self.grid.scrollToItem(item)
+                    break
+        self.current = None
+
+    def open_game(self, game):
+        """Страница игры: Steam — на «Рулетке», порт и дисковая — на своей вкладке. С неё можно вернуться сюда."""
+        if not game:
+            return
+        self.win.game_origin = self.current
+        self.win.switchTo(self.win.home_page)
+        self.win.home_page.open_game(game)
+        self.win.game_origin = None  # страница запомнила, откуда её открыли; дальше — обычный путь
+
+    def play(self, game):
+        if not game:
+            return
+        if core.is_port(game):
+            (self.win.disc_page if core.is_disc(game) else self.win.native_page).launch(game)
+        else:
+            self.win.launch_game(game)
+
+    # --- Меню ---
+    def _tile_menu(self, pos):
+        item = self.grid.itemAt(pos)
+        collection = self._collection_of(item)
+        if not collection:
+            return
+        self.grid.clearSelection()
+        item.setSelected(True)
+        has_games = bool(self.win.collection_games(collection))
+        menu = RoundMenu(parent=self)
+        open_action = Action(COLLECTION_ICON, "Открыть", menu)
+        open_action.triggered.connect(lambda: self.open_collection(collection, item))
+        spin = Action(FIF.SYNC, "Крутить в рулетке", menu)
+        spin.setEnabled(has_games)
+        spin.triggered.connect(lambda: self.spin_collection(collection))
+        rename = Action(fluent_icon("EDIT", FIF.SETTING), "Переименовать…", menu)
+        rename.triggered.connect(lambda: self.rename(collection))
+        delete = Action(FIF.DELETE, "Удалить коллекцию", menu)
+        delete.setToolTip("Сами игры останутся в своих списках")
+        delete.triggered.connect(lambda: self.delete(collection))
+        menu.addActions([open_action, spin, rename])
+        menu.addSeparator()
+        menu.addAction(delete)
+        menu.exec(self.grid.viewport().mapToGlobal(pos))
+
+    def _game_menu(self, pos):
+        item = self.games.itemAt(pos)
+        game = self._game_of(item)
+        if not game:
+            return
+        if not item.isSelected():
+            self.games.clearSelection()
+            item.setSelected(True)
+        menu = RoundMenu(parent=self)
+        if core.is_port(game) or game.get("appid"):
+            installed = core.is_port(game) or core.is_installed(game["appid"])
+            play = Action(FIF.PLAY if installed else FIF.DOWNLOAD, "Играть" if installed else "Установить", menu)
+            play.triggered.connect(lambda: self.play(game))
+            menu.addAction(play)
+        page = Action(FIF.GAME, "Открыть страницу игры", menu)
+        page.triggered.connect(lambda: self.open_game(game))
+        menu.addAction(page)
+        menu.addSeparator()
+        selected = [self._game_of(i) for i in self.games.selectedItems()]
+        add_collection_menu(self.win, menu, selected)
+        menu.addSeparator()
+        count = len([g for g in selected if g])
+        remove = Action(fluent_icon("REMOVE", FIF.DELETE),
+                        "Убрать из коллекции" if count == 1 else f"Убрать из коллекции ({count})", menu)
+        remove.setToolTip("Сама игра останется в своём списке")
+        remove.triggered.connect(self.remove_selected)
+        menu.addAction(remove)
+        menu.exec(self.games.viewport().mapToGlobal(pos))
+
+    def _on_escape(self):
+        if self.stack.currentWidget() is self.detail_view:
+            self.show_list()
+        else:
+            self.grid.clearSelection()
+
+    # --- Изменения ---
+    def _save(self):
+        if not self.win.save_collections():
+            return False
+        self.win.collectionsChanged.emit()
+        return True
+
+    def new_collection(self, games):
+        dialog = CollectionNameDialog(self.win, "Новая коллекция")
+        core.log.info("Открыто окно «Новая коллекция»")
+        accepted = dialog.exec()
+        name = dialog.name()
+        dialog.deleteLater()
+        if not accepted or not name:
+            return
+        collection = self.win.collections.create(name)
+        added = self.win.collections.add(collection, [core.collection_ref(g) for g in games if g])
+        if not self.win.save_collections():
+            self.win.collections.delete(collection)
+            return
+        core.log.info("Коллекция «%s» создана: %s", name, game_word(added))
+        self.win.collectionsChanged.emit()
+        notify("success", self.win, "Коллекция создана", f"«{name}»: {game_word(added)}." if added else
+               f"«{name}». Добавить игры — правый клик по игре на любой вкладке → «Добавить в коллекцию».", 6000)
+
+    def toggle_games(self, collection, games, remove=False):
+        refs = [core.collection_ref(g) for g in games if g]
+        lib = self.win.collections
+        count = lib.remove(collection, refs) if remove else lib.add(collection, refs)
+        if not count:
+            notify("info", self.win, "Уже в коллекции", f"«{collection['name']}»: эти игры уже там.")
+            return
+        if not self._save():
+            return
+        core.log.info("Коллекция «%s»: %s %s", collection["name"], "убрано" if remove else "добавлено",
+                      game_word(count))
+        notify("success", self.win, ("Убрано из коллекции" if remove else "Добавлено в коллекцию"),
+               f"«{collection['name']}»: {game_word(count)}.", 3500)
+
+    def remove_selected(self):
+        games = [g for g in (self._game_of(i) for i in self.games.selectedItems()) if g]
+        if not games or self.current is None:
+            notify("info", self.win, "Ничего не выбрано", "Выделите игры в коллекции (Ctrl или Shift — несколько).")
+            return
+        self.toggle_games(self.current, games, remove=True)
+
+    def rename(self, collection):
+        if collection is None:
+            return
+        dialog = CollectionNameDialog(self.win, "Переименовать коллекцию", collection["name"], skip=collection)
+        accepted = dialog.exec()
+        name = dialog.name()
+        dialog.deleteLater()
+        if not accepted or not name or name == collection["name"]:
+            return
+        old, collection["name"] = collection["name"], name
+        if not self._save():
+            collection["name"] = old
+            return
+        core.log.info("Коллекция «%s» переименована в «%s»", old, name)
+
+    def delete(self, collection):
+        if not confirm(self.win, "Удалить коллекцию?", f"«{collection['name']}» — сами игры останутся в своих "
+                                                         "списках, удалится только подборка.", "Удалить"):
+            return
+        self.win.collections.delete(collection)
+        if not self.win.save_collections():
+            self.win.collections.collections.append(collection)
+            return
+        self.tiles.pop(collection["id"], None)
+        core.log.info("Коллекция «%s» удалена", collection["name"])
+        self.win.collectionsChanged.emit()
+        notify("success", self.win, "Коллекция удалена", f"«{collection['name']}». Игры остались на своих местах.")
+
+    def spin_collection(self, collection):
+        """«Крутить эту коллекцию»: рулетка крутит только её игры — и сразу запускается."""
+        if collection is None:
+            return
+        if not self.win.collection_games(collection):
+            notify("info", self.win, "Крутить нечего", f"В «{collection['name']}» пока нет игр.")
+            return
+        pool = f"col:{collection['id']}"
+        self.win.settings["roulette_pool"] = pool
+        core.save_settings(roulette_pool=pool)
+        core.log.info("Рулетка крутит: коллекция «%s»", collection["name"])
+        home = self.win.home_page
+        home.current = None
+        home.name_label.setText("")
+        home.on_library_changed()
+        self.win.switchTo(home)
+        home.show_reel()
+        QTimer.singleShot(350, home.spin)
+
+    # --- Окно ---
+    def _fit_empty_text(self):
+        label = self.empty_text
+        width = max(240, min(560, self.width() - 2 * 36 - 24))
+        rect = QFontMetrics(label.font()).boundingRect(QRect(0, 0, width, 10000),
+                                                       int(Qt.AlignCenter | Qt.TextWordWrap), label.text())
+        label.setFixedSize(width, rect.height() + 6)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.mini.place()
+        self._fit_empty_text()
+        if self._overlay is not None:
+            self._overlay.deleteLater()  # сетка переложилась — места карт уже другие
+            self._dealt()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self.mini.place)
+        self._fit_empty_text()
+        ratio = self.devicePixelRatioF()
+        if ratio != self.thumbs.ratio:
+            self.thumbs.ratio = ratio
+            self.thumbs.clear()
 
 
 # --- Страница «Логи» --------------------------------------------------------
@@ -8768,8 +11987,110 @@ class LogsPage(QWidget):
 
 
 # --- Главное окно -----------------------------------------------------------
-class MainWindow(MSFluentWindow):
+class NavHover(QObject):
+    """Боковое меню — узкая полоска значков. Навели на неё мышь — меню плавно выезжает вправо поверх страницы:
+    значок и подпись в одну строку. Увели мышь или выбрали пункт — прячется обратно. Страница под ним
+    не сдвигается и не сжимается.
+
+    Выбрали пункт — меню спряталось, а мышь всё ещё на полоске значков. Чтобы оно тут же не выехало снова,
+    после выбора оно ждёт, пока мышь уйдёт с полоски, и только потом снова открывается при наведении."""
+
+    OPEN_MS, CLOSE_MS = 150, 250  # мышь просто пролетела мимо — меню не дёргается
+    BLOCK_MIN_MS = 500  # после выбора пункта меню не открывается хотя бы полсекунды, даже если мышь ушла и вернулась
+
+    def __init__(self, panel, strip):
+        super().__init__(panel)
+        self.panel = panel
+        self.strip = strip  # место меню в окне: шириной в полоску значков, не двигается и не прячется
+        self.blocked = False  # меню закрылось выбором пункта — не открывать, пока мышь не уйдёт с полоски
+        self.blocked_at = 0.0
+        self._closing = False  # меню закрываем мы сами, потому что мышь ушла
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self._check)
+        # Пока меню «ждёт ухода мыши», раз в 120 мс смотрим, где курсор: события «мышь ушла» у панели
+        # приходят не всегда — она во время закрытия меняет размер и родителя
+        self.unblock_timer = QTimer(self)
+        self.unblock_timer.setInterval(120)
+        self.unblock_timer.timeout.connect(self._try_unblock)
+        panel.installEventFilter(self)
+        # Пункт выбрали — панель закрывает себя сама (self.collapse()). Подменяем методы у этой панели: так
+        # видно, что её закрыл щелчок, а открыть её снова, пока мышь не ушла, не получится никаким путём
+        self._collapse, self._expand = panel.collapse, panel.expand
+        panel.collapse, panel.expand = self._on_collapse, self._on_expand
+
+    def block(self, *_):
+        """Выбрали пункт меню (или сменилась вкладка), а мышь на меню — не открывать его снова, пока мышь
+        не уйдёт с полоски значков."""
+        if self._hovered():
+            if not self.blocked:
+                core.log.info("Меню: пункт выбран, мышь на полоске — не открываю, пока мышь не уйдёт")
+            self.blocked = True
+            self.blocked_at = time.monotonic()
+            self.timer.stop()
+            self.unblock_timer.start()
+
+    def _try_unblock(self):
+        if not self.blocked:
+            self.unblock_timer.stop()
+        elif time.monotonic() - self.blocked_at >= self.BLOCK_MIN_MS / 1000 and not self._hovered():
+            self.blocked = False
+            self.unblock_timer.stop()
+
+    def _on_collapse(self, *args):
+        if not self._closing:
+            self.block()
+        self._collapse(*args)
+
+    def _on_expand(self, *args):
+        if self.blocked:
+            core.log.info("Меню: пункт только что выбран, мышь ещё на полоске — снова не открываю")
+            return
+        self._expand(*args)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Enter:
+            if not self.blocked:
+                self.timer.start(self.OPEN_MS)
+        elif event.type() == QEvent.Leave:
+            self.timer.start(self.CLOSE_MS)
+        return False
+
+    def _hovered(self):
+        """Курсор над полоской значков или над раскрытым меню. Проверяем по месту на экране, а не по событиям
+        мыши: панель во время закрытия ненадолго прячется и меняет родителя. Полоска с запасом в 8 точек
+        влево и 4 вправо — щелчок у самого края окна тоже считается."""
+        pos = QCursor.pos()
+        strip = QRect(self.strip.mapToGlobal(QPoint(0, 0)), self.strip.size()).adjusted(-8, 0, 4, 0)
+        if self.strip.isVisible() and strip.contains(pos):
+            return True
+        if not self.panel.isVisible():
+            return False
+        return self.panel.rect().adjusted(-8, 0, 4, 0).contains(self.panel.mapFromGlobal(pos))
+
+    def _check(self):
+        animation = getattr(self.panel, "expandAni", None)
+        if animation is not None and animation.state() == QAbstractAnimation.Running:
+            self.timer.start(80)  # меню ещё выезжает или уезжает — решим, когда остановится
+            return
+        mode = getattr(self.panel, "displayMode", None)
+        if self._hovered():
+            if mode == NavigationDisplayMode.COMPACT and not self.blocked:
+                self.panel.expand()
+            return
+        self._try_unblock()
+        if mode == NavigationDisplayMode.MENU:
+            self._closing = True
+            try:
+                self.panel.collapse()
+            finally:
+                self._closing = False
+
+
+class MainWindow(FluentWindow):
     libraryChanged = Signal()
+    portsChanged = Signal()  # порты добавили, убрали, изменили или пришли сведения об их обновлениях
+    collectionsChanged = Signal()  # коллекцию создали, переименовали, удалили или поменяли в ней игры
 
     def __init__(self, startup=None):
         super().__init__()
@@ -8783,17 +12104,27 @@ class MainWindow(MSFluentWindow):
         self.session_steam_id = ""  # SteamID из входа, когда запоминать его отказались: только до закрытия программы
         self.library = core.GameLibrary()
         self.load_message = self.library.load()
+        self.ports = core.PortLibrary()
+        self.ports_message = self.ports.load()
+        self.discs = core.PortLibrary(core.DISCS_FILE, kind="disc")
+        self.discs_message = self.discs.load()
+        self.collections = core.CollectionLibrary()
+        self.collections_message = self.collections.load()
+        self.game_origin = None  # коллекция, из которой открыли страницу игры (для кнопки «К коллекции»)
 
         self.music = MusicPlayer(self.settings["music_path"], self.settings["music_shuffle_mode"],
                                  self.settings["music_repeat"] == "one", self)
         self.music.set_volume(int(self.settings["music_volume"]))
         self.sounds = ReelSounds(bool(self.settings["sounds_enabled"]), self)
         self.covers = CoverPrefetcher(self)
+        self.play_tracker = PlayTracker(self)  # время в портах и дисковых играх
         startup.mark("список игр и музыка")
 
         self.home_page = HomePage(self)
         self.library_page = LibraryPage(self)
         self.native_page = NativePortsPage(self)
+        self.disc_page = DiscGamesPage(self)
+        self.collections_page = CollectionsPage(self)
         self.music_page = MusicPage(self)
         self.web_page = WebPage(self) if QWebEngineView else None
         self.settings_page = SettingsPage(self)
@@ -8803,6 +12134,8 @@ class MainWindow(MSFluentWindow):
         self.addSubInterface(self.home_page, FIF.GAME, "Рулетка")
         self.addSubInterface(self.library_page, FIF.LIBRARY, "Игры Steam")
         self.addSubInterface(self.native_page, FIF.APPLICATION, "Игры Native Port's")
+        self.addSubInterface(self.disc_page, fluent_icon("MEDIA", FIF.FOLDER), "Дисковые игры")
+        self.addSubInterface(self.collections_page, COLLECTION_ICON, "Коллекции")
         self.addSubInterface(self.music_page, FIF.MUSIC, "Саундтреки")
         if self.web_page:
             self.addSubInterface(self.web_page, FIF.GLOBE, "Браузер")
@@ -8817,6 +12150,7 @@ class MainWindow(MSFluentWindow):
             self.home_page.browser.preload(self)  # до показа окна — иначе оно мигнёт при первой ссылке
             startup.mark("браузер")
         self.libraryChanged.connect(self.on_library_changed)
+        self.portsChanged.connect(self.on_library_changed)
         self.stackedWidget.currentChanged.connect(self._time_tab_switch)
 
         self.setWindowTitle(f"{APP_NAME} {__version__}")
@@ -8829,7 +12163,7 @@ class MainWindow(MSFluentWindow):
         self.move(screen.center().x() - self.width() // 2, screen.center().y() - self.height() // 2)
 
         # Если обложки скачаны не все — сначала экран загрузки, барабан потом
-        if self.covers.enqueue(self.library.games):
+        if self.covers.enqueue(self.all_games()):
             self.home_page.show_loading()
         self.music_page.reload_soundtracks()
         QTimer.singleShot(300, self._after_show)
@@ -8838,29 +12172,48 @@ class MainWindow(MSFluentWindow):
         """Замер переключения вкладки: от смены до момента, когда окно снова свободно (после её showEvent)."""
         page = self.stackedWidget.widget(index)
         key = page.objectName() if page else str(index)
-        item = getattr(self.navigationInterface, "items", {}).get(key)  # подпись в меню: «Саундтреки», …
-        timing = Timing(f"вкладка «{item.text() if item else key}»")
+        panel = getattr(self.navigationInterface, "panel", self.navigationInterface)
+        item = getattr(panel, "items", {}).get(key)
+        widget = getattr(item, "widget", item)  # подпись в меню: «Саундтреки», …
+        timing = Timing(f"вкладка «{widget.text() if hasattr(widget, 'text') else key}»")
         QTimer.singleShot(0, lambda: timing.done("показана"))
 
     def _fit_navigation(self):
-        """Боковое меню — по самой длинной подписи, чтобы «О программе» не обрезалось."""
+        """Боковое меню — полоской значков; при наведении раскрывается поверх страницы (NavHover). Ширина
+        раскрытого меню — по самой длинной подписи, чтобы «Игры Native Port's» помещались в одну строку."""
         nav = self.navigationInterface
-        buttons = nav.buttons() if hasattr(nav, "buttons") else []
-        if not buttons:
+        panel = getattr(nav, "panel", None)
+        if panel is None or NavigationDisplayMode is None:
             return
-        width = max([64] + [QFontMetrics(b.font()).horizontalAdvance(b.text()) + 14 for b in buttons])
-        for button in buttons:
-            button.setFixedSize(width, button.height())
-        nav.setFixedWidth(width + 8)  # по 4 точки отступа с каждой стороны
+        if hasattr(nav, "setReturnButtonVisible"):
+            nav.setReturnButtonVisible(False)  # «Назад» в меню не нужен: у страниц свои кнопки возврата
+        if hasattr(nav, "setMinimumExpandWidth"):
+            nav.setMinimumExpandWidth(100000)  # при любой ширине окна меню выезжает поверх, а не раздвигает страницу
+        widgets = [getattr(item, "widget", None) for item in getattr(panel, "items", {}).values()]
+        texts = [QFontMetrics(w.font()).horizontalAdvance(w.text()) for w in widgets if hasattr(w, "text")]
+        if hasattr(nav, "setExpandWidth"):
+            nav.setExpandWidth(max([150] + texts) + 84)  # значок слева, поля и полоса выбранного пункта
+        if getattr(self, "_nav_hover", None) is None:  # второй раз не вешаем — иначе два «наблюдателя» спорят
+            self._nav_hover = NavHover(panel, nav)
+            # Сменилась вкладка щелчком по меню — оно закрывается и не выезжает снова, пока мышь на полоске
+            self.stackedWidget.currentChanged.connect(self._nav_hover.block)
 
     def _after_show(self):
         if self.load_message:
             notify("info", self, "Список игр", self.load_message, duration=8000)
+        if self.ports_message:
+            notify("warning", self, "Список портов", self.ports_message, duration=8000)
+        if self.discs_message:
+            notify("warning", self, "Список дисковых игр", self.discs_message, duration=8000)
+        if self.collections_message:
+            notify("warning", self, "Коллекции", self.collections_message, duration=8000)
         self.set_music_enabled(bool(self.settings["music_enabled"]), save=False)
         if self.home_page.stack.currentWidget() is self.home_page.reel_view:
             self.home_page.reel.play_intro()
         if core.griddb_key():
             self.covers.upgrade(self.library.games)  # каждая обложка проверяется один раз, потом это мгновенно
+        # Новые версии портов на GitHub — не чаще раза в несколько часов, молча, если нового нет
+        QTimer.singleShot(5000, lambda: self.native_page.check_updates(quiet=True))
         if self.needs_steam_setup():
             QTimer.singleShot(400, self.run_steam_setup)
 
@@ -8974,8 +12327,106 @@ class MainWindow(MSFluentWindow):
             self.library_page.add_games()
 
     def on_library_changed(self):
-        if self.covers.enqueue(self.library.games) >= LOADING_THRESHOLD:
+        if self.covers.enqueue(self.all_games()) >= LOADING_THRESHOLD:
             self.home_page.show_loading()
+
+    def all_games(self):
+        """Игры Steam, порты и дисковые игры — для обложек."""
+        return self.library.games + self.ports.ports + self.discs.ports
+
+    def name_in_use(self, name, skip=None):
+        """Название есть у какой-то игры в программе (кроме skip): тогда её обложку не трогаем — она общая."""
+        if self.library.find(name):
+            return True
+        key = name.casefold()
+        return any(p is not skip and p["name"].casefold() == key for p in self.ports.ports + self.discs.ports)
+
+    # Что крутит рулетка: игры Steam, порты, дисковые — по отдельности и вместе. Ключ — источники через «+»
+    POOL_SOURCES = ("steam", "ports", "discs")
+
+    def pool_sources(self):
+        """Источники, в которых есть игры, — из них и можно выбирать."""
+        return [s for s, games in zip(self.POOL_SOURCES, (self.library.games, self.ports.ports, self.discs.ports))
+                if games]
+
+    def roulette_pool(self):
+        """Что крутит рулетка сейчас: «steam», «steam+ports», «discs», «col:<номер коллекции>» и т. п. Выбранного
+        источника больше нет (порты убрали, коллекцию удалили или опустошили) — остаётся то, что есть из
+        выбранного, а если ничего — всё, где есть игры."""
+        pool = self.settings.get("roulette_pool") or "steam"
+        pool = {"mix": "steam+ports"}.get(pool, pool)  # так «Steam и порты» назывались в первых сборках 2.4
+        if pool.startswith("col:"):
+            collection = self.collections.find(pool[4:])
+            if collection and self.collection_games(collection):
+                return pool
+            pool = "steam"
+        available = self.pool_sources()
+        chosen = [s for s in self.POOL_SOURCES if s in pool.split("+") and s in available]
+        return "+".join(chosen or available) or "steam"
+
+    def roulette_games(self):
+        """Игры для барабана — по выбору рядом с «Крутить». В списке те же словари, что в играх и портах."""
+        pool = self.roulette_pool()
+        if pool.startswith("col:"):
+            return self.collection_games(self.collections.find(pool[4:]))
+        lists = {"steam": self.library.games, "ports": self.ports.ports, "discs": self.discs.ports}
+        games = []
+        for source in pool.split("+"):
+            games += lists[source]
+        return games
+
+    def back_to_collection(self):
+        """«К коллекции» со страницы игры: на вкладку «Коллекции», в ту коллекцию, где эта игра выделена."""
+        page = self.collections_page
+        home = self.home_page
+        collection, game = None, None
+        if home.game_page.isVisible():
+            collection, game = home.game_page.origin, home.game_page.game
+            home.game_page.stop_video()
+        for ports_page in (self.native_page, self.disc_page):
+            if ports_page.page.isVisible():
+                collection, game = ports_page.page.origin, ports_page.page.port
+                ports_page.show_list()  # страница игры не остаётся висеть на её вкладке
+        self.switchTo(page)
+        if collection is not None and any(c is collection for c in self.collections.collections):
+            page.open_collection(collection)
+            page.reveal(game)
+        else:
+            page.show_list()
+
+    def collection_games(self, collection):
+        """Игры коллекции, которые сейчас есть в списках, — те же словари, что в играх, портах и дисковых."""
+        if not collection:
+            return []
+        by_appid = {int(g["appid"]): g for g in self.library.games if g.get("appid")}
+        games, seen = [], set()
+        for ref in collection["items"]:
+            if ref["kind"] == "steam":
+                game = by_appid.get(ref["appid"]) if "appid" in ref else self.library.find(ref["name"])
+            else:
+                game = (self.discs if ref["kind"] == "disc" else self.ports).find(ref["id"])
+            if game is not None and id(game) not in seen:
+                seen.add(id(game))
+                games.append(game)
+        return games
+
+    def save_collections(self):
+        try:
+            self.collections.save()
+            return True
+        except OSError as e:
+            notify("error", self, "Не удалось сохранить коллекции", str(e))
+            return False
+
+    def save_ports(self, lib=None):
+        lib = lib or self.ports
+        try:
+            lib.save()
+            return True
+        except OSError as e:
+            notify("error", self, "Не удалось сохранить список " +
+                   ("дисковых игр" if lib is self.discs else "портов"), str(e))
+            return False
 
     def save_library(self):
         try:
@@ -9094,7 +12545,7 @@ class MainWindow(MSFluentWindow):
 
     def open_web(self, url):
         """Открыть адрес на вкладке «Браузер»; без встроенного браузера — во внешнем."""
-        if not self.web_page:
+        if not self.web_page or external_only(url):
             QDesktopServices.openUrl(QUrl(url))
             return
         self.web_page.open(url)
@@ -9191,6 +12642,7 @@ def main():
     startup.mark("Qt")
     window = MainWindow(startup)
     install_error_hooks(window)
+    app.aboutToQuit.connect(window.play_tracker.flush)  # игра ещё идёт — время до закрытия программы засчитывается
     window.show()
     QTimer.singleShot(0, lambda: startup.done("окно на экране"))  # сработает, когда окно уже нарисовано
     sys.exit(app.exec())
