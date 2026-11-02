@@ -22,8 +22,14 @@ steam_soundtracks.json
 cache/
 logs/
 
-# Личные данные: свой список игр и скачанные обложки
+# Личные данные: свой список игр, порты, дисковые игры, коллекции и скачанные обложки
 games.json
+ports.json
+ports.json.broken
+discs.json
+discs.json.broken
+collections.json
+collections.json.broken
 SteamGames.xlsx
 covers/
 
