@@ -109,6 +109,8 @@ DEFAULT_SETTINGS = {
     "roulette_backdrop": "film",
     "selection_backdrop": True,  # выделили игры — за списком их обложки под матовым стеклом
     "collections_style": "glass",  # вид плиток коллекций: glass | case
+    # Фильтры рулетки для игр Steam: жанры (любой из), годы выхода «с» и «по», отзывы — от скольких % положительных
+    "roulette_filters": {"genres": [], "year_from": None, "year_to": None, "reviews": 0},
 }
 
 
@@ -2839,6 +2841,75 @@ class CollectionLibrary:
         return before - len(collection["items"])
 
 
+# --- Список рулетки --------------------------------------------------------------
+# Рулетка крутит игры из их разделов (Steam, порты, дисковые), но список у неё свой: «Убрать из рулетки» убирает
+# игру только из него. В своём разделе и в коллекциях игра остаётся, и крутить её можно в коллекции. Вернуть
+# в рулетку нельзя. Хранятся ссылки, как в коллекциях: переименовали игру — она всё равно убрана.
+ROULETTE_FILE = os.path.join(BASE_DIR, "roulette.json")
+
+
+class RouletteList:
+    def __init__(self, path=ROULETTE_FILE):
+        self.path = path
+        self.removed = []
+        self._keys = set()
+
+    @staticmethod
+    def _key(ref):
+        return ref["kind"], ref.get("appid"), ref.get("name"), ref.get("id")
+
+    @staticmethod
+    def _refs(game):
+        """Ссылки, по которым игра может быть убрана. Игру Steam убрали, пока она была добавлена вручную, а потом
+        связали с магазином (появился номер) — по названию она всё равно узнаётся."""
+        ref = collection_ref(game)
+        return [ref, {"kind": "steam", "name": game["name"]}] if ref["kind"] == "steam" and "appid" in ref else [ref]
+
+    def load(self):
+        """Прочитать список. Файл испорчен — откладываем его в .broken; текст для уведомления или None."""
+        self.removed, self._keys = [], set()
+        if not os.path.exists(self.path):
+            return None
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+            items = data.get("removed") if isinstance(data, dict) else None
+            if not isinstance(items, list):
+                raise ValueError("нет списка убранных игр")
+        except (OSError, ValueError) as e:
+            log.warning("Список рулетки не прочитался: %s", e)
+            try:
+                os.replace(self.path, self.path + ".broken")
+            except OSError:
+                pass
+            return ("Файл списка рулетки повреждён — он сохранён как roulette.json.broken. Игры, убранные "
+                    "из рулетки, снова в ней.")
+        self.removed = [ref for ref in items if CollectionLibrary._valid_ref(ref)]
+        self._keys = {self._key(ref) for ref in self.removed}
+        return None
+
+    def save(self):
+        save_json(self.path, {"version": 1, "removed": self.removed})
+
+    def has(self, game):
+        return any(self._key(ref) in self._keys for ref in self._refs(game))
+
+    def add(self, game):
+        """Убрать игру из рулетки; False — уже убрана."""
+        if self.has(game):
+            return False
+        ref = collection_ref(game)
+        self.removed.append(ref)
+        self._keys.add(self._key(ref))
+        return True
+
+    def undo(self, game):
+        """Отменить add — если сохранить список не удалось."""
+        ref = collection_ref(game)
+        self.removed = [r for r in self.removed if r != ref]
+        self._keys = {self._key(r) for r in self.removed}
+
+
 # --- Другой вариант картинки из SteamGridDB --------------------------------------
 # «Обложка из SteamGridDB» в меню и кнопки «Фон ›» и «Логотип ›» в шапке страницы игры берут из SteamGridDB
 # следующий вариант при каждом нажатии, по кругу. Обложки — только 600×900, как остальные на барабане
@@ -3110,6 +3181,202 @@ def owned_games(appids):
     games = [{"appid": appid, "name": clean_name(item["name"])} for appid, item in store_items(appids).items()
              if item["type"] in (None, STORE_TYPE_GAME) and clean_name(item["name"])]
     return sorted(games, key=lambda g: natural_key(g["name"]))
+
+
+# --- Жанры, год выхода и отзывы игр Steam — для фильтров рулетки ---------------------
+# Собираются в фоне после импорта и синхронизации (и при запуске — то, что не успели) из открытых сведений
+# магазина, без ключа и без входа. Год и оценки — пачками по сотне игр (IStoreBrowseService/GetItems), жанры —
+# со страницы каждой игры (appdetails, тот же запрос, что у страницы игры), по одной и с паузой: магазин отдаёт
+# не больше ~200 страниц за 5 минут. Всё собранное сразу пишется в steam_meta.json — закрыли программу на
+# середине, при следующем запуске сбор продолжится с того же места.
+STEAM_META_FILE = os.path.join(BASE_DIR, "steam_meta.json")
+STEAM_META_VERSION = 1
+STEAM_META_PAUSE = 1.6  # секунд между страницами игр
+STEAM_META_BUSY_PAUSE = 60  # магазин просит подождать (429) — ждём минуту
+STEAM_META_MAX_ERRORS = 5  # столько ошибок подряд — бросаем, продолжим при следующем запуске
+STEAM_META_STORE_TTL = 7 * 24 * 3600  # оценки меняются медленно — пачкой раз в неделю
+STEAM_META_RETRY = 3 * 24 * 3600  # магазин не отдал страницу игры — спросим снова через три дня
+STEAM_META_SAVE_EVERY = 20
+# Пороги «Отзывов» в фильтре — по правилам Steam (score_description): доля положительных отзывов
+REVIEW_LEVELS = ((0, "Любые"), (40, "Смешанные и лучше — от 40 %"), (70, "В основном положительные — от 70 %"),
+                 (80, "Очень положительные — от 80 %"), (95, "Крайне положительные — от 95 %"))
+_meta_lock = threading.Lock()
+
+
+def load_steam_meta():
+    """{appid (строкой): {"genres": [...], "details_year", "store_year", "percent", "reviews", ...}}."""
+    with _meta_lock:
+        try:
+            with open(STEAM_META_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            data = {}
+    if not isinstance(data, dict) or data.get("version") != STEAM_META_VERSION or not isinstance(data.get("games"), dict):
+        return {}
+    return data["games"]
+
+
+def _save_steam_meta(games):
+    with _meta_lock:
+        try:
+            save_json(STEAM_META_FILE, {"version": STEAM_META_VERSION, "games": games})
+        except OSError:
+            log.exception("Не удалось сохранить жанры и оценки игр")
+
+
+def release_year(text):
+    """Год из даты выхода магазина: «8 ноя. 1998 г.» → 1998. Нет года («Скоро») — None."""
+    match = re.search(r"(?<!\d)(19[7-9]\d|20\d\d)(?!\d)", text or "")
+    return int(match.group(1)) if match else None
+
+
+def meta_year(entry):
+    """Год выхода: со страницы игры, а если там его нет — из сведений магазина."""
+    return (entry or {}).get("details_year") or (entry or {}).get("store_year")
+
+
+def meta_ready(entry):
+    """Для игры собрано всё, что нужно фильтрам: жанры (или магазин её не отдал) и оценки."""
+    return bool(entry) and ("genres" in entry or "missing" in entry) and "percent" in entry
+
+
+def _store_meta(appids):
+    """Год выхода и оценка игроков пачками: {appid: {"store_year", "percent", "reviews"}}."""
+    result = {}
+    ids = sorted(set(appids))
+    for start in range(0, len(ids), STORE_ITEMS_BATCH):
+        query = {"ids": [{"appid": appid} for appid in ids[start:start + STORE_ITEMS_BATCH]],
+                 "context": {"language": "russian", "country_code": "US"},
+                 "data_request": {"include_release": True, "include_reviews": True}}
+        data = fetch(STEAM_STORE_ITEMS_URL, params={"input_json": json.dumps(query, separators=(",", ":"))}).json()
+        for item in (data.get("response") or {}).get("store_items") or []:
+            appid = item.get("appid") or item.get("id")
+            if not appid or item.get("success") != 1:
+                continue
+            release = item.get("release") or {}
+            # Старые игры вышли в Steam позже, чем на самом деле: «настоящая» дата — original_release_date
+            stamp = release.get("original_release_date") or release.get("steam_release_date")
+            entry = {"store_year": time.gmtime(int(stamp)).tm_year if stamp else None}
+            reviews = item.get("reviews")
+            if isinstance(reviews, dict):  # нет поля — магазин об оценках не сказал, спросим у отзывов отдельно
+                summary = reviews.get("summary_filtered") or reviews.get("summary_unfiltered") or {}
+                count, percent = int(summary.get("review_count") or 0), summary.get("percent_positive")
+                entry.update(reviews=count, percent=int(percent) if count and percent is not None else None)
+            result[int(appid)] = entry
+    return result
+
+
+def _review_percent(appid):
+    """Запасной путь для оценки одной игры: (доля положительных или None, всего отзывов)."""
+    summary = _reviews_json(appid, languages=["all"], num_per_page=1).get("query_summary") or {}
+    positive, total = int(summary.get("total_positive") or 0), int(summary.get("total_reviews") or 0)
+    return (round(100 * positive / total) if total else None), total
+
+
+def collect_steam_meta(appids, progress=None, cancelled=None):
+    """Собрать жанры, год выхода и оценки игр Steam для фильтров рулетки. В фоновом потоке.
+    progress(готово, всего) — по ходу дела, cancelled() → True — бросить. Возвращает {"done", "total", "stopped"}:
+    stopped — магазин перестал отвечать, остальное соберётся в следующий раз."""
+    appids = sorted({int(a) for a in appids if a})
+    meta = load_steam_meta()
+    now = time.time()
+    stale = [a for a in appids if now - (meta.get(str(a)) or {}).get("store_fetched", 0) > STEAM_META_STORE_TTL]
+    if stale:
+        try:
+            store = _store_meta(stale)
+        except (requests.RequestException, ValueError) as e:
+            log.warning("Магазин Steam не отдал годы и оценки игр: %s", e)
+            store = None
+        if store is not None:
+            for appid in stale:  # и те, о которых магазин промолчал, — чтобы не спрашивать о них при каждом запуске
+                meta.setdefault(str(appid), {}).update(store.get(appid) or {}, store_fetched=now)
+            _save_steam_meta(meta)
+            log.info("Годы и оценки игр Steam из магазина: %d из %d", len(store), len(stale))
+
+    def needs_details(entry):
+        if "genres" in entry:
+            return False
+        return now - entry.get("missing", 0) > STEAM_META_RETRY
+
+    with _details_lock:
+        details_cache = _load_details_cache()  # страницы, которые уже открывали, второй раз не спрашиваем
+    wanted = [a for a in appids if needs_details(meta.get(str(a)) or {}) or "percent" not in (meta.get(str(a)) or {})]
+    total = len(appids)
+    done = total - len(wanted)
+    if progress:
+        progress(done, total)
+    errors, stopped, unsaved = 0, False, 0
+    for appid in wanted:
+        if cancelled and cancelled():
+            break
+        entry = meta.setdefault(str(appid), {})
+        asked = False
+        try:
+            if needs_details(entry):
+                cached = details_cache.get(str(appid))
+                details = cached if isinstance(cached, dict) and "genres" in cached else None
+                if details is None:
+                    asked = True
+                    details = fetch_game_details(appid)
+                if details:
+                    entry["genres"] = list(details.get("genres") or [])
+                    entry["details_year"] = release_year(details.get("release_date"))
+                    entry.pop("missing", None)
+                else:
+                    entry["missing"] = now  # магазин страницу не отдаёт — сняли с продажи или не в этом регионе
+            if "percent" not in entry:
+                if asked:
+                    time.sleep(STEAM_META_PAUSE)
+                asked = True
+                entry["percent"], entry["reviews"] = _review_percent(appid)
+            errors = 0
+        except (requests.RequestException, ValueError) as e:
+            errors += 1
+            busy = isinstance(e, requests.HTTPError) and getattr(e.response, "status_code", 0) == 429
+            log.info("Сведения об игре %s для фильтров не загрузились: %s", appid, e)
+            if errors >= STEAM_META_MAX_ERRORS:
+                stopped = True
+                log.warning("Магазин Steam не отвечает — сбор жанров и оценок продолжу позже")
+                break
+            time.sleep(STEAM_META_BUSY_PAUSE if busy else STEAM_META_PAUSE * 3)
+            continue
+        done += 1
+        unsaved += 1
+        if unsaved >= STEAM_META_SAVE_EVERY:
+            _save_steam_meta(meta)
+            unsaved = 0
+        if progress:
+            progress(done, total)
+        if asked:
+            time.sleep(STEAM_META_PAUSE)
+    if unsaved:
+        _save_steam_meta(meta)
+    log.info("Жанры, годы и оценки игр Steam: собрано %d из %d%s", done, total, " — магазин не отвечает" if stopped else "")
+    return {"done": done, "total": total, "stopped": stopped}
+
+
+def filters_active(filters):
+    filters = filters or {}
+    return bool(filters.get("genres") or filters.get("year_from") or filters.get("year_to") or filters.get("reviews"))
+
+
+def meta_matches(entry, filters):
+    """Подходит ли игра под фильтры рулетки. Нужных фильтру сведений ещё нет — не подходит (не крутим вслепую)."""
+    entry, filters = entry or {}, filters or {}
+    genres = filters.get("genres") or []
+    if genres and not set(genres) & set(entry.get("genres") or []):
+        return False
+    year_from, year_to = filters.get("year_from"), filters.get("year_to")
+    if year_from or year_to:
+        year = meta_year(entry)
+        if not year or (year_from and year < year_from) or (year_to and year > year_to):
+            return False
+    minimum = filters.get("reviews") or 0
+    if minimum:
+        percent = entry.get("percent")
+        if percent is None or percent < minimum:
+            return False
+    return True
 
 
 # Какие картинки магазина нам нужны и как они называются в ответе GetItems (сначала крупные)

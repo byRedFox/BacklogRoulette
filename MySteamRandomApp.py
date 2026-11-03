@@ -119,7 +119,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.4"
+__version__ = "2.4.5"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -2872,6 +2872,11 @@ class ImportDialog(MessageBoxBase):
                                "По времени в игре, которое сообщает Steam.")
         self.replace = option("Заменить мой список: убрать игры Steam, которых нет в выборе",
                               settings["import_replace"], "Игры, добавленные вручную, останутся в любом случае.")
+        heading("Фильтры рулетки")
+        hint("После импорта программа в фоне соберёт из магазина Steam жанры, год выхода и отзывы новых игр — по ним "
+             "рулетку можно фильтровать («Фильтры» рядом с кнопкой «Крутить»). Магазин отдаёт сведения не сразу, "
+             "поэтому для большой библиотеки сбор займёт время: фильтры станут доступны позже, ход сбора виден "
+             "на «Рулетке». Закроете программу раньше — сбор продолжится при следующем запуске.", indent=False)
         layout.addStretch(1)
 
         scroll = ScrollArea(self)
@@ -4829,8 +4834,12 @@ class GamePage(QWidget):
         self.play_button.clicked.connect(self.play)
         self.spin_button = PushButton("Крутить ещё", self, FIF.SYNC)
         self.spin_button.clicked.connect(self.home.spin_again)
-        self.done_button = PushButton("Пройдена", self, FIF.ACCEPT)
-        self.done_button.clicked.connect(self.home.mark_done)
+        # Убирает игру только из рулетки: в «Играх Steam» и в коллекциях она остаётся
+        self.done_button = PushButton("Убрать из рулетки", self, fluent_icon("REMOVE", FIF.DELETE))
+        self.done_button.setToolTip("Игра больше не будет выпадать в рулетке, но останется в «Играх Steam» "
+                                    "и в коллекциях — там её можно крутить")
+        self.done_button.clicked.connect(lambda: self.home.remove_from_roulette(self.game))
+        self.win.rouletteChanged.connect(lambda: self.game is not None and self.update_buttons())
         self.cover_button = PushButton("Своя обложка", self, FIF.PHOTO)
         self.cover_button.clicked.connect(self.home.choose_cover)
         self.store_button = PushButton("Магазин Steam", self, FIF.SHOPPING_CART)
@@ -5171,9 +5180,14 @@ class GamePage(QWidget):
             self._show_without_details("Магазин Steam не отдаёт страницу этой игры — возможно, её сняли с продажи.")
             return
         release = details["release_date"] + (" (ещё не вышла)" if details["coming_soon"] else "")
+        release_caption = "Дата выхода"
+        if not details["release_date"].strip():
+            # На странице магазина даты нет — год из сведений, собранных для фильтров рулетки
+            year = core.meta_year(self.win.steam_meta.get(str(int(self.game["appid"]))))
+            release, release_caption = (str(year), "Год выхода") if year else ("", release_caption)
         values = {
             "genres": ("Жанры", ", ".join(details["genres"]), None),
-            "release": ("Дата выхода", release, None),
+            "release": (release_caption, release, None),
             "developers": ("Разработчик", ", ".join(details["developers"]), None),
         }
         if details["metacritic"]:
@@ -5433,6 +5447,7 @@ class GamePage(QWidget):
         self.store_button.setToolTip(OWNED_STORE_TIP if owned else "Страница игры в магазине Steam")
         self.play_button.setText("Играть" if installed else "Установить")
         self.play_button.setIcon(FIF.PLAY if installed else FIF.DOWNLOAD)
+        self.done_button.setVisible(bool(self.game) and not self.win.roulette.has(self.game))
         music_page = getattr(self.win, "music_page", None)
         album = music_page.album_for_game(self.game) if music_page and self.game else None
         owned = music_page.owned_for_game(self.game) if music_page and self.game and not album else None
@@ -6094,6 +6109,248 @@ class SelectionBackdrop(QWidget):
         self._draw(painter, self.pixmap, self.fade)
 
 
+class MetaCollector(QObject):
+    """Жанры, год выхода и отзывы игр Steam для фильтров рулетки — собираются в фоне после импорта, синхронизации
+    и при запуске (то, что не успели). Один сбор за раз; собранное лежит в win.steam_meta."""
+
+    changed = Signal()  # пришла новая порция сведений или сбор закончился
+    _progress = Signal(int, int)  # из фонового потока
+    _done = Signal(object)
+
+    DELAY_MS = 4000  # список игр меняется пачкой (импорт) — начинаем, когда он успокоится
+    RETRY_MS = 10 * 60 * 1000  # магазин перестал отвечать — пробуем снова через 10 минут
+    RELOAD_S = 3  # сведения с диска перечитываются не чаще раза в 3 с
+    NOTICE_MIN = 10  # столько игр без сведений — предупреждаем, что фильтры будут позже
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        self.running = False
+        self.state = None  # (готово, всего), пока идёт сбор
+        self._again = False
+        self._stop = False
+        self._loaded_at = 0.0
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.start)
+        self._progress.connect(self._on_progress)
+        self._done.connect(self._on_done)
+
+    def appids(self):
+        return sorted({int(g["appid"]) for g in self.win.library.games if g.get("appid")})
+
+    def missing(self, appids=None):
+        meta = self.win.steam_meta
+        return [a for a in (self.appids() if appids is None else appids) if not core.meta_ready(meta.get(str(a)))]
+
+    def schedule(self, delay=None):
+        self.timer.start(self.DELAY_MS if delay is None else delay)
+
+    def stop(self):
+        self._stop = True
+
+    def start(self):
+        if self.running:
+            self._again = True  # список поменялся во время сбора — после него соберём и новые
+            return
+        appids = self.appids()
+        missing = self.missing(appids)
+        now = time.time()
+        stale = any(now - (self.win.steam_meta.get(str(a)) or {}).get("store_fetched", 0) > core.STEAM_META_STORE_TTL
+                    for a in appids)
+        if not appids or not (missing or stale):
+            return
+        if len(missing) >= self.NOTICE_MIN:
+            core.log.info("Собираю жанры, годы и оценки для фильтров рулетки: игр без сведений — %d", len(missing))
+            notify("info", self.win, "Фильтры рулетки — чуть позже",
+                   f"Собираю из магазина Steam жанры, год выхода и отзывы: {game_word(len(missing))}. Это идёт в фоне "
+                   "и займёт какое-то время — пока сбор не закончится, фильтры знают не все игры. Ход сбора — "
+                   "на «Рулетке», под заголовком.", 9000)
+        self.running, self._again, self._stop = True, False, False
+        self.state = (len(appids) - len(missing), len(appids))
+        self.changed.emit()
+        threading.Thread(target=self._run, args=(appids,), daemon=True).start()
+
+    def _run(self, appids):
+        try:
+            result = core.collect_steam_meta(appids, lambda done, total: self._progress.emit(done, total),
+                                             lambda: self._stop)
+        except Exception:  # noqa: BLE001 — без сведений фильтры просто не знают игру, программа работает
+            core.log.exception("Сбор жанров и оценок для фильтров рулетки сломался")
+            result = None
+        try:
+            self._done.emit(result)
+        except RuntimeError:
+            pass  # программу закрыли
+
+    def _on_progress(self, done, total):
+        self.state = (done, total)
+        # Сведения перечитываем и сообщаем о них не на каждую игру: барабан с фильтрами пересобирается по сигналу
+        if time.monotonic() - self._loaded_at >= self.RELOAD_S:
+            self._loaded_at = time.monotonic()
+            self.win.steam_meta = core.load_steam_meta()
+            self.changed.emit()
+
+    def _on_done(self, result):
+        self.running, self.state = False, None
+        self.win.steam_meta = core.load_steam_meta()
+        self.changed.emit()
+        if self._again:
+            self.schedule(1000)
+        elif result and result.get("stopped"):
+            self.schedule(self.RETRY_MS)
+
+
+class RouletteFilterDialog(MessageBoxBase):
+    """«Фильтры» рулетки: жанры, год выхода и отзывы. Только для игр Steam — по сведениям из магазина Steam;
+    игры, о которых сведений ещё нет, под включённый фильтр не попадают."""
+
+    GENRE_COLUMNS = 3
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        filters = win.roulette_filters()
+        self.games = [g for g in win.library.games if g.get("appid") and not win.roulette.has(g)]
+        self.manual = sum(1 for g in win.library.games if not g.get("appid") and not win.roulette.has(g))
+        self._load_entries()
+        counts = {}
+        for entry in self.entries:
+            for genre in entry.get("genres") or []:
+                counts[genre] = counts.get(genre, 0) + 1
+        for genre in filters.get("genres") or []:
+            counts.setdefault(genre, 0)  # жанр выбран раньше, а игр с ним сейчас нет — галочку не теряем
+        years = sorted({y for y in (core.meta_year(e) for e in self.entries) if y}
+                       | {y for y in (filters.get("year_from"), filters.get("year_to")) if isinstance(y, int)})
+
+        self.viewLayout.addWidget(SubtitleLabel("Фильтры рулетки", self))
+        self.viewLayout.addWidget(plain_label(
+            "Только для игр Steam. Жанры, год выхода и отзывы — из магазина Steam. Игры, о которых сведений ещё нет, "
+            "под включённый фильтр не попадают, пока сведения не соберутся.", self, caption=True))
+
+        self.viewLayout.addWidget(StrongBodyLabel("Жанры", self))
+        self.genre_boxes = {}
+        if counts:
+            self.viewLayout.addWidget(plain_label("Подойдёт игра с любым из отмеченных жанров. Ничего не отмечено — "
+                                                  "любые.", self, caption=True))
+            body = QWidget()
+            grid = QGridLayout(body)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(16)
+            grid.setVerticalSpacing(8)
+            chosen = set(filters.get("genres") or [])
+            for i, (genre, count) in enumerate(sorted(counts.items(), key=lambda item: (-item[1], item[0]))):
+                box = CheckBox(f"{genre} ({count})", body)
+                box.setChecked(genre in chosen)
+                box.stateChanged.connect(self._update)
+                grid.addWidget(box, i // self.GENRE_COLUMNS, i % self.GENRE_COLUMNS)
+                self.genre_boxes[genre] = box
+            scroll = ScrollArea(self)
+            scroll.setWidget(body)
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget {background: transparent; border: none}")
+            rows = math.ceil(len(counts) / self.GENRE_COLUMNS)
+            scroll.setFixedHeight(min(rows * 34 + 4, 240))
+            self.viewLayout.addWidget(scroll)
+        else:
+            self.viewLayout.addWidget(plain_label("Жанры появятся, когда соберутся сведения об играх.", self,
+                                                  caption=True))
+
+        self.viewLayout.addWidget(StrongBodyLabel("Год выхода", self))
+        self.years = years
+        self.year_from = ComboBox(self)
+        self.year_from.addItems(["любого"] + [str(y) for y in years])
+        self.year_to = ComboBox(self)
+        self.year_to.addItems(["любой"] + [str(y) for y in years])
+        for box, value in ((self.year_from, filters.get("year_from")), (self.year_to, filters.get("year_to"))):
+            box.setCurrentIndex(years.index(value) + 1 if value in years else 0)
+            box.currentIndexChanged.connect(self._update)
+        year_row = QHBoxLayout()
+        year_row.setSpacing(10)
+        year_row.addWidget(BodyLabel("с", self))
+        year_row.addWidget(self.year_from)
+        year_row.addWidget(BodyLabel("по", self))
+        year_row.addWidget(self.year_to)
+        year_row.addStretch(1)
+        self.viewLayout.addLayout(year_row)
+
+        self.viewLayout.addWidget(StrongBodyLabel("Отзывы в Steam", self))
+        self.reviews_box = ComboBox(self)
+        self.reviews_box.addItems([title for _, title in core.REVIEW_LEVELS])
+        levels = [level for level, _ in core.REVIEW_LEVELS]
+        minimum = filters.get("reviews") or 0
+        self.reviews_box.setCurrentIndex(levels.index(minimum) if minimum in levels else 0)
+        self.reviews_box.currentIndexChanged.connect(self._update)
+        self.viewLayout.addWidget(self.reviews_box, 0, Qt.AlignLeft)
+
+        self.status = plain_label("", self, caption=True)
+        self.viewLayout.addWidget(self.status)
+        reset = TransparentPushButton("Сбросить фильтры", self, FIF.CANCEL)
+        reset.clicked.connect(self._reset)
+        self.counter = StrongBodyLabel("", self)
+        self.counter.setTextColor(themeColor(), themeColor())
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.counter, 1)
+        bottom.addWidget(reset)
+        self.viewLayout.addLayout(bottom)
+
+        self.yesButton.setText("Применить")
+        self.cancelButton.setText("Отмена")
+        self.widget.setMinimumWidth(640)
+        self.widget.setMaximumWidth(640)
+        win.meta.changed.connect(self._on_meta)  # сбор идёт — счётчики оживают прямо в окне
+        self._update()
+
+    def _load_entries(self):
+        meta = self.win.steam_meta
+        self.entries = [meta.get(str(int(g["appid"]))) or {} for g in self.games]
+
+    def _on_meta(self):
+        try:
+            self._load_entries()
+            self._update()
+        except RuntimeError:
+            pass  # окно уже закрыто
+
+    def filters(self):
+        """Выбор в окне — новым словарем (настройки по умолчанию общие, их не трогаем)."""
+        year_from = self.years[self.year_from.currentIndex() - 1] if self.year_from.currentIndex() > 0 else None
+        year_to = self.years[self.year_to.currentIndex() - 1] if self.year_to.currentIndex() > 0 else None
+        if year_from and year_to and year_from > year_to:
+            year_from, year_to = year_to, year_from
+        return {"genres": sorted(g for g, box in self.genre_boxes.items() if box.isChecked()),
+                "year_from": year_from, "year_to": year_to,
+                "reviews": core.REVIEW_LEVELS[max(0, self.reviews_box.currentIndex())][0]}
+
+    def _reset(self):
+        for box in self.genre_boxes.values():
+            box.setChecked(False)
+        self.year_from.setCurrentIndex(0)
+        self.year_to.setCurrentIndex(0)
+        self.reviews_box.setCurrentIndex(0)
+        self._update()
+
+    def _update(self, *_):
+        filters = self.filters()
+        ready = sum(1 for e in self.entries if core.meta_ready(e))
+        total = len(self.games)
+        status = f"Сведения собраны: {ready} из {game_word(total)} Steam."
+        if self.win.meta.running:
+            status += " Сбор идёт в фоне — когда закончится, под фильтры попадут и остальные."
+        elif ready < total:
+            status += " Остальные соберутся позже — программа попробует сама."
+        if self.manual:
+            status += (f" Добавленные вручную без связи со Steam ({self.manual}) под фильтры не попадают: "
+                       "сведений о них нет.")
+        self.status.setText(status)
+        if not core.filters_active(filters):
+            self.counter.setText(f"Фильтры выключены — крутятся все игры Steam: {total + self.manual}")
+            return
+        matched = sum(1 for e in self.entries if core.meta_matches(e, filters))
+        self.counter.setText(f"Подходит: {game_word(matched)}" if matched else "Под эти фильтры не подходит ни одна игра")
+
+
 class HomePage(QWidget):
     """Вкладка «Рулетка»: барабан с одной кнопкой «Крутить», а после выбора — страница выпавшей игры."""
 
@@ -6145,6 +6402,8 @@ class HomePage(QWidget):
         self.win.libraryChanged.connect(self.on_library_changed)
         self.win.portsChanged.connect(self.on_library_changed)
         self.win.collectionsChanged.connect(self.on_library_changed)  # коллекцию могут крутить
+        self.win.rouletteChanged.connect(self.on_library_changed)  # игру убрали из рулетки или сменили фильтры
+        self.win.meta.changed.connect(self._on_meta_changed)
         self.win.covers.coverReady.connect(self.reel.refresh_cover)
         self.win.covers.progress.connect(self.on_cover_progress)
         self.win.covers.finished.connect(self.on_covers_finished)
@@ -6212,6 +6471,9 @@ class HomePage(QWidget):
                                  "или одну из ваших коллекций")
         self._pool_keys, self._pool_labels, self._pool_titles = [], [], {}
         self.pool_box.currentIndexChanged.connect(self._on_pool_changed)
+        # Фильтры по жанру, году и отзывам — только когда крутятся игры Steam
+        self.filter_button = TransparentPushButton("Фильтры", view, FIF.FILTER)
+        self.filter_button.clicked.connect(self.edit_filters)
         # Фон рулетки: ленты едут, стоят или своя картинка — если от движения укачивает
         self.backdrop_button = TransparentPushButton("Фон", view, FIF.PHOTO)
         self.backdrop_button.setToolTip("Фон рулетки: ленты из обложек (едут или стоят) или своя картинка")
@@ -6222,6 +6484,7 @@ class HomePage(QWidget):
         spin_row.addStretch(1)
         spin_row.addWidget(self.spin_button)
         spin_row.addWidget(self.pool_box)
+        spin_row.addWidget(self.filter_button)
         spin_row.addWidget(self.backdrop_button)
         spin_row.addStretch(1)
 
@@ -6430,17 +6693,28 @@ class HomePage(QWidget):
     # --- Барабан ---
     def update_count(self):
         pool = self.win.roulette_pool()
-        counts = {"steam": len(self.win.library.games), "ports": len(self.win.ports.ports),
-                  "discs": len(self.win.discs.ports)}
+        removed = self.win.roulette.has
+        lists = {"steam": self.win.library.games, "ports": self.win.ports.ports, "discs": self.win.discs.ports}
+        counts = {key: sum(1 for g in games if not removed(g)) for key, games in lists.items()}
+        hidden = sum(len(games) - counts[key] for key, games in lists.items())
         sources = pool.split("+")
+        filtered = self.win.filters_on()
         if pool.startswith("col:"):
             collection = self.win.collections.find(pool[4:])
             text = f"Крутим коллекцию «{collection['name']}»: {game_word(len(self.win.roulette_games()))}"
+        elif sources == ["steam"] and filtered:
+            text = f"Подходит под фильтры: {len(self.win.roulette_games())} из {counts['steam']}"
         elif sources == ["steam"]:
-            text = f"Игр в списке: {counts['steam']}"
+            text = f"Игр в рулетке: {counts['steam']}"
         else:
             text = "Крутим: " + " + ".join(f"{self.POOL_NAMES[s]} {counts[s]}" for s in sources)
+        if hidden and not pool.startswith("col:"):
+            text += f" · убрано из рулетки: {hidden}"
+        state = self.win.meta.state
+        if state and state[0] < state[1]:
+            text += f" · собираю жанры, годы и отзывы для фильтров: {state[0]} из {state[1]}"
         self.count_label.setText(text)
+        self._update_filter_button(pool, filtered)
         # Выбор «что крутить» — из тех вариантов, для которых есть игры, и коллекции, в которых есть игры.
         # Кроме Steam ничего нет — не показываем
         available = set(self.win.pool_sources())
@@ -6465,6 +6739,64 @@ class HomePage(QWidget):
             self.pool_box.blockSignals(True)
             self.pool_box.setCurrentIndex(index)
             self.pool_box.blockSignals(False)
+
+    # --- Фильтры для игр Steam ---
+    def _update_filter_button(self, pool, filtered):
+        active = core.filters_active(self.win.roulette_filters())
+        self.filter_button.setVisible(any(g.get("appid") for g in self.win.library.games))
+        self.filter_button.setEnabled(pool == "steam")
+        filters = self.win.roulette_filters()
+        parts = sum(bool(x) for x in (filters.get("genres"), filters.get("year_from") or filters.get("year_to"),
+                                       filters.get("reviews")))
+        self.filter_button.setText(f"Фильтры · {parts}" if active else "Фильтры")
+        if pool != "steam":
+            self.filter_button.setToolTip("Фильтры по жанру, году и отзывам — только для игр Steam: выберите «Игры "
+                                          "Steam» в списке рядом" + (". Сейчас они не действуют" if active else ""))
+        else:
+            self.filter_button.setToolTip("Крутить только игры нужных жанров, лет и с хорошими отзывами"
+                                          if not filtered else "Фильтры включены — нажмите, чтобы изменить или сбросить")
+
+    def edit_filters(self):
+        if self.reel.is_spinning():
+            return
+        dialog = RouletteFilterDialog(self.win)
+        core.log.info("Открыто окно «Фильтры рулетки»")
+        accepted = dialog.exec()
+        filters = dialog.filters()
+        dialog.deleteLater()
+        if not accepted or filters == self.win.roulette_filters():
+            return
+        self.win.settings["roulette_filters"] = filters
+        core.save_settings(roulette_filters=filters)
+        core.log.info("Фильтры рулетки: %s", self.filters_text(filters) or "выключены")
+        self.current = None
+        self.name_label.setText("")
+        self.win.rouletteChanged.emit()
+        if core.filters_active(filters) and not self.win.roulette_games():
+            notify("warning", self.win, "Под фильтры ничего не подходит",
+                   "Ослабьте фильтры или подождите, пока соберутся сведения об играх." if self.win.meta.running else
+                   "Ослабьте фильтры: «Фильтры» рядом с кнопкой «Крутить».", 6000)
+
+    @staticmethod
+    def filters_text(filters):
+        parts = []
+        if filters.get("genres"):
+            parts.append("жанры " + ", ".join(filters["genres"]))
+        if filters.get("year_from") or filters.get("year_to"):
+            parts.append(f"годы {filters.get('year_from') or '…'}–{filters.get('year_to') or '…'}")
+        if filters.get("reviews"):
+            parts.append(f"отзывы от {filters['reviews']} %")
+        return "; ".join(parts)
+
+    def _on_meta_changed(self):
+        """Пришла порция жанров и оценок. С фильтрами под них могли подойти новые игры — тогда барабан пересобираем."""
+        if self.win.filters_on():
+            ids = [id(g) for g in self.win.roulette_games()]
+            if ids != getattr(self, "_filtered_ids", None):
+                self._filtered_ids = ids
+                self.on_library_changed()
+                return
+        self.update_count()
 
     def update_buttons(self):
         self.spin_button.setEnabled(not self.reel.is_spinning())
@@ -6497,7 +6829,16 @@ class HomePage(QWidget):
         if self.reel.is_spinning():
             return
         if not games:
-            notify("warning", self.win, "Список пуст", "Добавьте игры на вкладке «Игры Steam».")
+            if self.win.filters_on():
+                notify("warning", self.win, "Под фильтры ничего не подходит",
+                       "Сведения об играх ещё собираются — подождите немного или ослабьте фильтры."
+                       if self.win.meta.running else "Ослабьте фильтры: «Фильтры» рядом с кнопкой «Крутить».", 6000)
+            elif self.win.roulette.removed and not self.win.roulette_pool().startswith("col:"):
+                notify("warning", self.win, "Крутить нечего",
+                       "Все игры убраны из рулетки. Их можно крутить в коллекциях: «Коллекции» → «Крутить эту "
+                       "коллекцию», — или добавьте новые игры.", 7000)
+            else:
+                notify("warning", self.win, "Список пуст", "Добавьте игры на вкладке «Игры Steam».")
             return
         # Не выдаём ту же игру два раза подряд
         candidates = [g for g in games if g is not self.current] or games
@@ -6521,24 +6862,40 @@ class HomePage(QWidget):
             self.win.game_origin = None  # выпала на рулетке — «назад» к рулетке, а не в коллекцию
             self.open_game(game)
 
-    def mark_done(self):
-        if not self.current:
+    SECTION_NAMES = {"steam": "«Игры Steam»", "port": "«Игры Native Port's»", "disc": "«Дисковые игры»"}
+
+    def remove_from_roulette(self, game):
+        """«Убрать из рулетки»: игра больше не выпадает на барабане, но остаётся в своём разделе и в коллекциях.
+        Вернуть её в рулетку нельзя — крутить можно в коллекции."""
+        if not game or self.win.roulette.has(game):
             return
-        name = self.current["name"]
-        if not confirm(self.win, "Игра пройдена?", f"Убрать «{name}» из списка вместе с обложкой?", "Убрать"):
+        name = game["name"]
+        section = self.SECTION_NAMES[game_kind(game)]
+        if not confirm(self.win, "Убрать из рулетки?",
+                       f"«{name}» больше не будет выпадать в рулетке. Из раздела {section} игра никуда не денется: "
+                       "её можно запускать, открывать её страницу и добавлять в коллекции, как раньше.\n\n"
+                       "Вернуть игру в рулетку будет нельзя. Но если захотите снова её крутануть — добавьте её "
+                       "в коллекцию и нажмите «Крутить эту коллекцию»: в коллекции крутятся все её игры, "
+                       "и убранные из рулетки тоже.", "Убрать из рулетки"):
             return
-        self.win.library.remove(self.current)
-        if not self.win.save_library():
-            return
+        self.win.roulette.add(game)
         try:
-            core.delete_cover(name)
-        except OSError:
-            pass  # обложка не критична
-        self.current = None
-        self.name_label.setText("")
-        self.show_reel()  # со страницы пройденной игры — обратно к барабану
-        self.win.libraryChanged.emit()
-        notify("success", self.win, "Отличная работа!", f"«{name}» убрана из списка.")
+            self.win.roulette.save()
+        except OSError as e:
+            self.win.roulette.undo(game)
+            notify("error", self.win, "Не удалось сохранить список рулетки", str(e))
+            return
+        core.log.info("«%s» убрана из рулетки (%s), в разделе осталась", name, GAME_KIND_NAMES[game_kind(game)])
+        if self.current is game:
+            self.current = None
+            self.name_label.setText("")
+        self.win.rouletteChanged.emit()
+        notify("success", self.win, "Убрано из рулетки",
+               f"«{name}» осталась в разделе {section}. Крутить её можно в коллекции.", 6000)
+
+    def mark_done(self):
+        """До 2.4.5 «Пройдена» убирала игру из списка вместе с обложкой — теперь только из рулетки."""
+        self.remove_from_roulette(self.current)
 
     def choose_cover(self):
         if self.current:
@@ -9610,6 +9967,12 @@ class PortPage(QWidget):
         self.cover_button.clicked.connect(lambda: self.win.library_page.choose_cover(self.port))
         self.spin_button = PushButton("Крутить ещё", self, FIF.SYNC)
         self.spin_button.clicked.connect(self._spin_again)
+        # Как у игр Steam: только из рулетки, в своём разделе и в коллекциях игра остаётся
+        self.roulette_button = PushButton("Убрать из рулетки", self, fluent_icon("REMOVE", FIF.DELETE))
+        self.roulette_button.setToolTip("Игра больше не будет выпадать в рулетке, но останется здесь и в коллекциях — "
+                                        "там её можно крутить")
+        self.roulette_button.clicked.connect(lambda: self.win.home_page.remove_from_roulette(self.port))
+        self.win.rouletteChanged.connect(self.refresh)
         self.steam_button = PushButton("Найти в Steam", self, FIF.SEARCH)
         self.steam_button.setToolTip("Найдите игру в магазине Steam — здесь появятся её описание, оценки и отзывы. "
                                      "Запускаться она будет по-прежнему своим файлом")
@@ -9623,7 +9986,7 @@ class PortPage(QWidget):
         buttons_box = QWidget(self)
         self.buttons = CenteredFlowLayout(buttons_box, spacing=12)
         for button in (self.play_button, self.update_button, self.updated_button, self.repo_button, self.steam_button,
-                       self.folder_button, self.edit_button, self.cover_button, self.spin_button,
+                       self.folder_button, self.edit_button, self.cover_button, self.spin_button, self.roulette_button,
                        self.collection_button, back_button):
             self.buttons.addWidget(button)
 
@@ -9848,6 +10211,7 @@ class PortPage(QWidget):
             self.collection_button.setText(f"К коллекции «{origin['name']}»")
         # «Крутить ещё» — когда эта игра сама крутится в рулетке
         self.spin_button.setVisible(any(g is port for g in self.win.roulette_games()))
+        self.roulette_button.setVisible(not self.win.roulette.has(port))
         self.buttons.invalidate()
 
         # Дисковая игра: карточка Steam (если связана и Steam её отдал), иначе статья из Википедии
@@ -12091,6 +12455,7 @@ class MainWindow(FluentWindow):
     libraryChanged = Signal()
     portsChanged = Signal()  # порты добавили, убрали, изменили или пришли сведения об их обновлениях
     collectionsChanged = Signal()  # коллекцию создали, переименовали, удалили или поменяли в ней игры
+    rouletteChanged = Signal()  # игру убрали из рулетки или сменили фильтры рулетки
 
     def __init__(self, startup=None):
         super().__init__()
@@ -12110,6 +12475,10 @@ class MainWindow(FluentWindow):
         self.discs_message = self.discs.load()
         self.collections = core.CollectionLibrary()
         self.collections_message = self.collections.load()
+        self.roulette = core.RouletteList()  # игры, убранные из рулетки (в своих разделах они остаются)
+        self.roulette_message = self.roulette.load()
+        self.steam_meta = core.load_steam_meta()  # жанры, годы и оценки игр Steam — для фильтров рулетки
+        self.meta = MetaCollector(self)
         self.game_origin = None  # коллекция, из которой открыли страницу игры (для кнопки «К коллекции»)
 
         self.music = MusicPlayer(self.settings["music_path"], self.settings["music_shuffle_mode"],
@@ -12150,6 +12519,7 @@ class MainWindow(FluentWindow):
             self.home_page.browser.preload(self)  # до показа окна — иначе оно мигнёт при первой ссылке
             startup.mark("браузер")
         self.libraryChanged.connect(self.on_library_changed)
+        self.libraryChanged.connect(lambda: self.meta.schedule())  # импорт и синхронизация: новым играм — сведения
         self.portsChanged.connect(self.on_library_changed)
         self.stackedWidget.currentChanged.connect(self._time_tab_switch)
 
@@ -12207,6 +12577,10 @@ class MainWindow(FluentWindow):
             notify("warning", self, "Список дисковых игр", self.discs_message, duration=8000)
         if self.collections_message:
             notify("warning", self, "Коллекции", self.collections_message, duration=8000)
+        if self.roulette_message:
+            notify("warning", self, "Список рулетки", self.roulette_message, duration=8000)
+        # Жанры, годы и отзывы, которые не успели собрать в прошлый раз, — когда окно уже открылось и обложки пошли
+        self.meta.schedule(8000)
         self.set_music_enabled(bool(self.settings["music_enabled"]), save=False)
         if self.home_page.stack.currentWidget() is self.home_page.reel_view:
             self.home_page.reel.play_intro()
@@ -12365,15 +12739,28 @@ class MainWindow(FluentWindow):
         return "+".join(chosen or available) or "steam"
 
     def roulette_games(self):
-        """Игры для барабана — по выбору рядом с «Крутить». В списке те же словари, что в играх и портах."""
+        """Игры для барабана — по выбору рядом с «Крутить». В списке те же словари, что в играх и портах.
+        Убранные из рулетки сюда не попадают (кроме коллекций: там крутятся все их игры), а игры Steam — ещё
+        и по фильтрам, если они включены."""
         pool = self.roulette_pool()
         if pool.startswith("col:"):
             return self.collection_games(self.collections.find(pool[4:]))
         lists = {"steam": self.library.games, "ports": self.ports.ports, "discs": self.discs.ports}
         games = []
         for source in pool.split("+"):
-            games += lists[source]
+            games += [g for g in lists[source] if not self.roulette.has(g)]
+        if self.filters_on():
+            filters, meta = self.roulette_filters(), self.steam_meta
+            games = [g for g in games if g.get("appid") and core.meta_matches(meta.get(str(int(g["appid"]))), filters)]
         return games
+
+    def roulette_filters(self):
+        filters = self.settings.get("roulette_filters")
+        return filters if isinstance(filters, dict) else {}
+
+    def filters_on(self):
+        """Фильтры включены и действуют: они только для игр Steam — когда рулетка крутит только их."""
+        return self.roulette_pool() == "steam" and core.filters_active(self.roulette_filters())
 
     def back_to_collection(self):
         """«К коллекции» со страницы игры: на вкладку «Коллекции», в ту коллекцию, где эта игра выделена."""
