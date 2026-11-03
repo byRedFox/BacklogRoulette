@@ -111,6 +111,12 @@ DEFAULT_SETTINGS = {
     "collections_style": "glass",  # вид плиток коллекций: glass | case
     # Фильтры рулетки для игр Steam: жанры (любой из), годы выхода «с» и «по», отзывы — от скольких % положительных
     "roulette_filters": {"genres": [], "year_from": None, "year_to": None, "reviews": 0},
+    # Обновление программы: проверять ли GitHub самой (раз в сутки), когда проверяли, что нашли и какую
+    # версию попросили пропустить
+    "update_auto": True,
+    "update_checked": 0,
+    "update_release": None,
+    "update_skip": "",
 }
 
 
@@ -3905,6 +3911,241 @@ PORT_NOTES_MAX = 3000  # описание релиза длиннее — обр
 
 class GitHubLimit(ServiceBusy):
     """GitHub исчерпал лимит проверок без входа (60 в час)."""
+
+
+# --- Обновление программы ---------------------------------------------------------
+# Программа спрашивает GitHub о последнем релизе своего проекта (открытые сведения, без ключа и без входа) и только
+# сообщает о новой версии. Ставит её лишь по кнопке «Обновить»: скачивает BacklogRoulette.exe из этого релиза
+# по HTTPS — только с адреса загрузок своего проекта — и сверяет SHA-256 с той суммой, что GitHub сам посчитал для
+# файла релиза. Не сошлось — скачанный файл удаляется, ничего не меняется. Запущенную программу Windows
+# перезаписать не даёт, но переименовать даёт: старый .exe становится BacklogRoulette.exe.old (без «.exe» в конце —
+# случайно его не запустить), новый встаёт на его место, программа перезапускается, а .old удаляется при следующем
+# запуске. Данные (games.json, settings.json, обложки) лежат рядом и не трогаются.
+UPDATE_REPO = "byRedFox/BacklogRoulette"
+UPDATE_ASSET = "BacklogRoulette.exe"
+UPDATE_SUM_ASSET = UPDATE_ASSET + ".sha256"  # если GitHub не прислал сумму файла — её можно приложить к релизу
+UPDATE_DOWNLOAD_PREFIX = f"https://github.com/{UPDATE_REPO}/releases/download/"
+UPDATE_CHECK_EVERY = 24 * 3600  # сами проверяем не чаще раза в сутки
+UPDATE_MIN_SIZE = 5 * 1024 * 1024  # .exe программы — десятки мегабайт; меньше — это не она
+UPDATE_MAX_SIZE = 1024 * 1024 * 1024
+UPDATE_NOTES_MAX = 4000
+UPDATE_DOWNLOAD_TIMEOUT = 30  # секунд тишины, после которых загрузку бросаем
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def version_tuple(text):
+    """«v2.4.5» → (2, 4, 5). Не номер версии (пробный тег вроде «v2.5-beta») — None."""
+    match = re.fullmatch(r"v?(\d+(?:\.\d+){0,3})", (text or "").strip(), re.IGNORECASE)
+    return tuple(int(part) for part in match.group(1).split(".")) if match else None
+
+
+def newer_version(tag, current):
+    """Тег релиза новее текущей версии. 2.4 и 2.4.0 — одна версия."""
+    new, old = version_tuple(tag), version_tuple(current)
+    if not new or not old:
+        return False
+    width = max(len(new), len(old))
+    return new + (0,) * (width - len(new)) > old + (0,) * (width - len(old))
+
+
+def _release_asset_url(item):
+    url = item.get("browser_download_url") or ""
+    return url if url.startswith(UPDATE_DOWNLOAD_PREFIX) else ""
+
+
+def latest_release():
+    """Последний выпущенный релиз проекта на GitHub (черновики и пробные GitHub сюда не отдаёт):
+    {"tag", "name", "notes", "url", "asset": {"url", "size", "sha256", "sum_url"} или None}. Релизов нет — None."""
+    try:
+        response = requests.get(f"{GITHUB_API_URL}/repos/{UPDATE_REPO}/releases/latest", headers=GITHUB_HEADERS,
+                                timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as e:
+        raise ServiceBusy(f"GitHub не ответил: {e}") from None
+    if response.status_code in (403, 429) and response.headers.get("X-RateLimit-Remaining") == "0":
+        raise GitHubLimit("GitHub временно ограничил проверки без входа — попробуйте через час")
+    if response.status_code == 404:
+        return None
+    if not response.ok:
+        raise ServiceBusy(f"GitHub ответил ошибкой {response.status_code}, попробуйте позже")
+    data = response.json() or {}
+    tag = str(data.get("tag_name") or "")
+    asset, sum_url = None, ""
+    for item in data.get("assets") or []:
+        if item.get("name") == UPDATE_SUM_ASSET:
+            sum_url = _release_asset_url(item)
+    for item in data.get("assets") or []:
+        if item.get("name") != UPDATE_ASSET:
+            continue
+        url = _release_asset_url(item)
+        digest = str(item.get("digest") or "").lower()  # «sha256:…» — GitHub считает сам для каждого файла релиза
+        sha = digest[7:] if digest.startswith("sha256:") else ""
+        if url and (_SHA256_RE.fullmatch(sha) or sum_url):
+            asset = {"url": url, "size": int(item.get("size") or 0), "sha256": sha if _SHA256_RE.fullmatch(sha) else "",
+                     "sum_url": sum_url}
+        else:
+            log.warning("Релиз %s: у файла %s нет контрольной суммы — обновить по кнопке нельзя, только вручную",
+                        tag, UPDATE_ASSET)
+    notes = str(data.get("body") or "").strip()
+    release = {"tag": tag, "name": str(data.get("name") or tag), "url": str(data.get("html_url") or ""),
+               "notes": notes[:UPDATE_NOTES_MAX] + ("…" if len(notes) > UPDATE_NOTES_MAX else ""), "asset": asset}
+    if not release["url"].startswith(f"https://github.com/{UPDATE_REPO}/releases/"):
+        release["url"] = f"https://github.com/{UPDATE_REPO}/releases/latest"
+    log.info("Обновление программы: последний релиз на GitHub — %s%s", tag or "без тега",
+             "" if asset else f" (файла {UPDATE_ASSET} с контрольной суммой нет)")
+    return release
+
+
+def can_self_update():
+    """Заменить себя может только собранная программа одним файлом .exe: не запуск из исходников и не сборка
+    папкой (там рядом с .exe лежит _internal, и одного файла мало)."""
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return False
+    return (os.path.basename(sys.executable).lower().endswith(".exe")
+            and not os.path.isdir(os.path.join(BASE_DIR, "_internal")))
+
+
+def _expected_sum(asset):
+    if asset.get("sha256"):
+        return asset["sha256"]
+    response = requests.get(asset["sum_url"], headers={"User-Agent": GITHUB_HEADERS["User-Agent"]},
+                            timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    match = re.match(r"\s*([0-9A-Fa-f]{64})\b", response.text[:400])  # «сумма  имя_файла», как у sha256sum
+    if not match:
+        raise OSError(f"в {UPDATE_SUM_ASSET} нет контрольной суммы SHA-256")
+    return match.group(1).lower()
+
+
+def download_update(release, progress=None):
+    """Скачать .exe новой версии рядом с собой (BacklogRoulette.exe.new) и сверить SHA-256. Путь к файлу.
+    Сумма не сошлась, файл не похож на программу Windows или загрузка оборвалась — файла нет, OSError.
+    progress(текст, проценты или -1). Вызывается в фоновом потоке."""
+    asset = (release or {}).get("asset")
+    if not asset:
+        raise OSError(f"в релизе нет файла {UPDATE_ASSET} с контрольной суммой — обновите вручную со страницы релиза")
+    new_path = sys.executable + ".new"
+    try:
+        if progress:
+            progress("Узнаю контрольную сумму файла…", -1)
+        expected = _expected_sum(asset)
+        digest, size = hashlib.sha256(), 0
+        with requests.get(asset["url"], headers={"User-Agent": GITHUB_HEADERS["User-Agent"]},
+                          timeout=UPDATE_DOWNLOAD_TIMEOUT, stream=True) as response:
+            response.raise_for_status()
+            total = int(response.headers.get("Content-Length") or asset.get("size") or 0)
+            if total > UPDATE_MAX_SIZE:
+                raise OSError("файл обновления подозрительно большой — не скачиваю")
+            with open(new_path, "wb") as f:
+                for chunk in response.iter_content(256 * 1024):
+                    size += len(chunk)
+                    if size > UPDATE_MAX_SIZE:
+                        raise OSError("файл обновления подозрительно большой — не скачиваю")
+                    digest.update(chunk)
+                    f.write(chunk)
+                    if progress and total:
+                        progress(f"Скачиваю: {size // (1024 * 1024)} из {total // (1024 * 1024)} МБ",
+                                 min(99, size * 100 // total))
+        with open(new_path, "rb") as f:
+            is_program = f.read(2) == b"MZ"
+        if size < UPDATE_MIN_SIZE or not is_program:
+            raise OSError("скачанный файл — не программа Windows. Ничего не изменено")
+        if not hmac.compare_digest(digest.hexdigest(), expected):
+            raise OSError("контрольная сумма SHA-256 не совпала: файл повреждён при загрузке или подменён. "
+                          "Ничего не изменено")
+    except BaseException:
+        try:
+            os.remove(new_path)
+        except OSError:
+            pass
+        raise
+    log.info("Обновление %s скачано и проверено: %d МБ, SHA-256 совпала (…%s)", release["tag"],
+             size // (1024 * 1024), expected[-8:])
+    return new_path
+
+
+def apply_update(new_path):
+    """Поставить скачанный .exe на место запущенного: запущенный переименовывается в .old (Windows это разрешает),
+    новый встаёт на его место. Не вышло — всё возвращается как было (OSError)."""
+    exe = sys.executable
+    old = exe + ".old"
+    attempts = 6  # антивирус проверяет свежий файл и ненадолго держит его открытым — ждём его
+    for attempt in range(attempts):
+        try:
+            if os.path.exists(old):
+                os.remove(old)
+            os.replace(exe, old)
+            break
+        except OSError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.5)
+    try:
+        for attempt in range(attempts):
+            try:
+                os.replace(new_path, exe)
+                break
+            except OSError:
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(0.5)
+    except OSError:
+        os.replace(old, exe)
+        raise
+    log.info("Обновление поставлено: %s заменён, прежняя версия — %s до следующего запуска",
+             os.path.basename(exe), os.path.basename(old))
+    return exe
+
+
+def restart_program(exe, updated_from):
+    """Запустить новую версию и дать ей дождаться, пока эта закроется. Без параметров и без командной строки,
+    с переменными окружения, очищенными от этой копии программы (PyInstaller распакует новую заново)."""
+    import subprocess
+
+    env = {name: value for name, value in os.environ.items()
+           if not name.startswith(("QT_", "QML", "_PYI", "_MEI", "PYTHON")) and name != "BR_FAKE_VERSION"}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    env["BR_WAIT_PID"] = str(os.getpid())
+    env["BR_UPDATED_FROM"] = updated_from
+    kernel32, old_dir = None, None
+    if sys.platform == "win32" and getattr(sys, "frozen", False):
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        buffer = ctypes.create_unicode_buffer(32768)
+        old_dir = buffer.value if kernel32.GetDllDirectoryW(32768, buffer) else None
+        kernel32.SetDllDirectoryW(None)  # как при запуске портов: новой копии — обычный поиск библиотек
+    try:
+        subprocess.Popen([exe], cwd=os.path.dirname(exe), env=env, close_fds=True)
+    finally:
+        if kernel32 is not None:
+            kernel32.SetDllDirectoryW(old_dir)
+    log.info("Перезапуск в новой версии")
+
+
+def finish_update():
+    """При запуске: дождаться, пока закроется прежняя копия программы (если нас запустило обновление), и убрать
+    BacklogRoulette.exe.old и недокачанный .new. Возвращает версию, с которой обновились, или ""."""
+    pid = os.environ.pop("BR_WAIT_PID", "")
+    updated_from = os.environ.pop("BR_UPDATED_FROM", "")
+    os.environ.pop("PYINSTALLER_RESET_ENVIRONMENT", None)
+    if pid.isdigit() and sys.platform == "win32":
+        import ctypes
+        synchronize = 0x00100000
+        handle = ctypes.windll.kernel32.OpenProcess(synchronize, False, int(pid))
+        if handle:
+            ctypes.windll.kernel32.WaitForSingleObject(handle, 20000)  # не дольше 20 с
+            ctypes.windll.kernel32.CloseHandle(handle)
+    if getattr(sys, "frozen", False):
+        for leftover in (sys.executable + ".old", sys.executable + ".new"):
+            for attempt in range(10):
+                try:
+                    if os.path.exists(leftover):
+                        os.remove(leftover)
+                    break
+                except OSError:
+                    time.sleep(0.3)
+            else:
+                log.warning("Не удалось удалить %s — удалите его вручную", os.path.basename(leftover))
+    return updated_from
 
 
 def port_name_from_folder(folder):

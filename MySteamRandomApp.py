@@ -49,6 +49,11 @@ try:  # как сейчас показано боковое меню: полос
 except ImportError:
     NavigationDisplayMode = None
 
+try:  # точка «есть обновление» на значке «Настройки» в боковом меню
+    from qfluentwidgets import DotInfoBadge, InfoBadgePosition
+except ImportError:
+    DotInfoBadge = InfoBadgePosition = None
+
 # Прозрачные кнопки Fluent («Удалить с ПК», «К портам», «Другая папка…») без рамки: на размытой подложке
 # альбома или игры их не видно, пока не наведёшь мышь. Поэтому вокруг них — тонкая рамка, как у плашек
 # на странице игры; под мышью она цвета темы.
@@ -119,7 +124,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.4.5"
+__version__ = "2.4.6"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -218,7 +223,7 @@ class Notice(QWidget):
                "warning": (QColor(157, 93, 0), QColor(252, 225, 0)),
                "error": (QColor(196, 43, 28), QColor(255, 153, 164))}
 
-    def __init__(self, kind, host, title, text, duration):
+    def __init__(self, kind, host, title, text, duration, action=None):
         super().__init__(host)
         self.kind, self.host, self.closing = kind, host, False
         s = self.SHADOW
@@ -234,6 +239,13 @@ class Notice(QWidget):
             body = BodyLabel(text, self)
             body.setWordWrap(True)
             texts.addWidget(body)
+        if action:  # кнопка действия: («Подробнее», функция) — нажали, уведомление закрывается
+            label, callback = action
+            button = PrimaryPushButton(label, self)
+            button.clicked.connect(self.dismiss)
+            button.clicked.connect(callback)
+            texts.addSpacing(6)
+            texts.addWidget(button, 0, Qt.AlignLeft)
         layout.addLayout(texts, 1)
         close = TransparentToolButton(FIF.CLOSE, self)
         close.setFixedSize(28, 28)
@@ -355,8 +367,9 @@ def arrange_notices(host):
         top += notice.height() - overlap
 
 
-def notify(kind, window, title, text="", duration=3500):
+def notify(kind, window, title, text="", duration=3500, action=None):
     """Уведомление по центру окна, в общем стиле программы: kind = success | info | warning | error.
+    action = (подпись, функция) — кнопка в уведомлении.
 
     Открыто окно поверх программы («Добавить игру», вопрос) — уведомление встаёт поверх него, а не прячется сзади.
     """
@@ -366,7 +379,7 @@ def notify(kind, window, title, text="", duration=3500):
             and modal.parentWidget().window() is host:
         host = modal
     if host is not None:
-        Notice(kind, host, title, text, duration)
+        Notice(kind, host, title, text, duration, action)
 
 
 # --- Матовое стекло ----------------------------------------------------------
@@ -9156,6 +9169,51 @@ class SettingsPage(QWidget):
                                   "саундтреки вы купили. Кнопка стирает этот вход и куки всех сайтов браузера.", self)
         store_hint.setWordWrap(True)
 
+        # Обновление программы: о новой версии сообщает GitHub, ставится она только по кнопке «Обновить»
+        self.update_status = BodyLabel("", self)
+        self.update_status.setWordWrap(True)
+        self.update_notes = CaptionLabel("", self)
+        self.update_notes.setWordWrap(True)
+        self.update_notes.setTextFormat(Qt.MarkdownText)  # заметка к релизу на GitHub написана в Markdown
+        self.update_notes.setTextInteractionFlags(Qt.TextSelectableByMouse)  # ссылки из заметки не открываются
+        self.update_button = PrimaryPushButton("Обновить", self, FIF.DOWNLOAD)
+        self.update_button.clicked.connect(self.install_update)
+        self.update_page_button = PushButton("Страница релиза", self, FIF.GITHUB)
+        self.update_page_button.clicked.connect(self.open_release_page)
+        self.update_skip_button = PushButton("Пропустить эту версию", self, FIF.CLOSE)
+        self.update_skip_button.setToolTip("Точка на «Настройках» пропадёт до следующей версии. Обновиться всё "
+                                           "равно можно здесь")
+        self.update_skip_button.clicked.connect(self.win.updater.skip)
+        self.update_check_button = PushButton("Проверить сейчас", self, FIF.SYNC)
+        self.update_check_button.clicked.connect(lambda: self.win.updater.check(force=True))
+        update_buttons = QWidget(self)
+        update_flow = CenteredFlowLayout(update_buttons, spacing=8, center=False)
+        for button in (self.update_button, self.update_page_button, self.update_skip_button, self.update_check_button):
+            update_flow.addWidget(button)
+        self.update_flow = update_flow
+        self.update_bar = ProgressBar(self)
+        self.update_bar.setFixedWidth(320)
+        self.update_bar.hide()
+        self.update_progress = CaptionLabel("", self)
+        self.update_progress.hide()
+        self.update_switch = SwitchButton(self)
+        self.update_switch.setOnText("Вкл")
+        self.update_switch.setOffText("Выкл")
+        self.update_switch.setChecked(bool(settings.get("update_auto", True)))
+        self.update_switch.checkedChanged.connect(self.win.updater.set_auto)
+        update_row = QHBoxLayout()
+        update_row.addWidget(BodyLabel("Проверять обновления сама", self))
+        update_row.addSpacing(16)
+        update_row.addWidget(self.update_switch)
+        update_row.addStretch(1)
+        update_hint = CaptionLabel(
+            "При каждом запуске программа спрашивает GitHub о последнем релизе проекта — без ключа и без входа. Новая "
+            "версия ставится только по кнопке «Обновить»: программа скачивает BacklogRoulette.exe со страницы "
+            "релиза, сверяет его контрольную сумму SHA-256 с той, что посчитал GitHub, и только тогда заменяет "
+            "себя и перезапускается. Игры, настройки и обложки остаются на месте.", self)
+        update_hint.setWordWrap(True)
+        self.win.updater.changed.connect(self.update_updates)
+        self.update_updates()
         # Настроек много — кладём их в прокручиваемую область
         content = QWidget()
         scroll = ScrollArea(self)
@@ -9172,6 +9230,16 @@ class SettingsPage(QWidget):
         layout.setSpacing(12)
         layout.addWidget(TitleLabel("Настройки", self))
         layout.addSpacing(8)
+        # Обновление — первым: на него указывает точка на значке «Настройки»
+        layout.addWidget(StrongBodyLabel("Обновление программы", self))
+        layout.addWidget(self.update_status)
+        layout.addWidget(self.update_notes)
+        layout.addWidget(update_buttons)
+        layout.addWidget(self.update_bar)
+        layout.addWidget(self.update_progress)
+        layout.addLayout(update_row)
+        layout.addWidget(update_hint)
+        layout.addSpacing(16)
         layout.addWidget(StrongBodyLabel("Ключи", self))
         layout.addLayout(keys)
         layout.addWidget(key_buttons)
@@ -9207,6 +9275,125 @@ class SettingsPage(QWidget):
         self.win.music_page.forget_store_login()
         notify("success", self.win, "Вы вышли из магазина Steam",
                "Чтобы снова увидеть покупки, нажмите «Синхронизировать со Steam» на вкладке «Саундтреки».")
+
+    # --- Обновление программы ---
+    UPDATE_NOTES_SHOWN = 1500  # длинную заметку к релизу целиком — на странице релиза
+
+    def update_updates(self):
+        updater = self.win.updater
+        release = updater.release
+        available = updater.available()
+        version = f"Установлена версия {updater.current}" + (" (для проверки обновления)" if updater.fake else "")
+        if updater.installing:
+            status = version + ". Ставлю обновление…"
+        elif updater.checking:
+            status = version + ". Проверяю GitHub…"
+        elif available:
+            status = f"{version}. Вышла версия {release['tag'].lstrip('vV')}"
+            if release["tag"] == self.win.settings.get("update_skip"):
+                status += " — вы её пропустили, но обновиться можно и сейчас"
+            status += "."
+        elif release:
+            status = version + " — это последняя."
+        else:
+            status = version + "."
+        checked = self.win.settings.get("update_checked") or 0
+        if checked and not updater.checking and not updater.installing:
+            status += " Проверено " + time.strftime("%d.%m.%Y в %H:%M", time.localtime(checked)) + "."
+        self.update_status.setText(status)
+        notes = (release or {}).get("notes") or ""
+        if len(notes) > self.UPDATE_NOTES_SHOWN:
+            notes = notes[:self.UPDATE_NOTES_SHOWN].rsplit("\n", 1)[0] + "\n\n… целиком — на странице релиза"
+        self.update_notes.setText(notes if available else "")
+        self.update_notes.setVisible(available and bool(notes))
+        busy = updater.checking or updater.installing
+        self.update_button.setVisible(available)
+        self.update_button.setEnabled(not busy)
+        self.update_page_button.setVisible(available)
+        self.update_skip_button.setVisible(available and release["tag"] != self.win.settings.get("update_skip"))
+        self.update_check_button.setEnabled(not busy)
+        self.update_flow.invalidate()
+
+    def open_release_page(self):
+        release = self.win.updater.release
+        url = (release or {}).get("url") or f"{REPO_URL}/releases/latest"
+        QDesktopServices.openUrl(QUrl(url))
+
+    def install_update(self):
+        updater = self.win.updater
+        release = updater.release
+        if not updater.available() or updater.installing:
+            return
+        tag = release["tag"].lstrip("vV")
+        if not core.can_self_update():
+            if not getattr(sys, "frozen", False):
+                text = ("Программа запущена из исходников (python MySteamRandomApp.py) — она не заменяет свои файлы "
+                        "сама. Заберите новую версию из репозитория: git pull — или скачайте .exe со страницы релиза.")
+            else:
+                text = ("Эта сборка лежит папкой (рядом с .exe есть _internal) — одним файлом её не обновить. "
+                        "Скачайте новую версию со страницы релиза.")
+            if confirm(self.win, f"Обновить до {tag}?", text, "Открыть страницу релиза"):
+                self.open_release_page()
+            return
+        asset = release.get("asset")
+        if not asset:
+            if confirm(self.win, f"Обновить до {tag}?",
+                       f"В релизе нет файла {core.UPDATE_ASSET} с контрольной суммой, поэтому программа не может "
+                       "проверить его сама и ставить не будет. Скачайте обновление со страницы релиза вручную.",
+                       "Открыть страницу релиза"):
+                self.open_release_page()
+            return
+        size = f" ({disk_size_text(asset['size'])})" if asset.get("size") else ""
+        if not confirm(self.win, f"Обновить до версии {tag}?",
+                       f"Программа скачает {core.UPDATE_ASSET}{size} со страницы релиза {release['tag']} на GitHub "
+                       "и сверит его контрольную сумму SHA-256 с той, что посчитал GitHub. Сойдётся — закроется и "
+                       "откроется уже новой версией. Не сойдётся — ничего не изменится.\n\n"
+                       "Игры, коллекции, настройки, ключи и обложки останутся на месте. Если играет порт или "
+                       "дисковая игра, время в ней до этой минуты засчитается.", "Обновить"):
+            return
+        core.log.info("Обновление программы: ставлю %s (сейчас %s)", release["tag"], updater.current)
+        updater.installing = True
+        updater.changed.emit()
+        self.update_bar.setRange(0, 0)
+        self.update_bar.show()
+        self.update_progress.setText("Подключаюсь к GitHub…")
+        self.update_progress.show()
+        relay = ProgressRelay(self)
+        relay.progress.connect(self._on_update_progress)
+        worker = Worker(core.download_update, release, relay.report, parent=self)
+        worker.finished.connect(self._on_update_downloaded)
+        worker.failed.connect(self._on_update_failed)
+        worker.finished.connect(relay.deleteLater)
+        worker.failed.connect(relay.deleteLater)
+        worker.start()
+
+    def _on_update_progress(self, text, percent):
+        self.update_progress.setText(text)
+        if percent >= 0:
+            self.update_bar.setRange(0, 100)
+            self.update_bar.setValue(percent)
+
+    def _on_update_downloaded(self, new_path):
+        self.update_progress.setText("Файл проверен. Перезапускаюсь…")
+        try:
+            exe = core.apply_update(new_path)
+            core.restart_program(exe, self.win.updater.current)
+        except OSError as e:
+            core.log.exception("Обновление программы: новый файл не встал на место")
+            self._on_update_failed(f"OSError: не удалось заменить файл программы: {e}. Ничего не изменено — "
+                                   "можно скачать обновление со страницы релиза вручную")
+            return
+        QApplication.quit()  # новая версия дождётся, пока эта закроется (core.finish_update)
+
+    def _on_update_failed(self, message):
+        updater = self.win.updater
+        updater.installing = False
+        self.update_bar.hide()
+        self.update_progress.hide()
+        updater.changed.emit()
+        text = message.split(": ", 1)[-1]
+        core.log.warning("Обновление программы не поставлено: %s", text)
+        notify("error", self.win, "Обновление не поставлено", text + "\nПодробности — на вкладке «Логи».", 10000)
 
     def set_sounds_enabled(self, enabled):
         self.win.sounds.enabled = enabled
@@ -12351,6 +12538,103 @@ class LogsPage(QWidget):
 
 
 # --- Главное окно -----------------------------------------------------------
+class AppUpdater(QObject):
+    """Новая версия программы на GitHub: проверка (сама — при каждом запуске, и по кнопке), точка на «Настройках»
+    и установка по кнопке «Обновить» (core: скачать, сверить SHA-256, заменить .exe, перезапуститься).
+
+    Для проверки обновления без нового релиза: $env:BR_FAKE_VERSION="2.4" — программа считает себя версией 2.4,
+    и последний настоящий релиз покажется ей обновлением. Ставится он так же, со сверкой суммы."""
+
+    changed = Signal()
+    CHECK_DELAY_MS = 1500  # при каждом запуске — как только окно открылось
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        self.checking = False
+        self.installing = False
+        self._notified = None  # о какой версии уже сказали в этом запуске
+        fake = os.environ.get("BR_FAKE_VERSION", "").strip()
+        self.fake = bool(core.version_tuple(fake))
+        self.current = fake if self.fake else __version__
+        release = win.settings.get("update_release")
+        self.release = release if isinstance(release, dict) and release.get("tag") else None
+        if self.fake:
+            core.log.info("Обновление программы: для проверки программа считает себя версией %s (BR_FAKE_VERSION)",
+                          self.current)
+
+    def available(self):
+        return bool(self.release) and core.newer_version(self.release["tag"], self.current)
+
+    def pending(self):
+        """Есть обновление, которое не попросили пропустить, — для точки на «Настройках»."""
+        return self.available() and self.release["tag"] != self.win.settings.get("update_skip")
+
+    def schedule(self):
+        """Проверка при запуске программы — каждый раз, если она не выключена в «Настройках»."""
+        if self.win.settings.get("update_auto", True):
+            QTimer.singleShot(self.CHECK_DELAY_MS, self.check)
+
+    def check(self, force=False):
+        if self.checking or self.installing:
+            return
+        self.checking = True
+        self.changed.emit()
+        worker = Worker(core.latest_release, parent=self)
+        worker.finished.connect(lambda release: self._on_checked(release, force))
+        worker.failed.connect(lambda message: self._on_failed(message, force))
+        worker.start()
+
+    def _on_checked(self, release, force):
+        self.checking = False
+        self.release = release
+        self.win.settings.update(update_checked=time.time(), update_release=release)
+        core.save_settings(update_checked=self.win.settings["update_checked"], update_release=release)
+        self.changed.emit()
+        if self.available():
+            # При запуске — раз за запуск и только если версию не пропустили; по «Проверить сейчас» — всегда
+            if force or (self.pending() and self._notified != release["tag"]):
+                self._notified = release["tag"]
+                notify("info", self.win, f"Вышла новая версия {release['tag'].lstrip('vV')}",
+                       f"У вас {self.current}. Что нового и кнопка «Обновить» — в «Настройках», раздел «Обновление "
+                       "программы».", 12000, action=("Посмотреть обновление", self.open_settings))
+        elif force:
+            notify("success", self.win, "У вас последняя версия", f"{APP_NAME} {self.current}.")
+
+    def open_settings(self):
+        """Открыть «Настройки» на разделе «Обновление программы» — он там первый, прокручиваем к началу."""
+        page = self.win.settings_page
+        self.win.switchTo(page)
+        areas = ([page] if isinstance(page, ScrollArea) else []) + page.findChildren(ScrollArea)
+        for area in areas:
+            area.verticalScrollBar().setValue(0)
+        core.log.info("Обновление программы: открыты «Настройки» из уведомления")
+
+    def _on_failed(self, message, force):
+        self.checking = False
+        self.changed.emit()
+        text = message.split(": ", 1)[-1]
+        core.log.warning("Обновление программы: GitHub не ответил: %s", text)
+        if force:
+            notify("warning", self.win, "Не удалось проверить обновления", text, 7000)
+
+    def skip(self):
+        if not self.release:
+            return
+        tag = self.release["tag"]
+        self.win.settings["update_skip"] = tag
+        core.save_settings(update_skip=tag)
+        core.log.info("Обновление программы: версию %s попросили пропустить", tag)
+        self.changed.emit()
+
+    def set_auto(self, enabled):
+        self.win.settings["update_auto"] = enabled
+        core.save_settings(update_auto=enabled)
+        core.log.info("Обновление программы: сама проверка %s", "включена" if enabled else "выключена")
+        if enabled:
+            self.check()
+
+
 class NavHover(QObject):
     """Боковое меню — узкая полоска значков. Навели на неё мышь — меню плавно выезжает вправо поверх страницы:
     значок и подпись в одну строку. Увели мышь или выбрали пункт — прячется обратно. Страница под ним
@@ -12457,9 +12741,10 @@ class MainWindow(FluentWindow):
     collectionsChanged = Signal()  # коллекцию создали, переименовали, удалили или поменяли в ней игры
     rouletteChanged = Signal()  # игру убрали из рулетки или сменили фильтры рулетки
 
-    def __init__(self, startup=None):
+    def __init__(self, startup=None, updated_from=""):
         super().__init__()
         startup = startup or Timing("окно")
+        self.updated_from = updated_from  # программу только что обновили кнопкой «Обновить» — с этой версии
         if QWebEngineView:
             # Встроенный браузер переводит окно на отрисовку через видеокарту, и тогда прозрачные места
             # под эффектом Mica становятся чёрными: в светлой теме чернеют меню и фон страниц.
@@ -12479,6 +12764,8 @@ class MainWindow(FluentWindow):
         self.roulette_message = self.roulette.load()
         self.steam_meta = core.load_steam_meta()  # жанры, годы и оценки игр Steam — для фильтров рулетки
         self.meta = MetaCollector(self)
+        self.updater = AppUpdater(self)  # новая версия программы на GitHub
+        self._update_dot = None
         self.game_origin = None  # коллекция, из которой открыли страницу игры (для кнопки «К коллекции»)
 
         self.music = MusicPlayer(self.settings["music_path"], self.settings["music_shuffle_mode"],
@@ -12515,6 +12802,8 @@ class MainWindow(FluentWindow):
         self.addSubInterface(self.about_page, FIF.INFO, "О программе",
                              position=NavigationItemPosition.BOTTOM)
         self._fit_navigation()
+        self.updater.changed.connect(self._update_badge)
+        self._update_badge()  # обновление нашли в прошлый раз и ещё не поставили — точка сразу
         if self.home_page.browser:
             self.home_page.browser.preload(self)  # до показа окна — иначе оно мигнёт при первой ссылке
             startup.mark("браузер")
@@ -12568,6 +12857,28 @@ class MainWindow(FluentWindow):
             # Сменилась вкладка щелчком по меню — оно закрывается и не выезжает снова, пока мышь на полоске
             self.stackedWidget.currentChanged.connect(self._nav_hover.block)
 
+    def _update_badge(self):
+        """Точка на значке «Настройки», пока есть обновление, которое не поставили и не пропустили."""
+        want = self.updater.pending()
+        if want == (self._update_dot is not None):
+            return
+        if not want:
+            self._update_dot.deleteLater()
+            self._update_dot = None
+            return
+        if DotInfoBadge is None:
+            return  # в этой версии библиотеки интерфейса значков нет — обновление видно в «Настройках»
+        item = self.navigationInterface.widget(self.settings_page.objectName())
+        if item is None:
+            return
+        try:
+            self._update_dot = DotInfoBadge.attension(parent=item.parent(), target=item,
+                                                      position=InfoBadgePosition.NAVIGATION_ITEM)
+            self._update_dot.setFixedSize(8, 8)  # родная точка в 4 точки на полоске значков почти не видна
+        except (TypeError, AttributeError) as e:
+            core.log.warning("Точка «есть обновление» на меню не нарисовалась: %s", e)
+            self._update_dot = None
+
     def _after_show(self):
         if self.load_message:
             notify("info", self, "Список игр", self.load_message, duration=8000)
@@ -12588,6 +12899,11 @@ class MainWindow(FluentWindow):
             self.covers.upgrade(self.library.games)  # каждая обложка проверяется один раз, потом это мгновенно
         # Новые версии портов на GitHub — не чаще раза в несколько часов, молча, если нового нет
         QTimer.singleShot(5000, lambda: self.native_page.check_updates(quiet=True))
+        self.updater.schedule()  # и новая версия самой программы — при каждом запуске
+        if self.updated_from:
+            notify("success", self, f"Обновлено до версии {__version__}",
+                   f"Было: {self.updated_from}. Что нового — на странице релиза («Настройки» → «Обновление "
+                   "программы»).", 8000)
         if self.needs_steam_setup():
             QTimer.singleShot(400, self.run_steam_setup)
 
@@ -13009,6 +13325,10 @@ def main():
     core.setup_logging()
     startup.mark("модули")
     core.log.info("Запуск %s %s (Python %s) — %s", APP_NAME, __version__, sys.version.split()[0], COPYRIGHT)
+    # После «Обновить»: ждём, пока закроется прежняя версия, и убираем её файл
+    updated_from = core.finish_update()
+    if updated_from:
+        core.log.info("Программа обновлена: %s → %s", updated_from, __version__)
     choose_media_backend()
     if sys.platform == "win32":
         # Без этого Windows при запуске из .py показывает на панели задач значок Python
@@ -13027,7 +13347,7 @@ def main():
         app.setWindowIcon(QIcon(icon))  # для главного окна и всех диалогов
     setTheme(THEMES.get(core.load_settings()["theme"], Theme.AUTO))
     startup.mark("Qt")
-    window = MainWindow(startup)
+    window = MainWindow(startup, updated_from)
     install_error_hooks(window)
     app.aboutToQuit.connect(window.play_tracker.flush)  # игра ещё идёт — время до закрытия программы засчитывается
     window.show()

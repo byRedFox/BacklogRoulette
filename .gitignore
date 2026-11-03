@@ -3,6 +3,9 @@ build/
 dist/
 /MySteamRandomApp.exe
 /BacklogRoulette.exe
+# Прежняя и недокачанная версия при обновлении кнопкой «Обновить»
+*.exe.old
+*.exe.new
 
 # Python
 __pycache__/
