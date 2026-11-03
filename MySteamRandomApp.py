@@ -124,7 +124,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.4.6"
+__version__ = "2.4.7"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -9001,6 +9001,51 @@ class MusicPage(QWidget):
 
 
 # --- Страница «Настройки» ---------------------------------------------------
+class SettingsSection(QWidget):
+    """Раздел «Настроек» карточкой: значок и заголовок сверху, под ними — сами настройки. Так видно, где
+    кончается один раздел и начинается другой."""
+
+    PAD = 20
+    ICON = 20
+    GAP = 12  # между значком и заголовком
+    RADIUS = 8
+
+    def __init__(self, icon, title, parent):
+        super().__init__(parent)
+        self.icon = icon
+        self.body = QVBoxLayout(self)
+        self.body.setContentsMargins(self.PAD, self.PAD - 4, self.PAD, self.PAD)
+        self.body.setSpacing(10)
+        self.title_label = SubtitleLabel(title, self)
+        head = QHBoxLayout()
+        head.setSpacing(0)
+        # Место под значок вместе с промежутком: у пустого места раскладка свой промежуток не ставит
+        head.addSpacing(self.ICON + self.GAP)
+        head.addWidget(self.title_label)
+        head.addStretch(1)
+        self.body.addLayout(head)
+        self.body.addSpacing(2)
+
+    def add(self, item, stretch=0, alignment=None):
+        if isinstance(item, QLayout):
+            self.body.addLayout(item, stretch)
+        elif alignment is not None:
+            self.body.addWidget(item, stretch, alignment)
+        else:
+            self.body.addWidget(item, stretch)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        dark = isDarkTheme()
+        painter.setPen(QPen(QColor(255, 255, 255, 24) if dark else QColor(0, 0, 0, 20), 1))
+        painter.setBrush(QColor(255, 255, 255, 13) if dark else QColor(255, 255, 255, 170))
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), self.RADIUS, self.RADIUS)
+        title = self.title_label.geometry()
+        rect = QRectF(self.PAD, title.center().y() - self.ICON / 2 + 1, self.ICON, self.ICON)
+        self.icon.render(painter, rect)
+
+
 class SettingsPage(QWidget):
     def __init__(self, window):
         super().__init__()
@@ -9076,18 +9121,32 @@ class SettingsPage(QWidget):
         self.sounds_switch.setOffText("Выкл")
         self.sounds_switch.setChecked(settings["sounds_enabled"])
         self.sounds_switch.checkedChanged.connect(self.set_sounds_enabled)
+        # Фоновая музыка целиком: включена — при запуске играет то, что играло в прошлый раз
+        self.music_switch = SwitchButton(self)
+        self.music_switch.setOnText("Вкл")
+        self.music_switch.setOffText("Выкл")
+        self.music_switch.setChecked(bool(settings["music_enabled"]))
+        self.music_switch.checkedChanged.connect(self.set_music_enabled)
+        self.win.music.stateChanged.connect(self._show_music_enabled)  # и кнопка динамика в мини-плеере
 
         sound = QGridLayout()
         sound.setHorizontalSpacing(16)
         sound.setVerticalSpacing(8)
-        sound.addWidget(BodyLabel("Музыка", self), 0, 0)
-        sound.addWidget(self.music_edit, 0, 1)
-        sound.addWidget(music_buttons, 1, 1, 1, 2)
+        sound.addWidget(BodyLabel("Фоновая музыка", self), 0, 0)
+        sound.addWidget(self.music_switch, 0, 1)
+        music_hint = CaptionLabel("Включена — при запуске программы играет то же, что и в прошлый раз: встроенная "
+                                  "тема, саундтрек Steam или своя музыка. Выключить и включить можно и кнопкой "
+                                  "с динамиком в мини-плеере.", self)
+        music_hint.setWordWrap(True)
+        sound.addWidget(music_hint, 1, 1, 1, 2)
+        sound.addWidget(BodyLabel("Музыка", self), 2, 0)
+        sound.addWidget(self.music_edit, 2, 1)
+        sound.addWidget(music_buttons, 3, 1, 1, 2)
         sound.addWidget(CaptionLabel("Саундтреки Steam, громкость и плеер — на вкладке «Саундтреки». "
                                      "Пауза, треки и «вперемешку» — кнопками справа вверху на рулетке.", self),
-                        2, 1)
-        sound.addWidget(BodyLabel("Звуки барабана", self), 3, 0)
-        sound.addWidget(self.sounds_switch, 3, 1)
+                        4, 1)
+        sound.addWidget(BodyLabel("Звуки барабана", self), 5, 0)
+        sound.addWidget(self.sounds_switch, 5, 1)
         sound.setColumnStretch(2, 1)
         self.credit_label = CaptionLabel("Встроенная тема: «Soliloquy» — Matthew Pablo (matthewpablo.com), "
                                          "лицензия CC-BY 3.0, opengameart.org/content/soliloquy", self)
@@ -9202,7 +9261,7 @@ class SettingsPage(QWidget):
         self.update_switch.setChecked(bool(settings.get("update_auto", True)))
         self.update_switch.checkedChanged.connect(self.win.updater.set_auto)
         update_row = QHBoxLayout()
-        update_row.addWidget(BodyLabel("Проверять обновления сама", self))
+        update_row.addWidget(BodyLabel("Проверять обновление автоматически", self))
         update_row.addSpacing(16)
         update_row.addWidget(self.update_switch)
         update_row.addStretch(1)
@@ -9227,43 +9286,32 @@ class SettingsPage(QWidget):
 
         layout = QVBoxLayout(content)
         layout.setContentsMargins(36, 20, 36, 28)
-        layout.setSpacing(12)
+        layout.setSpacing(16)
         layout.addWidget(TitleLabel("Настройки", self))
-        layout.addSpacing(8)
-        # Обновление — первым: на него указывает точка на значке «Настройки»
-        layout.addWidget(StrongBodyLabel("Обновление программы", self))
-        layout.addWidget(self.update_status)
-        layout.addWidget(self.update_notes)
-        layout.addWidget(update_buttons)
-        layout.addWidget(self.update_bar)
-        layout.addWidget(self.update_progress)
-        layout.addLayout(update_row)
-        layout.addWidget(update_hint)
-        layout.addSpacing(16)
-        layout.addWidget(StrongBodyLabel("Ключи", self))
-        layout.addLayout(keys)
-        layout.addWidget(key_buttons)
-        layout.addSpacing(16)
-        layout.addWidget(StrongBodyLabel("Звук", self))
-        layout.addLayout(sound)
-        layout.addWidget(self.credit_label)
-        layout.addSpacing(16)
-        layout.addWidget(StrongBodyLabel("Оформление", self))
-        layout.addLayout(appearance)
-        layout.addLayout(selection_row)
-        layout.addWidget(selection_hint)
-        layout.addSpacing(16)
-        layout.addWidget(StrongBodyLabel("Перевод описаний", self))
-        layout.addLayout(translate_row)
-        layout.addLayout(model_row)
-        layout.addWidget(self.model_status)
-        layout.addSpacing(16)
-        layout.addWidget(StrongBodyLabel("Встроенный браузер", self))
-        layout.addLayout(links)
-        layout.addWidget(links_hint)
-        layout.addSpacing(8)
-        layout.addWidget(store_logout, 0, Qt.AlignLeft)
-        layout.addWidget(store_hint)
+        # Каждый раздел — своей карточкой со значком. Обновление — первым: на него указывает точка на «Настройках»
+        update = SettingsSection(FIF.UPDATE, "Обновление программы", content)
+        for item in (self.update_status, self.update_notes, update_buttons, self.update_bar, self.update_progress,
+                     update_row, update_hint):
+            update.add(item)
+        keys_section = SettingsSection(fluent_icon("FINGERPRINT", FIF.PEOPLE), "Ключи", content)
+        keys_section.add(keys)
+        keys_section.add(key_buttons)
+        sound_section = SettingsSection(FIF.MUSIC, "Звук", content)
+        sound_section.add(sound)
+        sound_section.add(self.credit_label)
+        look = SettingsSection(fluent_icon("PALETTE", FIF.PHOTO), "Оформление", content)
+        for item in (appearance, selection_row, selection_hint):
+            look.add(item)
+        translate = SettingsSection(fluent_icon("LANGUAGE", FIF.GLOBE), "Перевод описаний", content)
+        for item in (translate_row, model_row, self.model_status):
+            translate.add(item)
+        browser = SettingsSection(FIF.GLOBE, "Встроенный браузер", content)
+        browser.add(links)
+        browser.add(links_hint)
+        browser.add(store_logout, 0, Qt.AlignLeft)
+        browser.add(store_hint)
+        for section in (update, keys_section, sound_section, look, translate, browser):
+            layout.addWidget(section)
         layout.addStretch(1)
 
     def forget_store_login(self):
@@ -9400,6 +9448,21 @@ class SettingsPage(QWidget):
         core.save_settings(sounds_enabled=enabled)
         if enabled:
             self.win.sounds.win()  # пример звука
+
+    def set_music_enabled(self, enabled):
+        if enabled == self.win.music.enabled:
+            return
+        self.win.set_music_enabled(enabled)  # сохраняется: при следующем запуске будет так же
+        core.log.info("Фоновая музыка %s в «Настройках»", "включена" if enabled else "выключена")
+
+    def _show_music_enabled(self):
+        """Музыку включили или выключили кнопкой в плеере — переключатель показывает то же самое. Пока окно
+        только открывается и музыка ещё не включилась, показываем то, что сохранено."""
+        enabled = self.win.music.enabled or (not self.win.isVisible() and bool(self.win.settings["music_enabled"]))
+        if self.music_switch.isChecked() != enabled:
+            self.music_switch.blockSignals(True)
+            self.music_switch.setChecked(enabled)
+            self.music_switch.blockSignals(False)
 
     def set_selection_backdrop(self, enabled):
         self.win.settings["selection_backdrop"] = enabled
@@ -9693,6 +9756,123 @@ class AboutPage(QWidget):
         layout.addSpacing(8)
         layout.addWidget(card_box)
         layout.addStretch(1)
+
+
+# --- Страница «Купить игры» (заготовка) ---------------------------------------
+class RoadworksArt(QWidget):
+    """Картинка «Идут работы»: полосатый барьер с фонарями и два конуса. Рисуется сама — в светлой и тёмной теме."""
+
+    ORANGE = QColor(247, 148, 29)
+    W, H = 300, 190
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.W, self.H)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        dark = isDarkTheme()
+        ground_y = self.H - 18
+        # Земля — мягкая тень под всей картинкой
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 18) if dark else QColor(0, 0, 0, 16))
+        painter.drawEllipse(QRectF(10, ground_y - 6, self.W - 20, 16))
+        post = QColor(170, 170, 178) if dark else QColor(120, 120, 128)
+        # Стойки барьера
+        painter.setBrush(post)
+        for x in (88, 204):
+            painter.drawRoundedRect(QRectF(x, 74, 8, ground_y - 74), 3, 3)
+            painter.drawRoundedRect(QRectF(x - 14, ground_y - 6, 36, 8), 3, 3)
+        # Полосатая доска
+        board = QRectF(62, 66, 176, 40)
+        path = QPainterPath()
+        path.addRoundedRect(board, 6, 6)
+        painter.save()
+        painter.setClipPath(path)
+        painter.fillRect(board, QColor(250, 250, 250))
+        painter.setBrush(self.ORANGE)
+        step, band = 30, 15
+        x = board.left() - board.height()
+        while x < board.right():
+            painter.drawPolygon(QPolygonF([QPointF(x, board.bottom()), QPointF(x + band, board.bottom()),
+                                           QPointF(x + band + board.height(), board.top()),
+                                           QPointF(x + board.height(), board.top())]))
+            x += step
+        painter.restore()
+        painter.setPen(QPen(QColor(0, 0, 0, 60), 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(path)
+        # Фонари на доске
+        painter.setPen(Qt.NoPen)
+        for x in (92, 208):
+            painter.setBrush(QColor(255, 196, 0, 70))
+            painter.drawEllipse(QPointF(x, 56), 14, 14)
+            painter.setBrush(QColor(255, 196, 0))
+            painter.drawEllipse(QPointF(x, 56), 7, 7)
+            painter.setBrush(post)
+            painter.drawRect(QRectF(x - 2, 62, 4, 6))
+        # Конусы по бокам
+        for cx in (34, self.W - 34):
+            self._cone(painter, cx, ground_y, 74)
+
+    def _cone(self, painter, cx, base, height):
+        top = base - height
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(self.ORANGE)
+        painter.drawPolygon(QPolygonF([QPointF(cx - 5, top), QPointF(cx + 5, top),
+                                       QPointF(cx + 20, base - 6), QPointF(cx - 20, base - 6)]))
+
+        def half(y):  # полуширина конуса на высоте y
+            return 5 + 15 * (y - top) / (base - 6 - top)
+
+        painter.setBrush(QColor(250, 250, 250))
+        for y1, y2 in ((top + height * 0.30, top + height * 0.44), (top + height * 0.60, top + height * 0.72)):
+            painter.drawPolygon(QPolygonF([QPointF(cx - half(y1), y1), QPointF(cx + half(y1), y1),
+                                           QPointF(cx + half(y2), y2), QPointF(cx - half(y2), y2)]))
+        painter.setBrush(QColor(60, 60, 66))
+        painter.drawRoundedRect(QRectF(cx - 26, base - 8, 52, 8), 3, 3)
+
+
+class ShopPage(QWidget):
+    """Вкладка «Купить игры» — раздел следующих версий. Пока здесь картинка «идут работы» и путь в магазин Steam."""
+
+    def __init__(self, window):
+        super().__init__()
+        self.setObjectName("shopPage")
+        self.win = window
+        self.title = TitleLabel("Купить игры", self)
+        art = RoadworksArt(self)
+        heading = SubtitleLabel("Раздел в разработке", self)
+        text = BodyLabel("Здесь появится покупка игр. А пока купить игру можно в магазине Steam — во встроенном "
+                         "браузере или в самом Steam.", self)
+        text.setWordWrap(True)
+        text.setAlignment(Qt.AlignCenter)
+        text.setMaximumWidth(460)
+        store = PushButton("Открыть магазин Steam", self, FIF.SHOPPING_CART)
+        store.clicked.connect(lambda: self.win.open_web(BrowserPage.HOME_URL))
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(36, 20, 36, 28)
+        layout.setSpacing(12)
+        layout.addWidget(self.title)
+        layout.addStretch(1)
+        layout.addWidget(art, 0, Qt.AlignHCenter)
+        layout.addSpacing(8)
+        layout.addWidget(heading, 0, Qt.AlignHCenter)
+        layout.addWidget(text, 0, Qt.AlignHCenter)
+        layout.addSpacing(4)
+        layout.addWidget(store, 0, Qt.AlignHCenter)
+        layout.addStretch(2)
+        self.mini = MiniPlayerSpot(self, self.title)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self.mini.place)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.mini.place()
 
 
 # --- Страница «Игры Native Port's» ------------------------------------------
@@ -12538,6 +12718,48 @@ class LogsPage(QWidget):
 
 
 # --- Главное окно -----------------------------------------------------------
+def _paint_disc(painter, rect, color):
+    """Значок «компакт-диск» контуром, как значки Fluent: обод, отверстие в центре и блик на дорожках."""
+    rect = QRectF(rect)
+    side = min(rect.width(), rect.height())
+    unit = side / 16  # значки Fluent рисуются в сетке 16×16
+    center = rect.center()
+    painter.save()
+    painter.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(color, 1.2 * unit)
+    pen.setCapStyle(Qt.RoundCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    painter.drawEllipse(center, 6.9 * unit, 6.9 * unit)  # обод диска
+    painter.drawEllipse(center, 2.0 * unit, 2.0 * unit)  # отверстие
+    for radius, start in ((4.6 * unit, 100), (4.6 * unit, 280)):  # блик на дорожках — две дуги друг против друга
+        arc = QRectF(center.x() - radius, center.y() - radius, 2 * radius, 2 * radius)
+        painter.drawArc(arc, start * 16, 55 * 16)
+    painter.restore()
+
+
+class DiscIcon(FluentIconBase):
+    """Значок «Дисковых игр» в боковом меню: круглый CD-диск, в цвет текста меню своей темы."""
+
+    def path(self, theme=Theme.AUTO):
+        return ""  # не из файла — рисуется в render
+
+    def render(self, painter, rect, theme=Theme.AUTO, indexes=None, **attributes):
+        dark = isDarkTheme() if theme == Theme.AUTO else theme == Theme.DARK
+        _paint_disc(painter, rect, QColor(255, 255, 255) if dark else QColor(0, 0, 0, 228))
+
+    def icon(self, theme=Theme.AUTO, color=None):
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        self.render(painter, QRectF(0, 0, 64, 64), theme)
+        painter.end()
+        return QIcon(pixmap)
+
+
+DISC_ICON = DiscIcon()
+
+
 class AppUpdater(QObject):
     """Новая версия программы на GitHub: проверка (сама — при каждом запуске, и по кнопке), точка на «Настройках»
     и установка по кнопке «Обновить» (core: скачать, сверить SHA-256, заменить .exe, перезапуститься).
@@ -12596,8 +12818,10 @@ class AppUpdater(QObject):
             if force or (self.pending() and self._notified != release["tag"]):
                 self._notified = release["tag"]
                 notify("info", self.win, f"Вышла новая версия {release['tag'].lstrip('vV')}",
-                       f"У вас {self.current}. Что нового и кнопка «Обновить» — в «Настройках», раздел «Обновление "
-                       "программы».", 12000, action=("Посмотреть обновление", self.open_settings))
+                       f"У вас {self.current}" + (f" — так задано для проверки (BR_FAKE_VERSION), на самом деле "
+                                                  f"{__version__}" if self.fake else "")
+                       + ". Что нового и кнопка «Обновить» — в «Настройках», раздел «Обновление программы».",
+                       12000, action=("Посмотреть обновление", self.open_settings))
         elif force:
             notify("success", self.win, "У вас последняя версия", f"{APP_NAME} {self.current}.")
 
@@ -12783,6 +13007,7 @@ class MainWindow(FluentWindow):
         self.collections_page = CollectionsPage(self)
         self.music_page = MusicPage(self)
         self.web_page = WebPage(self) if QWebEngineView else None
+        self.shop_page = ShopPage(self)  # «Купить игры» — заготовка раздела следующих версий
         self.settings_page = SettingsPage(self)
         self.logs_page = LogsPage(self)
         self.about_page = AboutPage(self)
@@ -12790,11 +13015,12 @@ class MainWindow(FluentWindow):
         self.addSubInterface(self.home_page, FIF.GAME, "Рулетка")
         self.addSubInterface(self.library_page, FIF.LIBRARY, "Игры Steam")
         self.addSubInterface(self.native_page, FIF.APPLICATION, "Игры Native Port's")
-        self.addSubInterface(self.disc_page, fluent_icon("MEDIA", FIF.FOLDER), "Дисковые игры")
+        self.addSubInterface(self.disc_page, DISC_ICON, "Дисковые игры")
         self.addSubInterface(self.collections_page, COLLECTION_ICON, "Коллекции")
         self.addSubInterface(self.music_page, FIF.MUSIC, "Саундтреки")
         if self.web_page:
             self.addSubInterface(self.web_page, FIF.GLOBE, "Браузер")
+        self.addSubInterface(self.shop_page, FIF.SHOPPING_CART, "Купить игры")
         self.addSubInterface(self.logs_page, FIF.DOCUMENT, "Логи",
                              position=NavigationItemPosition.BOTTOM)
         self.addSubInterface(self.settings_page, FIF.SETTING, "Настройки",
@@ -12802,6 +13028,7 @@ class MainWindow(FluentWindow):
         self.addSubInterface(self.about_page, FIF.INFO, "О программе",
                              position=NavigationItemPosition.BOTTOM)
         self._fit_navigation()
+        self._connect_section_clicks()
         self.updater.changed.connect(self._update_badge)
         self._update_badge()  # обновление нашли в прошлый раз и ещё не поставили — точка сразу
         if self.home_page.browser:
@@ -12856,6 +13083,38 @@ class MainWindow(FluentWindow):
             self._nav_hover = NavHover(panel, nav)
             # Сменилась вкладка щелчком по меню — оно закрывается и не выезжает снова, пока мышь на полоске
             self.stackedWidget.currentChanged.connect(self._nav_hover.block)
+
+    def _connect_section_clicks(self):
+        """Щелчок по разделу в боковом меню — его главная страница. Открыта страница игры — раздел возвращается
+        к своему списку, как по кнопкам «К портам», «К коллекциям», «К рулетке». И когда раздел уже выбран."""
+        for page in (self.home_page, self.native_page, self.disc_page, self.collections_page):
+            item = self.navigationInterface.widget(page.objectName())
+            if item is None or not hasattr(item, "clicked"):
+                continue
+            # Меню само переключает вкладку по тому же щелчку — сбрасываем раздел сразу после этого
+            item.clicked.connect(lambda *_, p=page: QTimer.singleShot(0, lambda: self.show_section_main(p)))
+
+    def show_section_main(self, page):
+        if not page.isVisible():
+            return  # вкладку так и не открыли (например, поверх было окно)
+        if page is self.home_page:
+            if page.stack.currentWidget() is page.game_page:
+                page.game_page.stop_video()
+                page.show_reel()
+            elif page.browser is not None and page.stack.currentWidget() is page.browser \
+                    and page._browser_return is None:
+                page.show_reel()  # ссылка с карточки игры; вход в магазин Steam так не прерываем
+            else:
+                return
+        elif page is self.collections_page:
+            if page.stack.currentWidget() is not page.detail_view:
+                return
+            page.show_list()
+        else:
+            if page.stack.currentWidget() is not page.page:
+                return
+            page.show_list()
+        core.log.info("Меню: «%s» — к главной странице раздела", page.objectName())
 
     def _update_badge(self):
         """Точка на значке «Настройки», пока есть обновление, которое не поставили и не пропустили."""
@@ -13232,8 +13491,9 @@ class MainWindow(FluentWindow):
                        f"в Steam им.", "Всё равно открыть Steam")
 
     def set_music_enabled(self, enabled, save=True):
-        self.music.set_enabled(enabled)  # кнопки плееров обновятся по сигналу stateChanged
+        self.music.set_enabled(enabled)  # кнопки плееров и переключатель в «Настройках» — по сигналу stateChanged
         if save:
+            self.settings["music_enabled"] = enabled
             core.save_settings(music_enabled=enabled)
 
     def toggle_music(self):
