@@ -22,7 +22,7 @@ from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QEvent, QObject, Q
                             QRect, QRectF, QSize, QSizeF, Qt, QTimer, QUrl, QVariantAnimation, Signal)
 from PySide6.QtGui import (QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QIcon, QImage, QKeySequence,
                            QLinearGradient, QMovie, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
-                           QRadialGradient, QShortcut)
+                           QRadialGradient, QShortcut, QTextCharFormat, QTextCursor, QTextFormat, QTextListFormat)
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer, QSoundEffect
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFrame, QGraphicsOpacityEffect,
@@ -80,8 +80,8 @@ def _paint_outlined_button(self, event):
 TransparentPushButton.paintEvent = _paint_outlined_button
 
 # Окна поверх программы (подключение к Steam, импорт, вопросы) — это затемнение на всё окно, и оно закрывает
-# заголовок, за который окно таскают. Поэтому окно программы можно таскать за само затемнение —
-# например, чтобы перенести его на второй экран, не закрывая окна.
+# заголовок с крестиком. Поэтому заголовок поднимается над затемнением, а окно программы можно таскать и за само
+# затемнение — например, чтобы перенести его на второй экран, не закрывая окна.
 try:
     from qfluentwidgets.components.dialog_box.mask_dialog_base import MaskDialogBase
 
@@ -103,12 +103,36 @@ try:
 
     _mask_dialog_init = MaskDialogBase.__init__
 
+    class _TitleBarAbove(QObject):
+        """Заголовок окна с кнопками «свернуть», «развернуть» и крестиком — поверх затемнения: окно
+        поверх программы (например, мастер подключения к Steam) не мешает закрыть её крестиком."""
+
+        def __init__(self, dialog, title_bar):
+            super().__init__(dialog)
+            self.title_bar = title_bar
+
+        def eventFilter(self, obj, event):
+            if event.type() == QEvent.Show:
+                QTimer.singleShot(0, self._raise)  # после показа: окно поднимается при открытии
+            return False
+
+        def _raise(self):
+            try:
+                self.title_bar.raise_()
+            except RuntimeError:
+                pass  # окно программы уже закрыто
+
     def _draggable_mask_init(self, *args, **kwargs):
         _mask_dialog_init(self, *args, **kwargs)
         mask = getattr(self, "windowMask", None)
         if mask is not None:
             self._mask_drag = _MaskDrag(self)  # держим ссылку, иначе фильтр удалится вместе с обёрткой Python
             mask.installEventFilter(self._mask_drag)
+        title_bar = getattr(self.window(), "titleBar", None)
+        if title_bar is not None:
+            self._title_above = _TitleBarAbove(self, title_bar)
+            self.installEventFilter(self._title_above)
+            title_bar.raise_()
 
     MaskDialogBase.__init__ = _draggable_mask_init
 except (ImportError, AttributeError):
@@ -124,7 +148,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.4.7"
+__version__ = "2.5"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -3352,6 +3376,9 @@ class SteamSetupDialog(MessageBoxBase):
         self.names = {}  # SteamID → имя профиля Steam
         self.connected = False  # ключ проверен и сохранён
         self.no_key = False  # выбрали «Без ключа»
+        # Нажали «Пропустить» на первом шаге. Мастер закрыли иначе (Alt+F4, Esc, закрыли программу) —
+        # это не отказ: при следующем запуске мастер откроется снова
+        self.skipped = False
         self.want_import = False
         self._login = None
         self._closed = False
@@ -3604,6 +3631,7 @@ class SteamSetupDialog(MessageBoxBase):
         elif step == self.GRID:
             self._leave_grid(saved=False)
         else:
+            self.skipped = step == self.LOGIN  # «Пропустить»; на остальных шагах тут «Отмена» и «Позже»
             self.reject()
 
     # --- Ключ SteamGridDB ---
@@ -4788,6 +4816,352 @@ def _on_art_step_failed(page, kind, message):
     notify("warning", page.win, "SteamGridDB не ответил", message.split(": ", 1)[-1], 6000)
 
 
+class NotesDialog(MessageBoxBase):
+    """«Свои заметки» игры: общий текст об игре и записи по сессиям с датой — мысли после игры, наброски обзора
+    или статьи. Слева — «Об игре» и записи, новые сверху; справа — редактор с простым оформлением.
+
+    Всё сохраняется само (core.save_note): через секунду после правки, при переходе к другой записи и при закрытии
+    окна. Пустые записи не сохраняются — нажали «Новая запись» и ничего не написали, после закрытия её не будет."""
+
+    SAVE_DELAY_MS = 1000
+    DELETE_CONFIRM_MS = 3000
+    LIST_WIDTH = 230
+    PREVIEW_CHARS = 30
+    # «Точно удалить?» — красная кнопка, одинаково заметная в светлой и тёмной теме
+    DELETE_ARMED_QSS = """
+        PushButton { background-color: #C42B1C; color: white; border: 1px solid #A32317; }
+        PushButton:hover { background-color: #D13438; }
+        PushButton:pressed { background-color: #A32317; color: rgba(255, 255, 255, 0.85); }
+    """
+
+    def __init__(self, parent, game):
+        super().__init__(parent)
+        self.win, self.game = parent, game
+        self.note = core.load_note(game)
+        self.current = None  # что в редакторе: None — «Об игре», иначе запись (словарь из note["sessions"])
+        self.rows = []  # что в каждой строке списка: None — «Об игре», иначе запись
+        self._opened = False  # в редакторе уже текст из заметки — можно забирать его обратно
+        self.dirty = False
+        self.save_failed = ""
+        self._delete_armed = False
+        self.save_timer = QTimer(self)
+        self.save_timer.setSingleShot(True)
+        self.save_timer.setInterval(self.SAVE_DELAY_MS)
+        self.save_timer.timeout.connect(self.save)
+        self.delete_timer = QTimer(self)
+        self.delete_timer.setSingleShot(True)
+        self.delete_timer.setInterval(self.DELETE_CONFIRM_MS)
+        self.delete_timer.timeout.connect(self._reset_delete)
+
+        title = SubtitleLabel(f"Свои заметки — {game['name']}", self)
+        title.setWordWrap(True)
+        hint = CaptionLabel("Хранятся только на этом ПК, в папке notes рядом с программой, и сохраняются сами.", self)
+        hint.setWordWrap(True)
+
+        new_button = PrimaryPushButton("Новая запись", self, FIF.ADD)
+        new_button.setToolTip("Запись с сегодняшней датой — например, мысли после игровой сессии")
+        new_button.clicked.connect(self.add_session)
+        self.entries = ListWidget(self)
+        self.entries.setFixedWidth(self.LIST_WIDTH)
+        self.entries.currentRowChanged.connect(self._on_row)
+        self.delete_button = PushButton("Удалить запись", self, FIF.DELETE)
+        self.delete_button.clicked.connect(self.delete_session)
+        self._delete_style = self.delete_button.styleSheet()  # обычный вид кнопки — вернуть после «Точно удалить?»
+        export_button = PushButton("Экспорт в .md", self, FIF.SAVE)
+        export_button.setToolTip("Вся заметка одним файлом Markdown: его открывает любой редактор, "
+                                 "текст легко перенести в обзор или статью")
+        export_button.clicked.connect(self.export)
+        left = QVBoxLayout()
+        left.setSpacing(8)
+        left.addWidget(new_button)
+        left.addWidget(self.entries, 1)
+        left.addWidget(self.delete_button)
+        left.addWidget(export_button)
+
+        self.entry_title = StrongBodyLabel("", self)
+        tools = QHBoxLayout()
+        tools.setSpacing(6)
+        for text, tip, handler, style in (
+                ("Заголовок", "Заголовок раздела — ещё раз, чтобы убрать", self._heading, None),
+                ("Ж", "Жирный (Ctrl+B)", self._bold, "bold"),
+                ("К", "Курсив (Ctrl+I)", self._italic, "italic"),
+                ("• Список", "Список с точками", lambda: self._list(QTextListFormat.ListDisc), None),
+                ("1. Список", "Нумерованный список", lambda: self._list(QTextListFormat.ListDecimal), None)):
+            button = TransparentPushButton(text, self)
+            button.setToolTip(tip)
+            button.clicked.connect(handler)
+            if style:
+                font = QFont(button.font())
+                font.setBold(style == "bold")
+                font.setItalic(style == "italic")
+                button.setFont(font)
+            tools.addWidget(button)
+        tools.addStretch(1)
+        self.editor = TextEdit(self)
+        self.editor.setMinimumHeight(max(240, min(460, parent.height() - 380)))
+        self.editor.textChanged.connect(self._on_changed)
+        for keys, handler in (("Ctrl+B", self._bold), ("Ctrl+I", self._italic)):
+            shortcut = QShortcut(QKeySequence(keys), self.editor)
+            shortcut.setContext(Qt.WidgetShortcut)
+            shortcut.activated.connect(handler)
+        self.status = CaptionLabel("", self)
+        self.status.setWordWrap(True)
+        right = QVBoxLayout()
+        right.setSpacing(8)
+        right.addWidget(self.entry_title)
+        right.addLayout(tools)
+        right.addWidget(self.editor, 1)
+        right.addWidget(self.status)
+
+        row = QHBoxLayout()
+        row.setSpacing(16)
+        row.addLayout(left)
+        row.addLayout(right, 1)
+        self.viewLayout.addWidget(title)
+        self.viewLayout.addWidget(hint)
+        self.viewLayout.addLayout(row)
+        width = max(640, min(1000, parent.width() - 160))
+        self.widget.setMinimumWidth(width)
+        self.widget.setMaximumWidth(width)
+        self.yesButton.setText("Готово")
+        self.cancelButton.hide()
+
+        self._fill_list()
+        if self.note.get("broken"):
+            self._set_status(f"Прежний файл заметки был повреждён — он отложен как {self.note['broken']} в папке "
+                             "notes, заметка начата заново.", warning=True)
+        QTimer.singleShot(0, self.editor.setFocus)
+
+    # --- Список записей ---
+    def _sessions(self):
+        return sorted(self.note["sessions"], key=lambda s: (s["date"], s["created"]), reverse=True)
+
+    def _preview(self, text):
+        """Первая строка записи без разметки Markdown — подпись в списке."""
+        for line in text.splitlines():
+            line = re.sub(r"^\s*(#+|[-*+]|\d+[.)]|>)\s*", "", line).replace("**", "").replace("*", "").strip()
+            if line:
+                return line[:self.PREVIEW_CHARS] + ("…" if len(line) > self.PREVIEW_CHARS else "")
+        return ""
+
+    def _entry_text(self, entry):
+        if entry is None:
+            return "Об игре\n" + (self._preview(self.note["text"]) or "пока пусто")
+        return f"{core.russian_date(entry['date'])}\n{self._preview(entry['text']) or 'пустая запись'}"
+
+    def _fill_list(self, select=None):
+        """Список заново; открыть в редакторе select (None — «Об игре»)."""
+        self.entries.blockSignals(True)
+        self.entries.clear()
+        self.rows = [None] + self._sessions()
+        height = QFontMetrics(self.entries.font()).height() * 2 + 16  # две строки: дата и начало текста
+        for entry in self.rows:
+            item = QListWidgetItem(self._entry_text(entry))
+            item.setSizeHint(QSize(0, height))
+            self.entries.addItem(item)
+        self.entries.blockSignals(False)
+        self.entries.setCurrentRow(next((i for i, e in enumerate(self.rows) if e is select), 0))
+
+    def _refresh_row(self):
+        row = next((i for i, e in enumerate(self.rows) if e is self.current), -1)
+        item = self.entries.item(row) if row >= 0 else None
+        if item:
+            item.setText(self._entry_text(self.current))
+
+    def _on_row(self, row):
+        if 0 <= row < len(self.rows):
+            self._store()
+            self._open(self.rows[row])
+
+    def _open(self, entry):
+        self.current = entry
+        self.editor.blockSignals(True)
+        self.editor.setMarkdown(self.note["text"] if entry is None else entry["text"])
+        self.editor.blockSignals(False)
+        self._opened = True
+        if entry is None:
+            self.entry_title.setText("Об игре")
+            self.editor.setPlaceholderText("Общие впечатления, что нравится и что нет, план обзора или статьи…")
+        else:
+            self.entry_title.setText(f"Запись от {core.russian_date(entry['date'])}")
+            self.editor.setPlaceholderText("Что было в этой сессии: где остановились, что запомнилось, мысли…")
+        self.delete_button.setEnabled(entry is not None)
+        self._reset_delete()
+
+    def _store(self):
+        """Текст из редактора — в заметку (в «Об игре» или в открытую запись)."""
+        if not self._opened:
+            return
+        text = self.editor.toMarkdown().strip()
+        if self.current is None:
+            self.note["text"] = text
+        else:
+            self.current["text"] = text
+
+    # --- Записи ---
+    def add_session(self):
+        self._store()
+        session = core.new_session()
+        self.note["sessions"].append(session)
+        self._fill_list(select=session)
+        self.editor.setFocus()
+
+    def delete_session(self):
+        entry = self.current
+        if entry is None:
+            return
+        self._store()
+        if entry["text"].strip() and not self._delete_armed:
+            # Запись с текстом удаляется вторым нажатием — случайно не потерять. Кнопка на это время красная
+            self._delete_armed = True
+            self.delete_button.setText("Точно удалить?")
+            self.delete_button.setIcon(FIF.DELETE.icon(color=QColor("white")))
+            self.delete_button.setStyleSheet(self._delete_style + self.DELETE_ARMED_QSS)
+            self.delete_timer.start()
+            return
+        self._reset_delete()
+        self.note["sessions"] = [s for s in self.note["sessions"] if s is not entry]
+        self._opened = False  # в редакторе ещё текст удалённой записи — обратно его не забираем
+        self.dirty = True
+        self._fill_list()
+        self.save()
+
+    def _reset_delete(self):
+        self.delete_timer.stop()
+        self._delete_armed = False
+        self.delete_button.setText("Удалить запись")
+        self.delete_button.setIcon(FIF.DELETE)
+        self.delete_button.setStyleSheet(self._delete_style)
+
+    # --- Оформление ---
+    def _bold(self):
+        fmt = QTextCharFormat()
+        fmt.setFontWeight(QFont.Normal if self.editor.currentCharFormat().font().bold() else QFont.Bold)
+        self.editor.mergeCurrentCharFormat(fmt)
+
+    def _italic(self):
+        fmt = QTextCharFormat()
+        fmt.setFontItalic(not self.editor.currentCharFormat().fontItalic())
+        self.editor.mergeCurrentCharFormat(fmt)
+
+    def _heading(self):
+        cursor = self.editor.textCursor()
+        block = cursor.blockFormat()
+        level = 0 if block.headingLevel() else 2
+        block.setHeadingLevel(level)
+        cursor.beginEditBlock()
+        cursor.setBlockFormat(block)
+        cursor.movePosition(QTextCursor.StartOfBlock)
+        cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+        fmt = QTextCharFormat()
+        fmt.setProperty(QTextFormat.FontSizeAdjustment, 2 if level else 0)
+        cursor.mergeCharFormat(fmt)
+        cursor.endEditBlock()
+
+    def _list(self, style):
+        cursor = self.editor.textCursor()
+        current = cursor.currentList()
+        if current is None:
+            cursor.createList(style)
+        elif current.format().style() == style:  # тот же список ещё раз — строка снова обычная
+            current.remove(cursor.block())
+            block = cursor.blockFormat()
+            block.setIndent(0)
+            cursor.setBlockFormat(block)
+        else:
+            fmt = current.format()
+            fmt.setStyle(style)
+            current.setFormat(fmt)
+
+    # --- Сохранение ---
+    def _on_changed(self):
+        self.dirty = True
+        self.save_timer.start()
+
+    def _set_status(self, text, warning=False):
+        self.status.setText(text)
+        self.status.setTextColor(*(WARNING_TEXT if warning else (QColor(0, 0, 0, 160), QColor(255, 255, 255, 170))))
+
+    def save(self):
+        self.save_timer.stop()
+        if not self.dirty:
+            return True
+        self._store()
+        try:
+            core.save_note(self.game, self.note)
+        except OSError as e:
+            self.save_failed = str(e)
+            core.log.warning("Заметка «%s» не сохранилась: %s", self.game["name"], e)
+            self._set_status(f"Не сохранилось: {e}", warning=True)
+            return False
+        self.dirty, self.save_failed = False, ""
+        self._set_status("Сохранено в " + time.strftime("%H:%M"))
+        self._refresh_row()
+        return True
+
+    def export(self):
+        self._store()
+        self.save()
+        name = core.clean_name(self.game["name"]) or "Игра"
+        path, _ = QFileDialog.getSaveFileName(self, "Экспорт заметки",
+                                              os.path.join(os.path.expanduser("~"), f"{name} — заметки.md"),
+                                              "Markdown (*.md);;Текст (*.txt)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(core.note_markdown(self.game, self.note))
+        except OSError as e:
+            self._set_status(f"Файл не сохранился: {e}", warning=True)
+            return
+        core.log.info("Заметка «%s» выгружена в файл %s", self.game["name"], os.path.basename(path))
+        self._set_status(f"Выгружено в файл {os.path.basename(path)}")
+
+    def done(self, code):
+        self.save()
+        self.delete_timer.stop()
+        super().done(code)
+
+
+def open_notes(win, game, button):
+    """«Свои заметки» — окном поверх программы; после закрытия на кнопке видно, сколько в заметке записей."""
+    dialog = NotesDialog(win, game)
+    core.log.info("Открыты заметки «%s»", game["name"])
+    dialog.exec()
+    failed = dialog.save_failed
+    dialog.deleteLater()
+    if failed:
+        notify("error", win, "Заметка не сохранилась", f"{failed}. Подробности — на вкладке «Логи».", 8000)
+    show_notes_count(button, game)
+
+
+def show_notes_count(button, game):
+    count = core.note_count(game)
+    button.setText(f"Свои заметки · {count}" if count else "Свои заметки")
+    button.setToolTip("Общая заметка об игре и записи по сессиям — хранятся только на этом ПК" +
+                      (f". Сейчас частей: {count}" if count else ""))
+
+
+# Enter в окнах поверх программы — как главная кнопка окна («ОК», «Применить», «Сохранить», «Далее»). В окнах
+# библиотеки интерфейса главная кнопка не назначена кнопкой по умолчанию, и Enter в поле ввода ничего не делал.
+# Поле с несколькими строками (заметки) Enter забирает себе — там он, как и положено, начинает новую строку
+def _enter_confirms(cls):
+    original = cls.__init__
+
+    def init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        button = getattr(self, "yesButton", None)
+        if hasattr(button, "setDefault"):
+            button.setAutoDefault(True)
+            button.setDefault(True)
+
+    cls.__init__ = init
+
+
+for _dialog_class in (MessageBoxBase, MessageBox):
+    _enter_confirms(_dialog_class)
+
+
 class GamePage(QWidget):
     """Страница выпавшей игры: шапка с фоном и логотипом, кнопки, скриншоты и трейлеры, описание.
 
@@ -4855,6 +5229,8 @@ class GamePage(QWidget):
         self.win.rouletteChanged.connect(lambda: self.game is not None and self.update_buttons())
         self.cover_button = PushButton("Своя обложка", self, FIF.PHOTO)
         self.cover_button.clicked.connect(self.home.choose_cover)
+        self.notes_button = PushButton("Свои заметки", self, fluent_icon("QUICK_NOTE", FIF.EDIT))
+        self.notes_button.clicked.connect(lambda: self.game and open_notes(self.win, self.game, self.notes_button))
         self.store_button = PushButton("Магазин Steam", self, FIF.SHOPPING_CART)
         self.store_button.clicked.connect(self.open_store)
         self.link_button = PrimaryPushButton("Найти в Steam", self, FIF.SEARCH)
@@ -4879,8 +5255,9 @@ class GamePage(QWidget):
         # Кнопки по центру; в узком окне переносятся на вторую строку
         buttons_box = QWidget(self)
         buttons = CenteredFlowLayout(buttons_box, spacing=12)
-        for button in (self.play_button, self.link_button, self.spin_button, self.done_button, self.cover_button,
-                       self.store_button, self.soundtrack_button, self.collection_button, back_button, library_button):
+        for button in (self.play_button, self.link_button, self.spin_button, self.done_button, self.notes_button,
+                       self.cover_button, self.store_button, self.soundtrack_button, self.collection_button,
+                       back_button, library_button):
             buttons.addWidget(button)
         self.buttons = buttons
 
@@ -5030,6 +5407,7 @@ class GamePage(QWidget):
         self._rebuild_chips()
         self._reset_achievements()
         self.update_buttons()
+        show_notes_count(self.notes_button, game)
         self.scroll.verticalScrollBar().setValue(0)
 
         key = core.griddb_key()
@@ -6219,10 +6597,14 @@ class RouletteFilterDialog(MessageBoxBase):
     игры, о которых сведений ещё нет, под включённый фильтр не попадают."""
 
     GENRE_COLUMNS = 3
+    DIALOG_WIDTH = 640
+    DIALOG_PAD = 72  # поля окна по бокам и полоса прокрутки жанров
+    DIALOG_SIDE = 60  # от краёв окна программы
 
     def __init__(self, win):
         super().__init__(win)
         self.win = win
+        self.dialog_width = self.DIALOG_WIDTH
         filters = win.roulette_filters()
         self.games = [g for g in win.library.games if g.get("appid") and not win.roulette.has(g)]
         self.manual = sum(1 for g in win.library.games if not g.get("appid") and not win.roulette.has(g))
@@ -6252,18 +6634,28 @@ class RouletteFilterDialog(MessageBoxBase):
             grid.setHorizontalSpacing(16)
             grid.setVerticalSpacing(8)
             chosen = set(filters.get("genres") or [])
-            for i, (genre, count) in enumerate(sorted(counts.items(), key=lambda item: (-item[1], item[0]))):
+            for genre, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
                 box = CheckBox(f"{genre} ({count})", body)
                 box.setChecked(genre in chosen)
                 box.stateChanged.connect(self._update)
-                grid.addWidget(box, i // self.GENRE_COLUMNS, i % self.GENRE_COLUMNS)
                 self.genre_boxes[genre] = box
+            # Окно — по самому длинному жанру («Многопользовательские игры (12)»), чтобы подпись не обрезалась;
+            # в три колонки не влезает в окно программы — жанры встают в две
+            column = max(box.sizeHint().width() for box in self.genre_boxes.values())
+            room = win.width() - 2 * self.DIALOG_SIDE
+            columns = self.GENRE_COLUMNS
+            while columns > 2 and column * columns + 16 * (columns - 1) + self.DIALOG_PAD > room:
+                columns -= 1
+            self.dialog_width = max(self.DIALOG_WIDTH, min(room, column * columns + 16 * (columns - 1) +
+                                                           self.DIALOG_PAD))
+            for i, box in enumerate(self.genre_boxes.values()):
+                grid.addWidget(box, i // columns, i % columns)
             scroll = ScrollArea(self)
             scroll.setWidget(body)
             scroll.setWidgetResizable(True)
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget {background: transparent; border: none}")
-            rows = math.ceil(len(counts) / self.GENRE_COLUMNS)
+            rows = math.ceil(len(counts) / columns)
             scroll.setFixedHeight(min(rows * 34 + 4, 240))
             self.viewLayout.addWidget(scroll)
         else:
@@ -6310,8 +6702,8 @@ class RouletteFilterDialog(MessageBoxBase):
 
         self.yesButton.setText("Применить")
         self.cancelButton.setText("Отмена")
-        self.widget.setMinimumWidth(640)
-        self.widget.setMaximumWidth(640)
+        self.widget.setMinimumWidth(self.dialog_width)
+        self.widget.setMaximumWidth(self.dialog_width)
         win.meta.changed.connect(self._on_meta)  # сбор идёт — счётчики оживают прямо в окне
         self._update()
 
@@ -6709,9 +7101,9 @@ class HomePage(QWidget):
         removed = self.win.roulette.has
         lists = {"steam": self.win.library.games, "ports": self.win.ports.ports, "discs": self.win.discs.ports}
         counts = {key: sum(1 for g in games if not removed(g)) for key, games in lists.items()}
-        hidden = sum(len(games) - counts[key] for key, games in lists.items())
         sources = pool.split("+")
         filtered = self.win.filters_on()
+        # Сколько убрано из рулетки, не пишем: убранные игры в неё не возвращаются, число ни к чему
         if pool.startswith("col:"):
             collection = self.win.collections.find(pool[4:])
             text = f"Крутим коллекцию «{collection['name']}»: {game_word(len(self.win.roulette_games()))}"
@@ -6721,8 +7113,6 @@ class HomePage(QWidget):
             text = f"Игр в рулетке: {counts['steam']}"
         else:
             text = "Крутим: " + " + ".join(f"{self.POOL_NAMES[s]} {counts[s]}" for s in sources)
-        if hidden and not pool.startswith("col:"):
-            text += f" · убрано из рулетки: {hidden}"
         state = self.win.meta.state
         if state and state[0] < state[1]:
             text += f" · собираю жанры, годы и отзывы для фильтров: {state[0]} из {state[1]}"
@@ -6993,6 +7383,33 @@ class CoverThumbs(QObject):
             self.updated()
 
 
+class GridFit(QObject):
+    """Плитки в сетке — ровно по ширине: сколько колонок влезает, на столько и делится ширина, а каждая плитка
+    стоит по центру своей клетки. Без этого Qt ставит плитки с фиксированным шагом от левого края, и всё, что
+    не влезло в ещё одну колонку, остаётся пустой полосой справа."""
+
+    def __init__(self, view, tile, gap=8):
+        super().__init__(view)
+        self.view, self.tile, self.gap = view, QSize(tile), gap
+        self._width = -1
+        view.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Resize:
+            self.fit()
+        return False
+
+    def fit(self, force=False):
+        if self.view.viewMode() != QListView.IconMode:
+            return
+        width = self.view.viewport().width()
+        if width <= 0 or (width == self._width and not force):
+            return
+        self._width = width
+        columns = max(1, width // (self.tile.width() + self.gap))
+        self.view.setGridSize(QSize(width // columns, self.tile.height() + self.gap))
+
+
 class CoverTileDelegate(QStyledItemDelegate):
     """Плитка игры: обложка со скруглёнными углами и название под ней. Выбранные — в рамке цвета темы."""
 
@@ -7003,6 +7420,8 @@ class CoverTileDelegate(QStyledItemDelegate):
     def __init__(self, thumbs, parent=None):
         super().__init__(parent)
         self.thumbs = thumbs
+        if isinstance(parent, QListView):  # плитки — ровно по ширине вкладки, без пустой полосы справа
+            self.grid_fit = GridFit(parent, self.sizeHint(None, None))
 
     def sizeHint(self, option, index):
         return QSize(self.COVER.width() + 2 * self.PAD, self.COVER.height() + self.TEXT_H + 2 * self.PAD)
@@ -9758,121 +10177,608 @@ class AboutPage(QWidget):
         layout.addStretch(1)
 
 
-# --- Страница «Купить игры» (заготовка) ---------------------------------------
-class RoadworksArt(QWidget):
-    """Картинка «Идут работы»: полосатый барьер с фонарями и два конуса. Рисуется сама — в светлой и тёмной теме."""
+# --- Страница «Купить игры» ---------------------------------------------------
+class ShopItemDelegate(QStyledItemDelegate):
+    """Лот Plati.Market в списке «Найти игры»: картинка, название, крупная цена, продажи, продавец и метки.
+    Два вида — строкой во всю ширину (list) и карточкой в сетке (grid), как на сайте площадки."""
 
-    ORANGE = QColor(247, 148, 29)
-    W, H = 300, 190
+    ROW_H = 112
+    CARD_W, CARD_H = 216, 318
+    THUMB = 84
+    PRICE_W = 170
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedSize(self.W, self.H)
+    def __init__(self, page):
+        super().__init__(page.list)
+        self.page = page
+        self.mode = "list"
+        self.hover_row = -1
+        self.pressed_row = -1
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        dark = isDarkTheme()
-        ground_y = self.H - 18
-        # Земля — мягкая тень под всей картинкой
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 18) if dark else QColor(0, 0, 0, 16))
-        painter.drawEllipse(QRectF(10, ground_y - 6, self.W - 20, 16))
-        post = QColor(170, 170, 178) if dark else QColor(120, 120, 128)
-        # Стойки барьера
-        painter.setBrush(post)
-        for x in (88, 204):
-            painter.drawRoundedRect(QRectF(x, 74, 8, ground_y - 74), 3, 3)
-            painter.drawRoundedRect(QRectF(x - 14, ground_y - 6, 36, 8), 3, 3)
-        # Полосатая доска
-        board = QRectF(62, 66, 176, 40)
+    # Список программы (ListWidget библиотеки интерфейса) сообщает своему рисовальщику, над какой строкой мышь,
+    # какую нажали и какие выбраны. Без этих трёх методов он падает при каждом движении мыши
+    def setHoverRow(self, row):
+        self.hover_row = row
+
+    def setPressedRow(self, row):
+        self.pressed_row = row
+
+    def setSelectedRows(self, indexes):
+        pass  # выбранный лот видно по option.state — отдельно его хранить не нужно
+
+    def sizeHint(self, option, index):
+        if self.mode == "grid":
+            return QSize(self.CARD_W, self.CARD_H)
+        return QSize(max(200, self.page.list.viewport().width() - 4), self.ROW_H)
+
+    @staticmethod
+    def _colors(dark):
+        if dark:
+            return QColor(255, 255, 255), QColor(255, 255, 255, 165), QColor(255, 255, 255, 14)
+        return QColor(0, 0, 0, 228), QColor(0, 0, 0, 150), QColor(0, 0, 0, 10)
+
+    @staticmethod
+    def _font(base, pixels=None, bold=False, delta=0):
+        """Шрифт от base: ровно pixels пикселей или на delta пунктов крупнее. Шрифты программы бывают заданы
+        в пикселях (тогда размера в пунктах у них нет, -1) — их увеличиваем в пикселях."""
+        font = QFont(base)
+        if pixels:
+            font.setPixelSize(pixels)
+        elif delta:
+            if font.pointSizeF() > 0:
+                font.setPointSizeF(font.pointSizeF() + delta)
+            elif font.pixelSize() > 0:
+                font.setPixelSize(font.pixelSize() + round(delta * 4 / 3))
+        font.setBold(bold)
+        return font
+
+    def _back(self, painter, rect, dark, selected, hover, back):
         path = QPainterPath()
-        path.addRoundedRect(board, 6, 6)
+        path.addRoundedRect(rect, 8, 8)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(back)
+        painter.drawPath(path)
+        if hover or selected:
+            painter.setBrush(QColor(255, 255, 255, 12) if dark else QColor(0, 0, 0, 8))
+            painter.drawPath(path)
+        if selected:
+            accent = QColor(themeColor())
+            painter.setPen(QPen(accent, 2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 7, 7)
+
+    def _thumb(self, painter, rect, item, dark):
+        """Картинка лота по центру rect, с подложкой, пока картинка не пришла."""
+        path = QPainterPath()
+        path.addRoundedRect(rect, 6, 6)
         painter.save()
         painter.setClipPath(path)
-        painter.fillRect(board, QColor(250, 250, 250))
-        painter.setBrush(self.ORANGE)
-        step, band = 30, 15
-        x = board.left() - board.height()
-        while x < board.right():
-            painter.drawPolygon(QPolygonF([QPointF(x, board.bottom()), QPointF(x + band, board.bottom()),
-                                           QPointF(x + band + board.height(), board.top()),
-                                           QPointF(x + board.height(), board.top())]))
-            x += step
+        painter.fillRect(rect, QColor(255, 255, 255, 10) if dark else QColor(0, 0, 0, 8))
+        pixmap = self.page.images.get(item["image"])
+        if isinstance(pixmap, QPixmap) and not pixmap.isNull():
+            scaled = pixmap.scaled(rect.size().toSize(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            target = QRectF(0, 0, scaled.width(), scaled.height())
+            target.moveCenter(rect.center())
+            painter.drawPixmap(target.topLeft(), scaled)
         painter.restore()
-        painter.setPen(QPen(QColor(0, 0, 0, 60), 1))
-        painter.setBrush(Qt.NoBrush)
-        painter.drawPath(path)
-        # Фонари на доске
-        painter.setPen(Qt.NoPen)
-        for x in (92, 208):
-            painter.setBrush(QColor(255, 196, 0, 70))
-            painter.drawEllipse(QPointF(x, 56), 14, 14)
-            painter.setBrush(QColor(255, 196, 0))
-            painter.drawEllipse(QPointF(x, 56), 7, 7)
-            painter.setBrush(post)
-            painter.drawRect(QRectF(x - 2, 62, 4, 6))
-        # Конусы по бокам
-        for cx in (34, self.W - 34):
-            self._cone(painter, cx, ground_y, 74)
 
-    def _cone(self, painter, cx, base, height):
-        top = base - height
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(self.ORANGE)
-        painter.drawPolygon(QPolygonF([QPointF(cx - 5, top), QPointF(cx + 5, top),
-                                       QPointF(cx + 20, base - 6), QPointF(cx - 20, base - 6)]))
+    def _price(self, item):
+        currency = self.page._currency()
+        return ShopPage._price_text(item["prices"].get(currency), currency)
 
-        def half(y):  # полуширина конуса на высоте y
-            return 5 + 15 * (y - top) / (base - 6 - top)
+    @staticmethod
+    def _sold(item):
+        return "продажи скрыты" if item["sold"] is None else f"продано {number_text(item['sold'])}"
 
-        painter.setBrush(QColor(250, 250, 250))
-        for y1, y2 in ((top + height * 0.30, top + height * 0.44), (top + height * 0.60, top + height * 0.72)):
-            painter.drawPolygon(QPolygonF([QPointF(cx - half(y1), y1), QPointF(cx + half(y1), y1),
-                                           QPointF(cx + half(y2), y2), QPointF(cx - half(y2), y2)]))
-        painter.setBrush(QColor(60, 60, 66))
-        painter.drawRoundedRect(QRectF(cx - 26, base - 8, 52, 8), 3, 3)
+    def paint(self, painter, option, index):
+        item = index.data(Qt.UserRole)
+        if not isinstance(item, dict):
+            return
+        painter.save()
+        painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
+        dark = isDarkTheme()
+        text, caption, back = self._colors(dark)
+        selected = bool(option.state & QStyle.State_Selected)
+        hover = bool(option.state & QStyle.State_MouseOver) or index.row() == self.hover_row
+        if self.mode == "grid":
+            self._paint_card(painter, option, item, dark, text, caption, back, selected, hover)
+        else:
+            self._paint_row(painter, option, item, dark, text, caption, back, selected, hover)
+        painter.restore()
+
+    def _paint_row(self, painter, option, item, dark, text, caption, back, selected, hover):
+        rect = QRectF(option.rect).adjusted(4, 4, -4, -4)
+        self._back(painter, rect, dark, selected, hover, back)
+        pad = 12
+        thumb = QRectF(rect.x() + pad, rect.center().y() - self.THUMB / 2, self.THUMB, self.THUMB)
+        self._thumb(painter, thumb, item, dark)
+        # Цена — справа, крупно; под ней скидка и продажи
+        price_box = QRectF(rect.right() - pad - self.PRICE_W, rect.y() + pad, self.PRICE_W, rect.height() - 2 * pad)
+        price_font = self._font(option.font, pixels=22, bold=True)
+        painter.setFont(price_font)
+        painter.setPen(text)
+        price_h = QFontMetrics(price_font).height()
+        painter.drawText(QRectF(price_box.x(), price_box.y(), price_box.width(), price_h),
+                         Qt.AlignRight | Qt.AlignVCenter, self._price(item))
+        small = self._font(option.font)
+        painter.setFont(small)
+        line = QFontMetrics(small).height()
+        y = price_box.y() + price_h + 4
+        if item["discount"]:
+            painter.setPen(QColor(16, 160, 80) if not dark else QColor(108, 203, 95))
+            painter.drawText(QRectF(price_box.x(), y, price_box.width(), line), Qt.AlignRight | Qt.AlignVCenter,
+                             f"скидка {item['discount']}%")
+            y += line + 2
+        painter.setPen(caption)
+        painter.drawText(QRectF(price_box.x(), y, price_box.width(), line), Qt.AlignRight | Qt.AlignVCenter,
+                         self._sold(item))
+        # Середина: название в две строки, продавец с отзывами, метки
+        left = thumb.right() + 14
+        width = price_box.x() - 16 - left
+        name_font = self._font(option.font, bold=True, delta=1)
+        name_metrics = QFontMetrics(name_font)
+        name = two_lines(item["name"], name_metrics, round(width))
+        name_h = name_metrics.lineSpacing() * (name.count("\n") + 1)
+        painter.setFont(name_font)
+        painter.setPen(text)
+        y = rect.y() + pad
+        painter.drawText(QRectF(left, y, width, name_h), Qt.AlignLeft | Qt.AlignTop, name)
+        painter.setFont(small)
+        metrics = QFontMetrics(small)
+        y += name_h + 6
+        painter.setPen(caption)
+        painter.drawText(QRectF(left, y, width, line), Qt.AlignLeft | Qt.AlignVCenter,
+                         metrics.elidedText(self.page._seller_text(item), Qt.ElideRight, round(width)))
+        y += line + 4
+        self._chips(painter, QRectF(left, y, width, line + 6), self.page._labels(item), small, dark)
+
+    def _paint_card(self, painter, option, item, dark, text, caption, back, selected, hover):
+        rect = QRectF(option.rect).adjusted(6, 6, -6, -6)
+        self._back(painter, rect, dark, selected, hover, back)
+        pad = 10
+        width = rect.width() - 2 * pad
+        thumb = QRectF(rect.x() + pad, rect.y() + pad, width, 128)
+        self._thumb(painter, thumb, item, dark)
+        y = thumb.bottom() + 8
+        name_font = self._font(option.font, bold=True)
+        name_metrics = QFontMetrics(name_font)
+        painter.setFont(name_font)
+        painter.setPen(text)
+        name = two_lines(item["name"], name_metrics, round(width))
+        name_h = name_metrics.lineSpacing() * 2
+        painter.drawText(QRectF(rect.x() + pad, y, width, name_h), Qt.AlignLeft | Qt.AlignTop, name)
+        y += name_h + 6
+        price_font = self._font(option.font, pixels=24, bold=True)
+        price_h = QFontMetrics(price_font).height()
+        painter.setFont(price_font)
+        painter.drawText(QRectF(rect.x() + pad, y, width, price_h), Qt.AlignLeft | Qt.AlignVCenter, self._price(item))
+        small = self._font(option.font)
+        line = QFontMetrics(small).height()
+        if item["discount"]:
+            painter.setFont(small)
+            painter.setPen(QColor(16, 160, 80) if not dark else QColor(108, 203, 95))
+            painter.drawText(QRectF(rect.x() + pad, y, width, price_h), Qt.AlignRight | Qt.AlignVCenter,
+                             f"−{item['discount']}%")
+        y += price_h + 4
+        painter.setFont(small)
+        painter.setPen(caption)
+        metrics = QFontMetrics(small)
+        painter.drawText(QRectF(rect.x() + pad, y, width, line), Qt.AlignLeft | Qt.AlignVCenter,
+                         metrics.elidedText(f"{self._sold(item)} · 👍 {number_text(item['good'])}",
+                                            Qt.ElideRight, round(width)))
+        y += line + 6
+        self._chips(painter, QRectF(rect.x() + pad, y, width, line + 6), self.page._labels(item), small, dark)
+
+    @staticmethod
+    def _chips(painter, rect, labels, font, dark):
+        """Метки лота — плашками в одну строку; что не влезло, не рисуется."""
+        painter.setFont(font)
+        metrics = QFontMetrics(font)
+        x = rect.x()
+        for label in labels:
+            w = metrics.horizontalAdvance(label) + 14
+            if x + w > rect.right() + 0.5:
+                break
+            chip = QRectF(x, rect.y(), w, rect.height())
+            warn = label == "не игра?"
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(196, 43, 28, 60) if warn else
+                             (QColor(255, 255, 255, 22) if dark else QColor(0, 0, 0, 14)))
+            painter.drawRoundedRect(chip, rect.height() / 2, rect.height() / 2)
+            painter.setPen(QColor(255, 255, 255, 215) if dark else QColor(0, 0, 0, 190))
+            painter.drawText(chip, Qt.AlignCenter, label)
+            x += w + 6
 
 
 class ShopPage(QWidget):
-    """Вкладка «Купить игры» — раздел следующих версий. Пока здесь картинка «идут работы» и путь в магазин Steam."""
+    """Вкладка «Найти игры на Plati.Market»: поиск ключей, гифтов и аккаунтов Steam и Xbox.
+
+    Ищет открытый поиск площадки (core.search_plati) — без ключа и без входа. Найденное показывается после
+    «Показать» списком или сеткой: с крупной ценой в выбранной валюте, продажами, продавцом и отзывами, его можно
+    сортировать и отбирать. Покупка — только на сайте: лот открывается во внешнем браузере."""
+
+    SORTS = (("relevance", "Сначала подходящие"), ("price_asc", "Сначала дешёвые"), ("price_desc", "Сначала дорогие"),
+             ("sold", "Больше продаж"))
+    PLATFORMS = (("all", "Все платформы"), ("steam", "Steam"), ("xbox", "Xbox"), ("other", "Другие"))
+    VIEWS = (("list", "Списком"), ("grid", "Сеткой"))
+    KIND_TITLES = {key: title for key, title, _pattern in core.SHOP_KINDS}
+    PLATFORM_TITLES = {key: title for key, title, _pattern in core.SHOP_PLATFORMS}
+    ITEM_PREFIX = "https://plati.market/itm/"
 
     def __init__(self, window):
         super().__init__()
         self.setObjectName("shopPage")
         self.win = window
-        self.title = TitleLabel("Купить игры", self)
-        art = RoadworksArt(self)
-        heading = SubtitleLabel("Раздел в разработке", self)
-        text = BodyLabel("Здесь появится покупка игр. А пока купить игру можно в магазине Steam — во встроенном "
-                         "браузере или в самом Steam.", self)
-        text.setWordWrap(True)
-        text.setAlignment(Qt.AlignCenter)
-        text.setMaximumWidth(460)
-        store = PushButton("Открыть магазин Steam", self, FIF.SHOPPING_CART)
-        store.clicked.connect(lambda: self.win.open_web(BrowserPage.HOME_URL))
+        self.result = None  # последний ответ поиска: {"query", "total", "items"}
+        self.shown = []  # лоты в списке сейчас — по строкам
+        self.images = {}  # картинки лотов: адрес → QPixmap
+        self._token = 0
+        self.loader = ImageLoader(self)
+        self.loader.loaded.connect(self._on_image)
+        settings = core.load_settings()
+
+        self.title = TitleLabel("Найти игры на Plati.Market", self)
+        heading = SubtitleLabel("Ключи, гифты и аккаунты Steam и Xbox", self)
+        self.search = SearchLineEdit(self)
+        # Подсказки в поле нет — она всплывает рядом с мышкой при наведении
+        self.search.setToolTip("Название игры, например Doom — и Enter")
+        self.search.setFont(resized_font(self.search.font(), 2))
+        # Лупа в поле — searchSignal; Enter библиотека в него не передаёт, поэтому — отдельно
+        if hasattr(self.search, "searchSignal"):
+            self.search.searchSignal.connect(lambda _text: self.find())
+        self.search.returnPressed.connect(self.find)
+        self.search.setFixedHeight(40)
+        enlarge_line_edit_buttons(self.search)
+        search_row = QHBoxLayout()
+        search_row.setSpacing(8)
+        search_row.addWidget(self.search, 1)
+
+        self.bar = IndeterminateProgressBar(self)
+        self.bar.hide()
+        # Под полем — итог поиска и «Показать», по центру. «Показать» после нажатия исчезает, а вместо неё
+        # встают фильтры — выдача под ними не прыгает
+        self.status = StrongBodyLabel("", self)
+        self.status.setWordWrap(True)
+        self.status.setAlignment(Qt.AlignCenter)
+        self.show_button = PrimaryPushButton("Показать", self, FIF.VIEW if hasattr(FIF, "VIEW") else FIF.SEARCH)
+        self.show_button.setMinimumWidth(180)
+        self.show_button.clicked.connect(self.show_results)
+        self.show_button.hide()
+
+        # Валюта, порядок, платформа и «Только игры» — запоминаются в настройках
+        self.currency_box = ComboBox(self)
+        self.currency_box.addItems([f"{code} {sign}" for code, (_f, sign) in core.SHOP_CURRENCIES.items()])
+        codes = list(core.SHOP_CURRENCIES)
+        self.currency_box.setCurrentIndex(codes.index(settings["shop_currency"])
+                                          if settings["shop_currency"] in codes else 0)
+        self.sort_box = ComboBox(self)
+        self.sort_box.addItems([title for _key, title in self.SORTS])
+        self.sort_box.setCurrentIndex(next((i for i, (k, _t) in enumerate(self.SORTS) if k == settings["shop_sort"]), 0))
+        self.platform_box = ComboBox(self)
+        self.platform_box.addItems([title for _key, title in self.PLATFORMS])
+        self.platform_box.setCurrentIndex(next((i for i, (k, _t) in enumerate(self.PLATFORMS)
+                                                if k == settings["shop_platform"]), 0))
+        self.games_only = CheckBox("Только игры", self)
+        self.games_only.setToolTip("Прятать читы, игровую валюту, пополнения, книги и прочие лоты без платформы "
+                                   "(Steam, Xbox, EA app…), а также лоты, в названии которых нет всех слов из поиска "
+                                   "(по «Battlefield 4» не покажет «Battlefield 2042»)")
+        self.games_only.setChecked(bool(settings["shop_games_only"]))
+        self.view_box = ComboBox(self)
+        self.view_box.addItems([title for _key, title in self.VIEWS])
+        self.view_box.setCurrentIndex(next((i for i, (k, _t) in enumerate(self.VIEWS)
+                                            if k == settings["shop_view"]), 0))
+        for box in (self.currency_box, self.sort_box, self.platform_box):
+            box.currentIndexChanged.connect(self._on_filters)
+        self.games_only.stateChanged.connect(self._on_filters)
+        self.view_box.currentIndexChanged.connect(self._on_view)
+        filters = QHBoxLayout()
+        filters.setContentsMargins(0, 0, 0, 0)
+        filters.setSpacing(8)
+        filters.addWidget(self.currency_box)
+        filters.addWidget(self.sort_box)
+        filters.addWidget(self.platform_box)
+        filters.addWidget(self.games_only)
+        filters.addStretch(1)
+        filters.addWidget(self.view_box)
+        self.filters_box = QWidget(self)
+        self.filters_box.setLayout(filters)
+        self.filters_box.hide()
+
+        self.list = ListWidget(self)
+        self.list.setMouseTracking(True)
+        self.list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list.setResizeMode(QListView.Adjust)
+        self.list.setMovement(QListView.Static)
+        self.list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.delegate = ShopItemDelegate(self)
+        self.list.setItemDelegate(self.delegate)
+        self.grid_fit = GridFit(self.list, QSize(ShopItemDelegate.CARD_W, ShopItemDelegate.CARD_H), gap=4)
+        self.list.viewport().installEventFilter(self)  # колесо в сетке — см. eventFilter
+        self.list.itemDoubleClicked.connect(lambda _item: self.open_selected())
+        self.list.currentRowChanged.connect(lambda row: self.open_button.setEnabled(0 <= row < len(self.shown)))
+        self.list.hide()
+        self._apply_view()
+        self.open_button = PushButton("Открыть на Plati.Market", self, FIF.LINK)
+        self.open_button.setToolTip("Страница лота — во внешнем браузере. Двойной щелчок по лоту — то же самое")
+        self.open_button.setEnabled(False)
+        self.open_button.clicked.connect(self.open_selected)
+        self.open_button.hide()
+
+        note = plain_label("Plati.Market — площадка частных продавцов. Перед покупкой проверьте отзывы о продавце, "
+                           "регион и способ активации. Покупка проходит на сайте: программа ничего не покупает, "
+                           "не входит в ваши аккаунты и не знает о покупках.", self, caption=True)
+        note.setTextColor(*WARNING_TEXT)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(36, 20, 36, 28)
         layout.setSpacing(12)
         layout.addWidget(self.title)
-        layout.addStretch(1)
-        layout.addWidget(art, 0, Qt.AlignHCenter)
-        layout.addSpacing(8)
-        layout.addWidget(heading, 0, Qt.AlignHCenter)
-        layout.addWidget(text, 0, Qt.AlignHCenter)
-        layout.addSpacing(4)
-        layout.addWidget(store, 0, Qt.AlignHCenter)
-        layout.addStretch(2)
+        layout.addWidget(heading)
+        # Заголовки всегда на месте, сверху. Пока выдачи нет, поле поиска стоит посередине окна — пустые места
+        # сверху и снизу поровну. Нажали «Показать» — поле поднимается под заголовки, выдача занимает остальное
+        self.top_spacer = QWidget(self)
+        self.top_spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        layout.addWidget(self.top_spacer, 1)
+        layout.addLayout(search_row)
+        layout.addWidget(self.bar)
+        layout.addWidget(self.status)
+        layout.addWidget(self.show_button, 0, Qt.AlignHCenter)
+        layout.addWidget(self.filters_box)
+        layout.addWidget(self.list, 1)
+        layout.addWidget(self.open_button, 0, Qt.AlignLeft)
+        self.spacer = QWidget(self)  # пока списка нет — пустое место, чтобы подсказка стояла внизу
+        self.spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        layout.addWidget(self.spacer, 1)
+        layout.addWidget(note)
         self.mini = MiniPlayerSpot(self, self.title)
+        self._set_status("Введите название игры и нажмите Enter или лупу в поле. Цены, продажи и отзывы — "
+                         "с Plati.Market.")
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        QTimer.singleShot(0, self.mini.place)
+    # --- Поиск ---
+    def find(self, query=None):
+        """Искать query (или то, что в поле поиска)."""
+        if isinstance(query, str):
+            self.search.setText(query)
+        query = re.sub(r"\s+", " ", self.search.text()).strip()
+        if self.bar.isVisible() and query == getattr(self, "_query", None):
+            return  # этот поиск уже идёт (Enter и лупа подряд)
+        if len(query) < core.PLATI_MIN_QUERY:
+            self._set_status(f"Введите хотя бы {core.PLATI_MIN_QUERY} буквы названия.")
+            return
+        self._token += 1
+        token = self._token
+        self._query = query
+        self.result = None
+        self._hide_results()
+        self.bar.show()
+        self._set_status(f"Ищу «{query}» на Plati.Market…")
+        worker = Worker(core.search_plati, query, parent=self)
+        worker.finished.connect(lambda result: token == self._token and self._on_found(result))
+        worker.failed.connect(lambda message: token == self._token and self._on_failed(message))
+        worker.start()
+
+    def _on_found(self, result):
+        self.bar.hide()
+        self.result = result
+        if not result["items"]:
+            self._set_status(f"По «{result['query']}» на Plati.Market ничего не нашлось. Попробуйте название "
+                             "по-английски или короче.")
+            return
+        self._update_status()
+        self.show_button.show()
+
+    def _on_failed(self, message):
+        self.bar.hide()
+        self._set_status("Plati.Market не ответил: " + message.split(": ", 1)[-1] + ". Попробуйте ещё раз через "
+                         "минуту.", warning=True)
+
+    def _update_status(self):
+        result = self.result
+        if not result:
+            return
+        fitting = len(self._filtered())
+        text = f"Найдено {offers_word(result['total'])}"
+        if result["total"] > len(result["items"]):
+            text += f", загружены {len(result['items'])} самых подходящих"
+        if fitting != len(result["items"]):
+            text += f" · под фильтры подходит {fitting}"
+        self._set_status(text + ".")
+
+    def _set_status(self, text, warning=False):
+        self.status.setText(text)
+        if warning:
+            self.status.setTextColor(*WARNING_TEXT)
+        else:
+            self.status.setTextColor(QColor(0, 0, 0), QColor(255, 255, 255))
+
+    # --- Список ---
+    def show_results(self):
+        self.show_button.hide()
+        self.top_spacer.hide()
+        self.filters_box.show()
+        self.list.show()
+        self.open_button.show()
+        self.spacer.hide()
+        self._fill()
+
+    def _hide_results(self):
+        self.show_button.hide()
+        self.filters_box.hide()
+        self.list.hide()
+        self.list.clear()
+        self.shown, self.images = [], {}
+        self.loader.clear()
+        self.open_button.hide()
+        self.spacer.show()
+
+    def _currency(self):
+        return list(core.SHOP_CURRENCIES)[max(0, self.currency_box.currentIndex())]
+
+    def _filtered(self):
+        """Лоты под выбранные платформу и «Только игры» — в выбранном порядке."""
+        items = (self.result or {}).get("items") or []
+        platform = self.PLATFORMS[max(0, self.platform_box.currentIndex())][0]
+        if platform in ("steam", "xbox"):
+            items = [i for i in items if platform in i["platforms"]]
+        elif platform == "other":
+            items = [i for i in items if "steam" not in i["platforms"] and "xbox" not in i["platforms"]]
+        if self.games_only.isChecked():
+            # Только игры: лот с платформой (книги «Контрольная…» по запросу «Control» её не называют), не чит
+            # и не валюта, и в названии — все слова из поиска
+            wanted = core.shop_words(self.result["query"])
+            items = [i for i in items if i["platforms"] and not i["junk"] and wanted <= set(i["words"])]
+        sort = self.SORTS[max(0, self.sort_box.currentIndex())][0]
+        currency = self._currency()
+        if sort in ("price_asc", "price_desc"):
+            priced = [i for i in items if i["prices"].get(currency) is not None]
+            priced.sort(key=lambda i: i["prices"][currency], reverse=sort == "price_desc")
+            items = priced + [i for i in items if i["prices"].get(currency) is None]  # без цены — в конце
+        elif sort == "sold":
+            # Скрытые продажи — не ноль, а «неизвестно»: такие лоты после тех, где число видно
+            items = sorted(items, key=lambda i: (i["sold"] is None, -(i["sold"] or 0)))
+        return items
+
+    def _fill(self):
+        self.list.clear()
+        self.shown = self._filtered()
+        for item in self.shown:
+            entry = QListWidgetItem()
+            entry.setData(Qt.UserRole, item)
+            entry.setToolTip(item["name"] if not item["name_eng"] or item["name_eng"] == item["name"]
+                             else f"{item['name']}\n{item['name_eng']}")
+            self.list.addItem(entry)
+            if item["image"] not in self.images:
+                self.loader.request(item["image"])
+        self.open_button.setEnabled(False)
+        self._update_status()
+        if not self.shown and self.result and self.result["items"]:
+            self._set_status(self.status.text() + " Смените платформу или снимите «Только игры».")
+
+    def _apply_view(self):
+        """Список строками во всю ширину или сеткой карточек — как выбрано."""
+        mode = self.VIEWS[max(0, self.view_box.currentIndex())][0]
+        self.delegate.mode = mode
+        if mode == "grid":
+            self.list.setViewMode(QListView.IconMode)
+            self.list.setFlow(QListView.LeftToRight)
+            self.list.setWrapping(True)
+            self.grid_fit.fit(force=True)  # карточки — ровно по ширине, без пустой полосы справа
+        else:
+            self.list.setViewMode(QListView.ListMode)
+            self.list.setFlow(QListView.TopToBottom)
+            self.list.setWrapping(False)
+            self.list.setGridSize(QSize())
+        self.list.setMovement(QListView.Static)  # карточки не перетаскиваются
+        self.list.setResizeMode(QListView.Adjust)
+        self.list.setSpacing(0)
+        # Смена вида возвращает прокрутку «по строке» — тогда ползунок в сетке перескакивает через десятки рядов
+        self.list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.list.doItemsLayout()
+
+    def _on_view(self, *_):
+        core.save_settings(shop_view=self.VIEWS[max(0, self.view_box.currentIndex())][0])
+        self._apply_view()
+
+    @staticmethod
+    def _price_text(value, currency):
+        sign = core.SHOP_CURRENCIES[currency][1]
+        if value is None:
+            return "цена не указана"
+        text = f"{value:,.0f}" if currency == "RUB" or value >= 1000 else f"{value:,.2f}"
+        return text.replace(",", " ").replace(".", ",") + f" {sign}"
+
+    @staticmethod
+    def _seller_text(item):
+        return f"{item['seller'] or 'Продавец'} · 👍 {number_text(item['good'])}  👎 {number_text(item['bad'])}"
+
+    def _labels(self, item):
+        """Метки лота: платформа, что это за товар, DLC, регион; «не игра?» — если похоже на чит или валюту."""
+        labels = [self.PLATFORM_TITLES[p] for p in item["platforms"]]
+        if item["kind"]:
+            labels.append(self.KIND_TITLES[item["kind"]])
+        if item["dlc"]:
+            labels.append("DLC")
+        labels += item["regions"]
+        if item["junk"]:
+            labels.append("не игра?")
+        return labels or ["платформа не указана"]
+
+    def _on_image(self, url, content):
+        pixmap = QPixmap()
+        if not content or not pixmap.loadFromData(content):
+            return
+        if max(pixmap.width(), pixmap.height()) > 320:  # на карточку больше не нужно — меньше памяти
+            pixmap = pixmap.scaled(320, 320, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.images[url] = pixmap
+        self.list.viewport().update()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.mini.place()
+        if self.delegate.mode == "list":
+            self.list.doItemsLayout()  # строки — во всю новую ширину
+
+    def _on_filters(self, *_):
+        sort = self.SORTS[max(0, self.sort_box.currentIndex())][0]
+        platform = self.PLATFORMS[max(0, self.platform_box.currentIndex())][0]
+        core.save_settings(shop_currency=self._currency(), shop_sort=sort, shop_platform=platform,
+                           shop_games_only=self.games_only.isChecked())
+        if self.list.isVisible():
+            self._fill()
+        else:
+            self._update_status()
+
+    # --- Ссылки ---
+    def open_selected(self):
+        row = self.list.currentRow()
+        if not 0 <= row < len(self.shown):
+            return
+        item = self.shown[row]
+        url = item["url"]
+        if not url.startswith(self.ITEM_PREFIX):  # открываем только страницы лотов на plati.market
+            return
+        core.log.info("Найти игры: открываю лот %s на Plati.Market", item["id"])
+        QDesktopServices.openUrl(QUrl(url))
+
+    WHEEL_STEP = 110  # пикселей за щелчок колеса в сетке — треть карточки
+
+    def eventFilter(self, obj, event):
+        if (obj is self.list.viewport() and event.type() == QEvent.Wheel and self.delegate.mode == "grid"
+              and not event.modifiers() & Qt.ControlModifier):
+            # В сетке Qt крутит по целому ряду карточек на каждую «строку» колеса — три ряда за щелчок.
+            # Крутим сами, по пикселям; тачпад присылает точные пиксели — их и берём
+            bar = self.list.verticalScrollBar()
+            pixels = event.pixelDelta().y()
+            delta = pixels if pixels else round(event.angleDelta().y() / 120 * self.WHEEL_STEP)
+            bar.setValue(bar.value() - delta)
+            return True
+        return super().eventFilter(obj, event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self.mini.place)
+        QTimer.singleShot(0, self.search.setFocus)
+
+
+def number_text(value):
+    """12345 → «12 345»."""
+    return f"{int(value):,}".replace(",", " ")
+
+
+def enlarge_line_edit_buttons(edit, icon=15, size=QSize(38, 32)):
+    """Лупа и крестик внутри поля поиска крупнее: у библиотеки они 10 пикселей — в высоком поле едва видны."""
+    for name in ("searchButton", "clearButton"):
+        button = getattr(edit, name, None)
+        if button is not None:
+            button.setFixedSize(size)
+            button.setIconSize(QSize(icon, icon))
+
+
+def offers_word(count):
+    """«1 предложение», «3 предложения», «45 предложений»."""
+    n = abs(int(count)) % 100
+    word = "предложений" if 11 <= n <= 14 else {1: "предложение", 2: "предложения", 3: "предложения",
+                                                 4: "предложения"}.get(n % 10, "предложений")
+    return f"{number_text(count)} {word}"
 
 
 # --- Страница «Игры Native Port's» ------------------------------------------
@@ -10332,6 +11238,8 @@ class PortPage(QWidget):
         self.edit_button.clicked.connect(lambda: self.ports_page.edit(self.port))
         self.cover_button = PushButton("Своя обложка", self, FIF.PHOTO)
         self.cover_button.clicked.connect(lambda: self.win.library_page.choose_cover(self.port))
+        self.notes_button = PushButton("Свои заметки", self, fluent_icon("QUICK_NOTE", FIF.EDIT))
+        self.notes_button.clicked.connect(lambda: self.port and open_notes(self.win, self.port, self.notes_button))
         self.spin_button = PushButton("Крутить ещё", self, FIF.SYNC)
         self.spin_button.clicked.connect(self._spin_again)
         # Как у игр Steam: только из рулетки, в своём разделе и в коллекциях игра остаётся
@@ -10352,9 +11260,9 @@ class PortPage(QWidget):
         self.collection_button.hide()
         buttons_box = QWidget(self)
         self.buttons = CenteredFlowLayout(buttons_box, spacing=12)
-        for button in (self.play_button, self.update_button, self.updated_button, self.repo_button, self.steam_button,
-                       self.folder_button, self.edit_button, self.cover_button, self.spin_button, self.roulette_button,
-                       self.collection_button, back_button):
+        for button in (self.play_button, self.update_button, self.updated_button, self.notes_button, self.repo_button,
+                       self.steam_button, self.folder_button, self.edit_button, self.cover_button, self.spin_button,
+                       self.roulette_button, self.collection_button, back_button):
             self.buttons.addWidget(button)
 
         self.chips_box = QWidget(self)
@@ -10465,6 +11373,7 @@ class PortPage(QWidget):
                           lambda message: core.log.warning("Отзывы Steam не загрузились: %s", message))
             else:
                 self._load_wiki()
+        show_notes_count(self.notes_button, port)
         self.refresh()
 
     def _run(self, fn, args, on_done, on_fail=None):
@@ -13007,7 +13916,7 @@ class MainWindow(FluentWindow):
         self.collections_page = CollectionsPage(self)
         self.music_page = MusicPage(self)
         self.web_page = WebPage(self) if QWebEngineView else None
-        self.shop_page = ShopPage(self)  # «Купить игры» — заготовка раздела следующих версий
+        self.shop_page = ShopPage(self)  # «Найти игры на Plati.Market»
         self.settings_page = SettingsPage(self)
         self.logs_page = LogsPage(self)
         self.about_page = AboutPage(self)
@@ -13020,7 +13929,7 @@ class MainWindow(FluentWindow):
         self.addSubInterface(self.music_page, FIF.MUSIC, "Саундтреки")
         if self.web_page:
             self.addSubInterface(self.web_page, FIF.GLOBE, "Браузер")
-        self.addSubInterface(self.shop_page, FIF.SHOPPING_CART, "Купить игры")
+        self.addSubInterface(self.shop_page, FIF.SHOPPING_CART, "Найти игры на Plati.Market")
         self.addSubInterface(self.logs_page, FIF.DOCUMENT, "Логи",
                              position=NavigationItemPosition.BOTTOM)
         self.addSubInterface(self.settings_page, FIF.SETTING, "Настройки",
@@ -13076,9 +13985,11 @@ class MainWindow(FluentWindow):
         if hasattr(nav, "setMinimumExpandWidth"):
             nav.setMinimumExpandWidth(100000)  # при любой ширине окна меню выезжает поверх, а не раздвигает страницу
         widgets = [getattr(item, "widget", None) for item in getattr(panel, "items", {}).values()]
+        # Подпись в меню рисуется чуть шире шрифта самой кнопки — к ширине самой длинной подписи («Найти игры
+        # на Plati.Market») запас на значок, поля и эту разницу: меньше — последняя буква уходит за край
         texts = [QFontMetrics(w.font()).horizontalAdvance(w.text()) for w in widgets if hasattr(w, "text")]
         if hasattr(nav, "setExpandWidth"):
-            nav.setExpandWidth(max([150] + texts) + 84)  # значок слева, поля и полоса выбранного пункта
+            nav.setExpandWidth(max([150] + texts) + 94)
         if getattr(self, "_nav_hover", None) is None:  # второй раз не вешаем — иначе два «наблюдателя» спорят
             self._nav_hover = NavHover(panel, nav)
             # Сменилась вкладка щелчком по меню — оно закрывается и не выезжает снова, пока мышь на полоске
@@ -13182,8 +14093,10 @@ class MainWindow(FluentWindow):
         dialog.exec()
         connected, want_import, no_key = dialog.connected, dialog.want_import, dialog.no_key
         repeated, session_id, grid_saved = dialog.repeated, dialog.session_id, dialog.grid_saved
+        skipped = dialog.skipped
         core.log.info("Окно «Подключение к Steam» закрыто: %s",
-                      "подключено" if connected else "без ключа" if no_key else "без подключения")
+                      "подключено" if connected else "без ключа" if no_key else "«Пропустить»" if skipped
+                      else "закрыто без выбора")
         dialog.deleteLater()
         self.settings = core.load_settings()
         if grid_saved:
@@ -13204,7 +14117,8 @@ class MainWindow(FluentWindow):
                        "Игры добавляются на вкладке «Игры Steam» → «Добавить» — с поиском по магазину Steam.", 7000)
             return
         if not connected:
-            if not (self.settings["steam_api_key"] and self.settings["steam_id"]) \
+            # Отказ запоминаем только по «Пропустить». Закрыли мастер иначе — при следующем запуске он снова
+            if skipped and not (self.settings["steam_api_key"] and self.settings["steam_id"]) \
                     and self.settings.get("steam_setup") != "no_key":  # «Без ключа» с прошлого раза остаётся
                 core.save_settings(steam_setup="skipped")  # при следующем запуске не навязываемся
                 self.show_steam_later()
@@ -13543,13 +14457,30 @@ class MainWindow(FluentWindow):
 
 
 def install_error_hooks(window):
-    """Любая непойманная ошибка пишется в лог, а пользователь видит уведомление вместо молчаливого сбоя."""
+    """Любая непойманная ошибка пишется в лог, а пользователь видит уведомление вместо молчаливого сбоя.
+
+    Уведомление само может задеть то место, где случилась ошибка (затемнение уводит мышь со списка — и снова та же
+    ошибка). Поэтому пока одно уведомление об ошибке показывается, новое не открывается, а одинаковые ошибки
+    подряд уведомляют не чаще раза в ERROR_NOTICE_PAUSE секунд — иначе программа зацикливается и не отвечает."""
+    ERROR_NOTICE_PAUSE = 30
+    state = {"busy": False, "last": "", "at": 0.0}
 
     def on_error(exc_type, exc, tb):
         core.log.critical("Непредвиденная ошибка", exc_info=(exc_type, exc, tb))
-        if threading.current_thread() is threading.main_thread():
-            notify("error", window, "Что-то пошло не так",
-                   f"{exc_type.__name__}: {core.mask_secrets(exc)}\nПодробности — на вкладке «Логи».", duration=10000)
+        if threading.current_thread() is not threading.main_thread() or state["busy"]:
+            return
+        text = f"{exc_type.__name__}: {core.mask_secrets(exc)}"
+        now = time.monotonic()
+        if text == state["last"] and now - state["at"] < ERROR_NOTICE_PAUSE:
+            return
+        state.update(busy=True, last=text, at=now)
+        try:
+            notify("error", window, "Что-то пошло не так", f"{text}\nПодробности — на вкладке «Логи».",
+                   duration=10000)
+        except Exception:  # уведомление не открылось — ошибка уже в логе, главное не упасть здесь
+            core.log.exception("Уведомление об ошибке не показалось")
+        finally:
+            state["busy"] = False
 
     sys.excepthook = on_error
     threading.excepthook = lambda args: core.log.critical(

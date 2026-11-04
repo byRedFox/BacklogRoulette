@@ -117,6 +117,13 @@ DEFAULT_SETTINGS = {
     "update_checked": 0,
     "update_release": None,
     "update_skip": "",
+    # «Найти игры на Plati.Market»: валюта цен, порядок лотов, платформа, «Только игры» (без читов, валюты,
+    # пополнений и лотов без платформы) и вид — списком или сеткой
+    "shop_currency": "RUB",
+    "shop_sort": "relevance",
+    "shop_platform": "all",
+    "shop_games_only": True,
+    "shop_view": "list",
 }
 
 
@@ -3867,6 +3874,160 @@ def search_store(term):
     return found
 
 
+# --- «Найти игры на Plati.Market»: поиск ключей ---------------------------------
+# Открытый поиск площадки (интерфейс для партнёров Plati, без ключа и без входа): только чтение по HTTPS.
+# Программа ничего не покупает, не входит в аккаунты и не знает о покупках — лот открывается на сайте во внешнем
+# браузере, и только по адресу лота на plati.market. Партнёрский код к ссылкам не добавляется.
+PLATI_SEARCH_URL = "https://plati.io/api/search.ashx"
+PLATI_ITEM_URL = "https://plati.market/itm/{id}"
+PLATI_PAGE_SIZE = 99  # больше 99 за раз площадка не отдаёт
+PLATI_MAX_PAGES = 3  # самых подходящих лотов — до 297: дальше по запросу «Doom» идут уже не Doom
+PLATI_MIN_QUERY = 3  # короче площадка не ищет
+PLATI_TEXT_MAX = 200
+# Валюта → (поле цены в ответе площадки, знак)
+SHOP_CURRENCIES = {"RUB": ("price_rur", "₽"), "USD": ("price_usd", "$"), "EUR": ("price_eur", "€"),
+                   "UAH": ("price_uah", "₴")}
+# Где активируется: по названию лота. Порядок важен — «Steam» в «EA app / Steam» значит, что можно и в Steam
+SHOP_PLATFORMS = (("steam", "Steam", r"steam|стим"),
+                  ("xbox", "Xbox", r"xbox|microsoft\s*store|game\s*pass|windows\s*(10|11)\s*store"),
+                  ("ea", "EA app", r"\bea\s*app\b|\borigin\b"),
+                  ("epic", "Epic", r"\bepic\b|\begs\b"),
+                  ("gog", "GOG", r"\bgog\b"),
+                  ("ubisoft", "Ubisoft", r"ubisoft|uplay"),
+                  ("playstation", "PlayStation", r"playstation|\bps[345]\b|\bpsn\b"),
+                  ("nintendo", "Nintendo", r"nintendo|switch|eshop"))
+# Что это за товар — тоже по названию. «+ ПОДАРОК» — бонус к ключу, а не способ доставки, его отрезаем заранее
+SHOP_BONUS_RE = re.compile(r"\+\s*(подар\w*|gift|бонус\w*|bonus)", re.IGNORECASE)
+SHOP_KINDS = (("account", "Аккаунт", r"аккаунт|account|аренд|rent|offline|оффлайн|офлайн|shared|общий"),
+              ("gift", "Гифт", r"\bgift\b|гифт|подарком"),
+              ("key", "Ключ", r"\bkey\b|ключ|cd[- ]?key|код\s+активац"))
+SHOP_DLC_RE = re.compile(r"\bdlc\b|season\s*pass|сезонн\w*\s+абонемент|дополнени", re.IGNORECASE)
+# Не сама игра: читы, игровая валюта, пополнения, подарочные карты, подписки, прокачка — по умолчанию прячутся
+# («Только игры»). «Steam gift» — это игра подарком, а «gift card» — карта пополнения, поэтому они разные
+SHOP_JUNK_RE = re.compile(r"\bчит\w*|cheat|\bhack|aimbot|wallhack|монет|coins?\b|валют|\bpoints?\b|кредит\w*|"
+                          r"робукс|robux|пополнени|top[- ]?up|\bboost|буст|прокачк|подписк|"
+                          r"подарочн\w*\s+карт|gift\s*cards?|карт\w*\s+оплат|wallet|"
+                          r"\bbfc\b|v-?bucks|в-?баксы", re.IGNORECASE)
+SHOP_REGIONS = (("RU", r"\b(ru|рф)\b|росси|russia"), ("СНГ", r"\b(cis|снг)\b"), ("Global", r"global|region\s*free|глобал"),
+                ("KZ", r"\bkz\b|казах"), ("TR", r"\btr\b|турци|turkey"), ("EU", r"\beu\b|europe|европ"),
+                ("US", r"\b(us|usa)\b|сша"), ("AR", r"\bargentin|аргентин"))
+_SHOP_WORD_RE = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
+
+
+def _fix_mojibake(text):
+    """Русский текст, который где-то по пути прочитали как Latin-1 («Ð Ð¾ÑÑÐ¸Ñ»), — обратно в «Россия»."""
+    if "Ð" not in text and "Ñ" not in text:
+        return text
+    try:
+        fixed = text.encode("cp1252").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        try:
+            fixed = text.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return text
+    return fixed
+
+
+def _shop_text(value):
+    """Название лота обычным текстом: без HTML, служебных символов и лишних пробелов."""
+    text = html.unescape(_fix_mojibake(str(value or "")))
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()[:PLATI_TEXT_MAX]
+
+
+def _shop_number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def shop_words(text):
+    """Слова названия в нижнем регистре — по ним видно, что лот про ту игру: «Battlefield 4» не «Battlefield 2042»."""
+    return set(_SHOP_WORD_RE.findall((text or "").casefold().replace("ё", "е")))
+
+
+def _shop_labels(name):
+    """Метки лота по его названию: платформы, что это за товар, DLC, регион и не игра ли это вовсе."""
+    text = SHOP_BONUS_RE.sub(" ", name)
+    platforms = [key for key, _title, pattern in SHOP_PLATFORMS if re.search(pattern, text, re.IGNORECASE)]
+    kind = next((key for key, _title, pattern in SHOP_KINDS if re.search(pattern, text, re.IGNORECASE)), "")
+    regions = [title for title, pattern in SHOP_REGIONS if re.search(pattern, text, re.IGNORECASE)]
+    return {"platforms": platforms, "kind": kind, "dlc": bool(SHOP_DLC_RE.search(text)),
+            "junk": bool(SHOP_JUNK_RE.search(text)), "regions": regions[:3]}
+
+
+def _plati_item(raw):
+    """Лот из ответа площадки — в виде для программы. None — лот без номера или без названия."""
+    try:
+        item_id = int(raw.get("id") or 0)
+    except (TypeError, ValueError):
+        return None
+    name = _shop_text(raw.get("name")) or _shop_text(raw.get("name_eng"))
+    if item_id <= 0 or not name:
+        return None
+    name_eng = _shop_text(raw.get("name_eng"))
+    # Продажи продавец может скрыть — тогда числа нет (а не ноль): при сортировке такие лоты идут последними
+    sold = _shop_number(raw.get("numsold"))
+    if raw.get("numsold_hidden") or raw.get("hide_sales"):
+        sold = None
+    sale = raw.get("sale_info") if isinstance(raw.get("sale_info"), dict) else {}
+    discount = _shop_number(sale.get("sale_percent"))
+    labels = _shop_labels(f"{name} {name_eng}")
+    return {
+        "id": item_id, "name": name, "name_eng": name_eng,
+        "url": PLATI_ITEM_URL.format(id=item_id),  # адрес собираем сами: только страница лота на plati.market
+        "image": f"https://graph.digiseller.com/img.ashx?idd={item_id}&maxlength=160",
+        "prices": {code: _shop_number(raw.get(field)) for code, (field, _sign) in SHOP_CURRENCIES.items()},
+        "sold": int(sold) if sold is not None else None,
+        "seller": _shop_text(raw.get("seller_name"))[:60],
+        "rating": _shop_number(raw.get("seller_rating")),
+        "good": int(_shop_number(raw.get("count_positiveresponses")) or 0),
+        "bad": int(_shop_number(raw.get("count_negativeresponses")) or 0),
+        "returns": int(_shop_number(raw.get("count_returns")) or 0),
+        "discount": int(discount) if discount else 0,
+        "words": sorted(shop_words(f"{name} {name_eng}")),
+        **labels,
+    }
+
+
+def search_plati(query, pages=PLATI_MAX_PAGES):
+    """Лоты Plati.Market по названию игры, в порядке площадки (самые подходящие первыми):
+    {"query", "total" — сколько всего нашла площадка, "items": [лоты]}. Вызывается в фоновом потоке.
+    Площадка не ответила — ServiceBusy."""
+    query = re.sub(r"\s+", " ", query or "").strip()[:100]
+    if len(query) < PLATI_MIN_QUERY:
+        raise ValueError(f"введите хотя бы {PLATI_MIN_QUERY} буквы названия")
+    items, seen, total = [], set(), 0
+    for page in range(1, pages + 1):
+        try:
+            response = requests.get(PLATI_SEARCH_URL, timeout=REQUEST_TIMEOUT,
+                                    headers={"User-Agent": "BacklogRoulette", "Accept": "application/json"},
+                                    params={"query": query, "pagesize": PLATI_PAGE_SIZE, "pagenum": page,
+                                            "response": "json"})
+            response.raise_for_status()
+            data = json.loads(response.content.decode("utf-8-sig", errors="replace"))
+        except (requests.RequestException, ValueError) as e:
+            if items:  # первые страницы пришли — показываем их
+                log.warning("Plati.Market: страница %d поиска «%s» не пришла: %s", page, query, e)
+                break
+            raise ServiceBusy(f"Plati.Market не ответил: {str(e).split('?', 1)[0][:160]}") from None
+        if not isinstance(data, dict):
+            break
+        total = max(total, int(_shop_number(data.get("total")) or 0))
+        for raw in data.get("items") or []:
+            item = _plati_item(raw) if isinstance(raw, dict) else None
+            if item and item["id"] not in seen:
+                seen.add(item["id"])
+                items.append(item)
+        if page >= int(_shop_number(data.get("Totalpages")) or 0):
+            break
+    log.info("Plati.Market «%s»: всего %d, загружено %d", query, total, len(items))
+    return {"query": query, "total": max(total, len(items)), "items": items}
+
+
 # --- Игры Native Port's -------------------------------------------------------
 # Native Port's — игры, которые уже установлены на этом ПК и запускаются своей программой, чаще всего фанатские
 # порты с GitHub (Ship of Harkinian, OpenMW и т. п.). Программа их только находит и запускает: ничего не качает
@@ -4570,6 +4731,153 @@ def is_port(game):
 def is_disc(game):
     """Игра из «Дисковых игр»."""
     return is_port(game) and game.get("kind") == "disc"
+
+
+# --- Свои заметки -------------------------------------------------------------
+# У каждой игры — своя заметка: общий текст об игре и записи по сессиям, у каждой своя дата. Хранятся только
+# на этом ПК, в папке notes рядом с программой (в репозиторий она не попадает), по файлу на игру — сбой при записи
+# заденет не больше одной заметки. Текст — Markdown: его легко перенести в обзор или статью. У записи есть
+# список картинок — под скриншоты из игры (они появятся позже); сейчас он всегда пустой.
+NOTES_DIR = os.path.join(BASE_DIR, "notes")
+NOTES_VERSION = 1
+NOTE_KINDS = ("port", "disc")
+_NOTE_ID_RE = re.compile(r"[0-9a-f]{1,32}")
+_NOTE_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+MONTHS_GENITIVE = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября",
+                   "октября", "ноября", "декабря")
+
+
+def note_keys(game):
+    """Имя файла заметки игры (без .json) и прежнее имя, откуда её перенести, или None. Порт и дисковая игра —
+    по своему номеру в списке (переименование заметку не теряет), игра Steam — по номеру в Steam, а пока его нет —
+    по названию. Связали игру со Steam — заметка, записанная под названием, переезжает под номер."""
+    by_name = "name-" + hashlib.sha1(clean_name(game["name"]).casefold().encode("utf-8")).hexdigest()[:16]
+    if is_port(game):
+        port_id, kind = str(game.get("id") or ""), game.get("kind")
+        if _NOTE_ID_RE.fullmatch(port_id) and kind in NOTE_KINDS:
+            return f"{kind}-{port_id}", None
+        return by_name, None
+    appid = game.get("appid")
+    if isinstance(appid, int) and appid > 0:
+        return f"steam-{appid}", by_name
+    return by_name, None
+
+
+def _note_path(key):
+    return os.path.join(NOTES_DIR, key + ".json")
+
+
+def empty_note(game):
+    return {"version": NOTES_VERSION, "game": game["name"], "text": "", "sessions": [], "updated": 0}
+
+
+def new_session():
+    """Новая запись по сессии — с сегодняшней датой."""
+    return {"id": secrets.token_hex(6), "date": time.strftime("%Y-%m-%d"), "created": int(time.time()),
+            "text": "", "images": []}
+
+
+def _clean_note(data, game):
+    note = empty_note(game)
+    if not isinstance(data, dict):
+        return note
+    note["text"] = str(data.get("text") or "")
+    updated = data.get("updated")
+    note["updated"] = updated if isinstance(updated, int) else 0
+    for item in data.get("sessions") or []:
+        if not isinstance(item, dict):
+            continue
+        date = str(item.get("date") or "")
+        created = item.get("created")
+        note["sessions"].append({
+            "id": str(item.get("id") or secrets.token_hex(6))[:32],
+            "date": date if _NOTE_DATE_RE.fullmatch(date) else time.strftime("%Y-%m-%d"),
+            "created": created if isinstance(created, int) else 0,
+            "text": str(item.get("text") or ""),
+            "images": [str(p) for p in item.get("images") or [] if isinstance(p, str)],
+        })
+    return note
+
+
+def _read_note(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_note(game):
+    """Заметка игры: {"text", "sessions": [{"id", "date", "created", "text", "images"}], …}. Нет её — пустая.
+    Файл повреждён — он откладывается в сторону (…json.<время>.broken), заметка начинается заново, а в ответе
+    "broken" — имя отложенного файла, чтобы сказать об этом пользователю."""
+    key, old = note_keys(game)
+    path = _note_path(key)
+    if old and not os.path.exists(path) and os.path.exists(_note_path(old)):
+        try:
+            os.replace(_note_path(old), path)
+            log.info("Заметка «%s» перенесена: игра связана со Steam", game["name"])
+        except OSError as e:
+            log.warning("Заметку «%s» не перенести под номер Steam: %s", game["name"], e)
+            path = _note_path(old)
+    try:
+        return _clean_note(_read_note(path), game)
+    except FileNotFoundError:
+        return empty_note(game)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        broken = f"{path}.{int(time.time())}.broken"
+        try:
+            os.replace(path, broken)
+        except OSError:
+            broken = path
+        log.warning("Заметка «%s» повреждена (%s) — файл отложен как %s", game["name"], e, os.path.basename(broken))
+        return dict(empty_note(game), broken=os.path.basename(broken))
+
+
+def save_note(game, note):
+    """Сохранить заметку. Пустые записи не сохраняются; совсем пустая заметка — файл удаляется."""
+    key, _ = note_keys(game)
+    path = _note_path(key)
+    sessions = [dict(s) for s in note.get("sessions") or [] if s.get("text", "").strip() or s.get("images")]
+    if not note.get("text", "").strip() and not sessions:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    os.makedirs(NOTES_DIR, exist_ok=True)
+    save_json(path, {"version": NOTES_VERSION, "game": game["name"], "text": note.get("text", ""),
+                     "sessions": sessions, "updated": int(time.time())})
+
+
+def note_count(game):
+    """Сколько в заметке игры непустых частей: общий текст и записи. Только читает — повреждённый файл не трогает."""
+    key, old = note_keys(game)
+    for path in (_note_path(key), _note_path(old) if old else None):
+        if path and os.path.exists(path):
+            try:
+                note = _clean_note(_read_note(path), game)
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                return 0
+            return bool(note["text"].strip()) + sum(bool(s["text"].strip() or s["images"]) for s in note["sessions"])
+    return 0
+
+
+def russian_date(date):
+    """«2026-11-03» → «3 ноября 2026»."""
+    try:
+        year, month, day = (int(part) for part in date.split("-"))
+        return f"{day} {MONTHS_GENITIVE[month - 1]} {year}"
+    except (ValueError, IndexError, AttributeError):
+        return str(date)
+
+
+def note_markdown(game, note):
+    """Заметка целиком одним текстом Markdown — для экспорта в .md: общий текст, потом записи, новые сверху."""
+    parts = [f"# {game['name']}"]
+    if note.get("text", "").strip():
+        parts.append("## Об игре\n\n" + note["text"].strip())
+    sessions = [s for s in note.get("sessions") or [] if s.get("text", "").strip()]
+    if sessions:
+        parts.append("## Записи по сессиям")
+        for session in sorted(sessions, key=lambda s: (s["date"], s["created"]), reverse=True):
+            parts.append(f"### {russian_date(session['date'])}\n\n{session['text'].strip()}")
+    return "\n\n".join(parts) + "\n"
 
 
 def port_has_update(port):
