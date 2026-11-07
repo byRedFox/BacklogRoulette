@@ -148,7 +148,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.5"
+__version__ = "2.5.0.1"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -11122,13 +11122,62 @@ class PortEditDialog(MessageBoxBase):
         self.accept()
 
 
+TROPHY_DARK = QColor(43, 52, 64)
+
+
+def draw_trophy(painter, center, size, color):
+    """Кубок высотой size точек с центром в center: чаша с ручками, ножка и подставка."""
+    x, y, k = center.x(), center.y(), size / 16
+    painter.save()
+    painter.setRenderHint(QPainter.Antialiasing)
+    cup = QPainterPath()
+    cup.moveTo(x - 5 * k, y - 8 * k)
+    cup.lineTo(x + 5 * k, y - 8 * k)
+    cup.cubicTo(x + 5 * k, y - 1 * k, x + 2.5 * k, y + 1.5 * k, x, y + 1.5 * k)
+    cup.cubicTo(x - 2.5 * k, y + 1.5 * k, x - 5 * k, y - 1 * k, x - 5 * k, y - 8 * k)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(color)
+    painter.drawPath(cup)
+    painter.drawRect(QRectF(x - 1.1 * k, y + 1.4 * k, 2.2 * k, 3.4 * k))  # ножка
+    painter.drawRoundedRect(QRectF(x - 4.5 * k, y + 4.6 * k, 9 * k, 2.6 * k), 0.8 * k, 0.8 * k)  # подставка
+    painter.setPen(QPen(color, 1.5 * k))
+    painter.setBrush(Qt.NoBrush)
+    for side in (-1, 1):  # ручки
+        painter.drawArc(QRectF(x + side * 5.2 * k - 2.6 * k, y - 7.2 * k, 5.2 * k, 5.6 * k),
+                        (-90 if side > 0 else 90) * 16, 180 * 16)
+    painter.restore()
+
+
+def trophy_icon(color=None):
+    """Значок кубка для кнопок. Без цвета — цвета текста темы: кнопка сама сделает его бледным, если выключена."""
+    color = color or (WHITE if isDarkTheme() else QColor(30, 30, 30))
+    icon = QIcon()
+    for side in (16, 32, 48):
+        pixmap = QPixmap(side, side)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        draw_trophy(painter, QPointF(side / 2, side / 2), side, color)
+        painter.end()
+        icon.addPixmap(pixmap)
+    return icon
+
+
+def completed_text(port):
+    """«пройдена 07.11.2026» — для плашек и списка."""
+    return "пройдена " + time.strftime("%d.%m.%Y", time.localtime(port["completed_at"]))
+
+
 class PortTileDelegate(CoverTileDelegate):
-    """Плитка порта — как у игр Steam, а если на GitHub вышла новая версия, в углу обложки кружок со стрелкой."""
+    """Плитка порта — как у игр Steam, а если на GitHub вышла новая версия, в углу обложки кружок со стрелкой.
+    Пройденная игра — с платиновым кубком в левом верхнем углу, как трофей в PlayStation."""
 
     UPDATE_ROLE = Qt.UserRole + 2
+    COMPLETED_ROLE = Qt.UserRole + 12
 
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
+        if index.data(self.COMPLETED_ROLE):
+            self._paint_trophy(painter, option)
         if not index.data(self.UPDATE_ROLE):
             return
         rect = QRectF(option.rect)
@@ -11146,6 +11195,23 @@ class PortTileDelegate(CoverTileDelegate):
                                        QPointF(x + 2.2, y + 6), QPointF(x - 2.2, y + 6), QPointF(x - 2.2, y),
                                        QPointF(x - 6, y)]))
         painter.restore()
+
+    def _paint_trophy(self, painter, option):
+        rect = QRectF(option.rect)
+        left = rect.x() + (rect.width() - self.COVER.width()) / 2
+        center = QPointF(left + 20, rect.y() + self.PAD + 20)
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        # Платина: светлый серебристо-голубой металл с бликом сверху слева
+        metal = QLinearGradient(center.x() - 15, center.y() - 15, center.x() + 15, center.y() + 15)
+        metal.setColorAt(0, QColor(246, 249, 252))
+        metal.setColorAt(0.5, QColor(196, 208, 222))
+        metal.setColorAt(1, QColor(132, 148, 168))
+        painter.setPen(QPen(QColor(255, 255, 255, 230), 2))
+        painter.setBrush(metal)
+        painter.drawEllipse(center, 15, 15)
+        painter.restore()
+        draw_trophy(painter, center, 18, TROPHY_DARK)
 
 
 def hltb_url(name):
@@ -11223,6 +11289,15 @@ class PortPage(QWidget):
         self.header.artRequested.connect(lambda kind, step: self.port and step_art(self, self.port, kind, step))
         self.play_button = PrimaryPushButton("Играть", self, FIF.PLAY)
         self.play_button.clicked.connect(lambda: self.ports_page.launch(self.port))
+        # Прошли игру и удалили с диска — она остаётся здесь с наигранным временем и заметками, но запускать
+        # её нечем: вместо «Играть» — выключенная «Пройдена». Снова поставили — «Вернуть в игру»
+        self.complete_button = PushButton("Отметить пройденной", self, trophy_icon())
+        self.complete_button.setToolTip("Игра останется здесь — с наигранным временем и заметками, но из рулетки уйдёт. "
+                                        "Удалить её с диска можно и потом: программа сама ничего не удаляет")
+        self.complete_button.clicked.connect(lambda: self.ports_page.mark_completed(self.port))
+        self.replay_button = PushButton("Вернуть в игру", self, FIF.SYNC)
+        self.replay_button.setToolTip("Снова «Играть» — например, если вы поставили игру ещё раз")
+        self.replay_button.clicked.connect(lambda: self.ports_page.unmark_completed(self.port))
         self.update_button = PrimaryPushButton("Скачать обновление", self, FIF.DOWNLOAD)
         self.update_button.setToolTip("Страница нового релиза на GitHub — в браузере. Скачиваете и ставите вы сами")
         self.update_button.clicked.connect(lambda: self.ports_page.open_release(self.port))
@@ -11262,7 +11337,8 @@ class PortPage(QWidget):
         self.buttons = CenteredFlowLayout(buttons_box, spacing=12)
         for button in (self.play_button, self.update_button, self.updated_button, self.notes_button, self.repo_button,
                        self.steam_button, self.folder_button, self.edit_button, self.cover_button, self.spin_button,
-                       self.roulette_button, self.collection_button, back_button):
+                       self.roulette_button, self.complete_button, self.replay_button, self.collection_button,
+                       back_button):
             self.buttons.addWidget(button)
 
         self.chips_box = QWidget(self)
@@ -11476,9 +11552,18 @@ class PortPage(QWidget):
             return
         disc = not self.ports_page.GITHUB
         latest = port.get("latest") or {}
-        update = core.port_has_update(port)
+        completed = bool(port.get("completed_at"))
+        update = core.port_has_update(port) and not completed  # пройденную обновлять незачем
         self.update_button.setVisible(update)
         self.updated_button.setVisible(update)
+        self.play_button.setEnabled(not completed)
+        self.play_button.setText("Пройдена" if completed else "Играть")
+        self.play_button.setIcon(trophy_icon() if completed else FIF.PLAY)
+        self.play_button.setToolTip(completed_text(port)[:1].upper() + completed_text(port)[1:]
+                                    + ". Снова играть — «Вернуть в игру»" if completed else "")
+        self.complete_button.setIcon(trophy_icon())  # цвет — под тему, её могли сменить
+        self.complete_button.setVisible(not completed)
+        self.replay_button.setVisible(completed)
         self.repo_button.setVisible(bool(port.get("repo")))
         self.steam_button.setVisible(disc and not port.get("appid"))
         origin = self.origin
@@ -11487,7 +11572,7 @@ class PortPage(QWidget):
             self.collection_button.setText(f"К коллекции «{origin['name']}»")
         # «Крутить ещё» — когда эта игра сама крутится в рулетке
         self.spin_button.setVisible(any(g is port for g in self.win.roulette_games()))
-        self.roulette_button.setVisible(not self.win.roulette.has(port))
+        self.roulette_button.setVisible(not completed and not self.win.roulette.has(port))
         self.buttons.invalidate()
 
         # Дисковая игра: карточка Steam (если связана и Steam её отдал), иначе статья из Википедии
@@ -11505,6 +11590,9 @@ class PortPage(QWidget):
             if port.get("last_played"):
                 played += " · последний раз " + time.strftime("%d.%m.%Y", time.localtime(port["last_played"]))
             chips.append(InfoChip("Наиграно", played, None, self.chips_box))
+        if completed:
+            chips.append(InfoChip("Пройдена", time.strftime("%d.%m.%Y", time.localtime(port["completed_at"])), None,
+                                  self.chips_box))
         if port.get("installed_tag"):
             chips.append(InfoChip("Версия у вас", port["installed_tag"], None, self.chips_box))
         if latest.get("tag"):
@@ -12086,12 +12174,14 @@ class NativePortsPage(QWidget):
         for port in sort_games(ports, self.sort_box.mode()):
             if query and query not in port["name"].casefold():
                 continue
-            update = core.port_has_update(port)
+            update = core.port_has_update(port) and not port.get("completed_at")
             details = []
             if tracker.playing(port):
                 details.append("играете сейчас")
             elif port.get("playtime"):
                 details.append("наиграно " + core.playtime_text(port["playtime"]))
+            if port.get("completed_at"):
+                details.append(completed_text(port))
             if update:
                 details.append(f"новая версия {port['latest']['tag']}")
             for view in (self.list, self.grid):
@@ -12102,15 +12192,19 @@ class NativePortsPage(QWidget):
                 item.setToolTip(port["name"] + "".join(f"\n{d[:1].upper()}{d[1:]}" for d in details))
                 if view is self.grid:
                     item.setData(PortTileDelegate.UPDATE_ROLE, update)
+                    item.setData(PortTileDelegate.COMPLETED_ROLE, bool(port.get("completed_at")))
                     item.setSizeHint(QSize(tile.width() + 2 * CoverTileDelegate.PAD,
                                            tile.height() + CoverTileDelegate.TEXT_H + 2 * CoverTileDelegate.PAD))
                 view.addItem(item)
                 item.setSelected(port["id"] in selected)
-        updates = sum(core.port_has_update(p) for p in ports)
+        updates = sum(core.port_has_update(p) and not p.get("completed_at") for p in ports)
+        completed = sum(bool(p.get("completed_at")) for p in ports)
         text = self.T["count"].format(n=len(ports)) if ports else self.T["none"]
         total = sum(p.get("playtime") or 0 for p in ports)
         if total >= 60:
             text += f" · наиграно всего: {core.playtime_text(total)}"
+        if completed:
+            text += f" · пройдено: {completed}"
         if updates:
             text += f" · с новой версией на GitHub: {updates} — отмечены стрелкой"
         self.count_label.setText(text)
@@ -12162,19 +12256,28 @@ class NativePortsPage(QWidget):
             view.clearSelection()
             item.setSelected(True)
         menu = RoundMenu(parent=self)
+        completed = bool(port.get("completed_at"))
         play = Action(FIF.PLAY, "Играть", menu)
         play.triggered.connect(lambda: self.launch(port))
         page = Action(FIF.GAME, "Открыть страницу", menu)
         page.triggered.connect(lambda: self.open_from_list(port))
         folder = Action(FIF.FOLDER, "Открыть папку", menu)
         folder.triggered.connect(lambda: self.open_folder(port))
-        menu.addActions([play, page, folder])
-        if core.port_has_update(port):
+        menu.addActions([page, folder] if completed else [play, page, folder])
+        if core.port_has_update(port) and not completed:
             release = Action(FIF.DOWNLOAD, f"Скачать обновление {port['latest']['tag']}", menu)
             release.triggered.connect(lambda: self.open_release(port))
             done = Action(FIF.ACCEPT, "Я обновил", menu)
             done.triggered.connect(lambda: self.mark_updated(port))
             menu.addActions([release, done])
+        if completed:
+            replay = Action(FIF.SYNC, "Вернуть в игру", menu)
+            replay.triggered.connect(lambda: self.unmark_completed(port))
+            menu.addAction(replay)
+        else:
+            complete = Action(trophy_icon(), "Отметить пройденной", menu)
+            complete.triggered.connect(lambda: self.mark_completed(port))
+            menu.addAction(complete)
         menu.addSeparator()
         edit = Action(fluent_icon("EDIT", FIF.SETTING), "Изменить…", menu)
         edit.setToolTip(self.T["edit_tip"])
@@ -12450,6 +12553,10 @@ class NativePortsPage(QWidget):
     def launch(self, port):
         if not port:
             return
+        if port.get("completed_at"):  # кнопка «Пройдена» выключена, но запуск мог прийти и из рулетки или коллекции
+            notify("info", self.win, "Игра пройдена",
+                   f"«{port['name']}»: {completed_text(port)}. Снова играть — «Вернуть в игру» на её странице.")
+            return
         worker = Worker(core.check_port_exe, dict(port), parent=self)
         worker.finished.connect(lambda result: self._on_exe_checked(port, result))
         worker.failed.connect(lambda message: notify("error", self.win, self.T["not_launched"],
@@ -12501,11 +12608,49 @@ class NativePortsPage(QWidget):
             core.log.info("Порт «%s»: отмечен как обновлённый до %s", port["name"], latest)
             self.win.portsChanged.emit()
 
+    # --- Пройдена ---
+    # Пройденная игра остаётся в списке: наигранное время, заметки, обложка и коллекции — при ней. Меняется только
+    # то, что её больше не запустить: «Играть» становится выключенной «Пройдена», рулетка её не крутит, обновлений
+    # не ищем. Сама программа с диска ничего не удаляет. «Вернуть в игру» — всё как было, в том числе рулетка
+    # (если игру не убирали из неё вручную — тогда она так и остаётся убранной)
+    def mark_completed(self, port):
+        if not port or port.get("completed_at"):
+            return
+        if not confirm(self.win, "Отметить пройденной?",
+                       f"«{port['name']}» останется в списке — с наигранным временем и заметками, но из рулетки уйдёт, "
+                       "а вместо «Играть» будет «Пройдена». Файлы на диске программа не трогает: удалить игру можно "
+                       "самим, когда захотите.\n\nСнова сыграть — «Вернуть в игру».", "Пройдена"):
+            return
+        port["completed_at"] = int(time.time())
+        if not self.save():
+            port.pop("completed_at", None)
+            return
+        core.log.info("«%s»: отмечена пройденной", port["name"])
+        self._completed_changed()
+        notify("success", self.win, "Игра пройдена 🏆", f"«{port['name']}». Поздравляю!", 5000)
+
+    def unmark_completed(self, port):
+        if not port or not port.get("completed_at"):
+            return
+        old = port.pop("completed_at")
+        if not self.save():
+            port["completed_at"] = old
+            return
+        core.log.info("«%s»: возвращена в игру", port["name"])
+        self._completed_changed()
+        notify("success", self.win, "Игра снова в игре", f"«{port['name']}»: «Играть» и рулетка — как раньше. Если "
+               "игры уже нет на диске — поставьте её в ту же папку или укажите новую через «Изменить…».", 7000)
+
+    def _completed_changed(self):
+        self.win.portsChanged.emit()
+        self.win.rouletteChanged.emit()  # барабан, «Крутить ещё» и счётчик игр рулетки
+
     def check_updates(self, force=False, quiet=False, only=None):
         """Спросить GitHub о новых версиях. quiet — без уведомления «всё актуально» (при запуске программы)."""
         if self._checking or not self.GITHUB:
             return
-        ports = [p for p in self.lib.ports if p.get("repo") and (only is None or p["id"] in only)]
+        ports = [p for p in self.lib.ports if p.get("repo") and not p.get("completed_at")
+                 and (only is None or p["id"] in only)]
         if not ports:
             return
         self._checking = True
@@ -14230,14 +14375,15 @@ class MainWindow(FluentWindow):
     def roulette_games(self):
         """Игры для барабана — по выбору рядом с «Крутить». В списке те же словари, что в играх и портах.
         Убранные из рулетки сюда не попадают (кроме коллекций: там крутятся все их игры), а игры Steam — ещё
-        и по фильтрам, если они включены."""
+        и по фильтрам, если они включены. Пройденные порты и дисковые игры не крутятся нигде: запускать их нечем —
+        вернули в игру, снова крутятся (а убранные вручную так и остаются убранными)."""
         pool = self.roulette_pool()
         if pool.startswith("col:"):
-            return self.collection_games(self.collections.find(pool[4:]))
+            return [g for g in self.collection_games(self.collections.find(pool[4:])) if not g.get("completed_at")]
         lists = {"steam": self.library.games, "ports": self.ports.ports, "discs": self.discs.ports}
         games = []
         for source in pool.split("+"):
-            games += [g for g in lists[source] if not self.roulette.has(g)]
+            games += [g for g in lists[source] if not self.roulette.has(g) and not g.get("completed_at")]
         if self.filters_on():
             filters, meta = self.roulette_filters(), self.steam_meta
             games = [g for g in games if g.get("appid") and core.meta_matches(meta.get(str(int(g["appid"]))), filters)]
