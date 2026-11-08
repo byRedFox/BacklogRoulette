@@ -124,6 +124,11 @@ DEFAULT_SETTINGS = {
     "shop_platform": "all",
     "shop_games_only": True,
     "shop_view": "list",
+    # Снимки экрана в портах и дисковых играх: по клавише (или сочетанию) — окно игры в папку screenshots
+    # и в запись сессии в «Своих заметках». vk — код клавиши Windows, mods — Alt 1, Ctrl 2, Shift 4
+    "screenshots_enabled": True,
+    "screenshot_hotkey": {"vk": 0x7B, "mods": 2, "text": "Ctrl+F12"},
+    "screenshot_sound": True,  # свой щелчок затвора — поверх игры программа ничего не показывает
 }
 
 
@@ -4737,7 +4742,7 @@ def is_disc(game):
 # У каждой игры — своя заметка: общий текст об игре и записи по сессиям, у каждой своя дата. Хранятся только
 # на этом ПК, в папке notes рядом с программой (в репозиторий она не попадает), по файлу на игру — сбой при записи
 # заденет не больше одной заметки. Текст — Markdown: его легко перенести в обзор или статью. У записи есть
-# список картинок — под скриншоты из игры (они появятся позже); сейчас он всегда пустой.
+# список картинок — снимки экрана из портов и дисковых игр (папка screenshots, см. ниже).
 NOTES_DIR = os.path.join(BASE_DIR, "notes")
 NOTES_VERSION = 1
 NOTE_KINDS = ("port", "disc")
@@ -4872,12 +4877,298 @@ def note_markdown(game, note):
     parts = [f"# {game['name']}"]
     if note.get("text", "").strip():
         parts.append("## Об игре\n\n" + note["text"].strip())
-    sessions = [s for s in note.get("sessions") or [] if s.get("text", "").strip()]
+    sessions = [s for s in note.get("sessions") or [] if s.get("text", "").strip() or s.get("images")]
     if sessions:
         parts.append("## Записи по сессиям")
         for session in sorted(sessions, key=lambda s: (s["date"], s["created"]), reverse=True):
-            parts.append(f"### {russian_date(session['date'])}\n\n{session['text'].strip()}")
+            part = f"### {russian_date(session['date'])}"
+            if session.get("text", "").strip():
+                part += "\n\n" + session["text"].strip()
+            # Снимки — ссылками на файлы в папке screenshots: .md откроется с картинками в любом редакторе
+            shots = [screenshot_file(image) for image in session.get("images") or []]
+            shots = [path for path in shots if path and os.path.exists(path)]
+            if shots:
+                import pathlib
+                part += "\n\n" + "\n".join(f"![Снимок {i}]({pathlib.Path(path).as_uri()})"
+                                           for i, path in enumerate(shots, 1))
+            parts.append(part)
     return "\n\n".join(parts) + "\n"
+
+
+# --- Снимки экрана в портах и дисковых играх ------------------------------------
+# По клавише (её выбирают в настройках) — снимок окна игры: PNG в папке screenshots рядом с программой, по папке
+# на игру, и строка в записи сессии в «Своих заметках». Клавиша регистрируется в Windows (RegisterHotKey) только
+# пока идёт игра, запущенная из программы: программа узнаёт лишь о нажатии этой одной клавиши — остальные она не
+# видит. Снимается только окно, которое сейчас впереди, и только если это окно запущенной игры. Поверх игры ничего
+# не рисуется: о снимке говорит свой щелчок затвора.
+SCREENSHOTS_DIR = os.path.join(BASE_DIR, "screenshots")
+MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x4000
+VK_TAB, VK_ESCAPE, VK_F4, VK_F12, VK_SNAPSHOT, VK_PAUSE, VK_SCROLL = 0x09, 0x1B, 0x73, 0x7B, 0x2C, 0x13, 0x91
+# Одной клавишей без Ctrl/Alt можно назначить только такие — иначе, пока идёт игра, клавиша перестала бы
+# печатать во всех программах. F12 одна — нельзя: Windows бережёт её для отладчика
+SOLO_HOTKEYS = (set(range(0x70, 0x88)) - {VK_F12}) | {VK_SNAPSHOT, VK_PAUSE, VK_SCROLL}
+HOTKEY_NAMES = {VK_SNAPSHOT: "Print Screen", VK_PAUSE: "Pause", VK_SCROLL: "Scroll Lock"}
+SCREENSHOT_SAVING_MAX = 3  # столько снимков сразу может ждать записи на диск (4K-кадр в памяти — 33 МБ)
+
+
+class ScreenshotError(Exception):
+    """Снимок не получился. Текст — для пользователя."""
+
+
+def screenshot_hotkey(settings=None):
+    """Выбранная клавиша снимка: {"vk", "mods", "text"}. Испорченная запись в settings.json — по умолчанию."""
+    hotkey = (settings if settings is not None else load_settings()).get("screenshot_hotkey")
+    default = DEFAULT_SETTINGS["screenshot_hotkey"]
+    if not isinstance(hotkey, dict):
+        return dict(default)
+    vk, mods, text = hotkey.get("vk"), hotkey.get("mods"), hotkey.get("text")
+    if not (isinstance(vk, int) and isinstance(mods, int) and isinstance(text, str)) or hotkey_problem(vk, mods):
+        return dict(default)
+    return {"vk": vk, "mods": mods & (MOD_ALT | MOD_CONTROL | MOD_SHIFT), "text": text[:40]}
+
+
+def hotkey_problem(vk, mods):
+    """Почему клавишу нельзя назначить на снимок, или "" — можно."""
+    if not 0 < vk < 0xFF:
+        return "эту клавишу Windows не различает — выберите другую"
+    if vk == VK_F12 and not mods:
+        return "F12 одну Windows бережёт для отладчика — возьмите её с Ctrl, Alt или Shift"
+    if vk in (VK_TAB, VK_ESCAPE) or (vk == VK_F4 and mods & MOD_ALT):
+        return "это сочетание занято самой Windows"
+    if not mods and vk not in SOLO_HOTKEYS:
+        return ("одной клавишей можно назначить только F1–F11, F13–F24, Print Screen, Pause или Scroll Lock: "
+                "иначе, пока идёт игра, клавиша перестанет печатать во всех программах. Добавьте Ctrl или Alt")
+    if mods == MOD_SHIFT and vk not in SOLO_HOTKEYS:
+        return "Shift с буквой или цифрой — это просто заглавный знак. Добавьте Ctrl или Alt"
+    return ""
+
+
+def screenshot_file(image):
+    """Полный путь снимка из заметки — только PNG внутри папки screenshots, иначе None. Записанное в файл заметки
+    программа открывает только так: чужой путь (например, к программе) из испорченного файла не откроется."""
+    if not isinstance(image, str) or not image:
+        return None
+    path = os.path.normpath(os.path.join(BASE_DIR, image))
+    root = os.path.normcase(os.path.normpath(SCREENSHOTS_DIR)) + os.sep
+    if not os.path.normcase(path).startswith(root) or not path.lower().endswith(".png"):
+        return None
+    return path
+
+
+def screenshot_folder(game):
+    """Папка снимков игры — по тому же имени, что и файл её заметки."""
+    return os.path.join(SCREENSHOTS_DIR, note_keys(game)[0])
+
+
+def new_screenshot_path(game):
+    """Имя для нового снимка — дата и время; файл сразу занимается, чтобы два снимка за секунду не совпали."""
+    folder = screenshot_folder(game)
+    os.makedirs(folder, exist_ok=True)
+    base = time.strftime("%Y-%m-%d %H-%M-%S")
+    for i in range(1, 100):
+        path = os.path.join(folder, f"{base}.png" if i == 1 else f"{base} ({i}).png")
+        try:
+            with open(path, "xb"):
+                return path
+        except FileExistsError:
+            continue
+    raise OSError("не получилось придумать имя файла для снимка")
+
+
+def save_screenshot(path, width, height, data):
+    """Кадр (BGRA из capture_window) — в PNG. В фоновом потоке. Возвращает путь для заметки: screenshots/…/….png."""
+    try:
+        Image.frombuffer("RGB", (width, height), data, "raw", "BGRX", 0, 1).save(path, "PNG", compress_level=3)
+    except BaseException:
+        try:
+            os.remove(path)  # занятый пустой файл не оставляем
+        except OSError:
+            pass
+        raise
+    log.info("Снимок %dx%d: %s (%.1f МБ)", width, height, os.path.relpath(path, BASE_DIR),
+             os.path.getsize(path) / 1024 / 1024)
+    return os.path.relpath(path, BASE_DIR).replace(os.sep, "/")
+
+
+def attach_screenshot(note, session_id, image):
+    """Снимок — в запись сессии session_id; её нет (первый снимок за игру или запись удалили) — в новую запись
+    с сегодняшней датой. Возвращает номер записи — следующие снимки этой игры пойдут туда же."""
+    session = next((s for s in note["sessions"] if s["id"] == session_id), None) if session_id else None
+    if session is None:
+        session = new_session()
+        note["sessions"].append(session)
+    session["images"].append(image)
+    return session["id"]
+
+
+_WIN_API = None
+
+
+def _win_api():
+    """Функции Windows для клавиши и снимка — со своими описаниями аргументов (дескрипторы окон и картинок
+    64-битные: без описаний ctypes обрезал бы их до 32 бит)."""
+    global _WIN_API
+    if _WIN_API is not None:
+        return _WIN_API
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    HWND, HDC, INT, UINT, DWORD, BOOL = (wintypes.HWND, wintypes.HDC, ctypes.c_int, wintypes.UINT, wintypes.DWORD,
+                                         wintypes.BOOL)
+    for func, args, result in (
+            (user32.GetForegroundWindow, [], HWND),
+            (user32.GetWindowThreadProcessId, [HWND, ctypes.POINTER(DWORD)], DWORD),
+            (user32.IsIconic, [HWND], BOOL),
+            (user32.GetClientRect, [HWND, ctypes.POINTER(wintypes.RECT)], BOOL),
+            (user32.ClientToScreen, [HWND, ctypes.POINTER(wintypes.POINT)], BOOL),
+            (user32.GetDC, [HWND], HDC),
+            (user32.ReleaseDC, [HWND, HDC], INT),
+            (user32.PrintWindow, [HWND, HDC, UINT], BOOL),
+            (user32.RegisterHotKey, [HWND, INT, UINT, UINT], BOOL),
+            (user32.UnregisterHotKey, [HWND, INT], BOOL),
+            (gdi32.CreateCompatibleDC, [HDC], HDC),
+            (gdi32.CreateCompatibleBitmap, [HDC, INT, INT], wintypes.HBITMAP),
+            (gdi32.SelectObject, [HDC, wintypes.HGDIOBJ], wintypes.HGDIOBJ),
+            (gdi32.BitBlt, [HDC, INT, INT, INT, INT, HDC, INT, INT, DWORD], BOOL),
+            (gdi32.GetDIBits, [HDC, wintypes.HBITMAP, UINT, UINT, ctypes.c_void_p, ctypes.c_void_p, UINT], INT),
+            (gdi32.DeleteObject, [wintypes.HGDIOBJ], BOOL),
+            (gdi32.DeleteDC, [HDC], BOOL),
+            (kernel32.OpenProcess, [DWORD, BOOL, DWORD], wintypes.HANDLE),
+            (kernel32.QueryFullProcessImageNameW, [wintypes.HANDLE, DWORD, wintypes.LPWSTR, ctypes.POINTER(DWORD)],
+             BOOL),
+            (kernel32.CloseHandle, [wintypes.HANDLE], BOOL)):
+        func.argtypes, func.restype = args, result
+
+    class BITMAPINFO(ctypes.Structure):
+        _fields_ = [("biSize", DWORD), ("biWidth", wintypes.LONG), ("biHeight", wintypes.LONG),
+                    ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD), ("biCompression", DWORD),
+                    ("biSizeImage", DWORD), ("biXPelsPerMeter", wintypes.LONG), ("biYPelsPerMeter", wintypes.LONG),
+                    ("biClrUsed", DWORD), ("biClrImportant", DWORD), ("bmiColors", DWORD * 4)]
+
+    _WIN_API = {"ctypes": ctypes, "wintypes": wintypes, "user32": user32, "gdi32": gdi32, "kernel32": kernel32,
+                "BITMAPINFO": BITMAPINFO}
+    return _WIN_API
+
+
+def register_hotkey(hwnd, hotkey_id, vk, mods):
+    """Клавиша снимка — Windows пришлёт окну hwnd сообщение WM_HOTKEY. False — занята другой программой."""
+    if sys.platform != "win32":
+        return False
+    return bool(_win_api()["user32"].RegisterHotKey(hwnd, hotkey_id, mods | MOD_NOREPEAT, vk))
+
+
+def unregister_hotkey(hwnd, hotkey_id):
+    if sys.platform == "win32":
+        _win_api()["user32"].UnregisterHotKey(hwnd, hotkey_id)
+
+
+def foreground_window():
+    """Окно, которое сейчас впереди, и полный путь его программы (в нижнем регистре): (окно, путь) или (None, "").
+    Как и подсчёт времени, только читает сведения Windows о процессе — без доступа к его памяти."""
+    if sys.platform != "win32":
+        return None, ""
+    api = _win_api()
+    ctypes, wintypes, user32, kernel32 = api["ctypes"], api["wintypes"], api["user32"], api["kernel32"]
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return None, ""
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    handle = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return hwnd, ""
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buffer))
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return hwnd, os.path.normcase(buffer.value[:size.value])
+        return hwnd, ""
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _grab(api, screen, width, height, draw):
+    """Нарисовать кадр функцией draw(контекст) в картинку width×height и забрать её пиксели (BGRA сверху вниз)."""
+    ctypes, gdi32 = api["ctypes"], api["gdi32"]
+    memory = gdi32.CreateCompatibleDC(screen)
+    bitmap = gdi32.CreateCompatibleBitmap(screen, width, height)
+    if not memory or not bitmap:
+        if bitmap:
+            gdi32.DeleteObject(bitmap)
+        if memory:
+            gdi32.DeleteDC(memory)
+        raise ScreenshotError("Windows не дала памяти под снимок")
+    try:
+        old = gdi32.SelectObject(memory, bitmap)
+        drawn = draw(memory)
+        gdi32.SelectObject(memory, old)
+        if not drawn:
+            return None
+        info = api["BITMAPINFO"]()
+        info.biSize = 40  # только заголовок, без таблицы цветов
+        info.biWidth, info.biHeight = width, -height  # минус — строки сверху вниз, как у PNG
+        info.biPlanes, info.biBitCount, info.biCompression = 1, 32, 0  # BI_RGB
+        buffer = ctypes.create_string_buffer(width * height * 4)
+        if gdi32.GetDIBits(screen, bitmap, 0, height, buffer, ctypes.byref(info), 0) != height:
+            return None
+        return buffer.raw
+    finally:
+        gdi32.DeleteObject(bitmap)
+        gdi32.DeleteDC(memory)
+
+
+def _is_black(data):
+    """Кадр почти целиком чёрный — так выходит у игр в исключительном полноэкранном режиме."""
+    return max(data[::997], default=0) < 12
+
+
+def frame_digest(data):
+    """Отпечаток кадра — чтобы заметить, что снимок тот же, что и прошлый (кадр «застыл»)."""
+    return hashlib.blake2b(data, digest_size=16).digest()
+
+
+def capture_window(hwnd, window_first=False):
+    """Снимок окна hwnd без рамки и заголовка — то, что видно на экране. Чёрный кадр — ещё раз через PrintWindow
+    (так снимаются окна, которые рисует видеокарта). window_first — сразу через PrintWindow: экран отдал старый
+    кадр. Возвращает (ширина, высота, пиксели BGRA)."""
+    if sys.platform != "win32":
+        raise ScreenshotError("снимки работают только в Windows")
+    api = _win_api()
+    ctypes, wintypes, user32 = api["ctypes"], api["wintypes"], api["user32"]
+    if user32.IsIconic(hwnd):
+        raise ScreenshotError("окно игры свёрнуто")
+    rect = wintypes.RECT()
+    if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+        raise ScreenshotError("окно игры не отвечает на вопрос о размере")
+    width, height = rect.right - rect.left, rect.bottom - rect.top
+    if width < 16 or height < 16 or width * height > 8192 * 8192:
+        raise ScreenshotError(f"странный размер окна игры: {width}×{height}")
+    origin = wintypes.POINT(0, 0)
+    user32.ClientToScreen(hwnd, ctypes.byref(origin))
+    screen = user32.GetDC(None)
+    if not screen:
+        raise ScreenshotError("Windows не дала снять экран")
+    try:
+        gdi32 = api["gdi32"]
+        from_screen = (lambda dc: gdi32.BitBlt(dc, 0, 0, width, height, screen, origin.x, origin.y, 0x00CC0020))
+        from_window = (lambda dc: user32.PrintWindow(hwnd, dc, 0x1 | 0x2))  # PW_CLIENTONLY | PW_RENDERFULLCONTENT
+        first, second = (from_window, from_screen) if window_first else (from_screen, from_window)
+        data = _grab(api, screen, width, height, first)
+        if data is None or _is_black(data):
+            again = _grab(api, screen, width, height, second)
+            if again is not None and not _is_black(again):
+                data = again
+            elif data is not None:
+                raise ScreenshotError("кадр получился чёрным — так бывает в исключительном полноэкранном режиме. "
+                                      "Включите в настройках игры оконный или «безрамочный» режим")
+        if data is None:
+            raise ScreenshotError("Windows не отдала кадр окна игры")
+        return width, height, data
+    finally:
+        user32.ReleaseDC(None, screen)
 
 
 def port_has_update(port):
@@ -5664,12 +5955,43 @@ def _win_samples():
     return samples
 
 
+def _shutter_samples():
+    """Щелчок затвора фотоаппарата — два коротких сухих щелчка (шторка открылась и закрылась). Снимок сделан."""
+    rng = random.Random(7)  # один и тот же шум — звук всегда одинаковый
+    samples, low = [], 0.0
+    clicks = [(0.0, 0.9, 150.0), (0.07, 0.65, 120.0)]  # начало, громкость, как быстро стихает
+    for i in range(int(SAMPLE_RATE * 0.2)):
+        t = i / SAMPLE_RATE
+        low += 0.35 * (rng.uniform(-1.0, 1.0) - low)  # шум без резкого шипения
+        value = 0.0
+        for start, gain, decay in clicks:
+            if t >= start:
+                local = t - start
+                value += gain * math.exp(-local * decay) * (0.75 * low + 0.25 * math.sin(2 * math.pi * 1700 * local))
+        samples.append(0.55 * value)
+    return samples
+
+
+def _shot_fail_samples():
+    """Два низких коротких «бип» — снимок не получился (впереди не окно игры, окно свёрнуто, кадр чёрный)."""
+    samples = []
+    for i in range(int(SAMPLE_RATE * 0.3)):
+        t = i / SAMPLE_RATE
+        local = t if t < 0.12 else t - 0.16
+        value = 0.0
+        if t < 0.12 or 0.16 <= t < 0.28:
+            value = math.sin(2 * math.pi * 330 * local) * min(1.0, local / 0.005, (0.12 - local) / 0.02)
+        samples.append(0.25 * value)
+    return samples
+
+
 def generate_sounds():
-    """Создаёт WAV-файлы звуков во временной папке. Возвращает {"tick": путь, "win": путь}."""
+    """Создаёт WAV-файлы звуков во временной папке. Возвращает {"tick", "win", "shot", "shot_fail": путь}."""
     folder = os.path.join(tempfile.gettempdir(), "MySteamRandom")
     os.makedirs(folder, exist_ok=True)
-    paths = {"tick": os.path.join(folder, "tick.wav"), "win": os.path.join(folder, "win.wav")}
-    for name, make in (("tick", _tick_samples), ("win", _win_samples)):
+    makers = {"tick": _tick_samples, "win": _win_samples, "shot": _shutter_samples, "shot_fail": _shot_fail_samples}
+    paths = {name: os.path.join(folder, f"{name}.wav") for name in makers}
+    for name, make in makers.items():
         if not os.path.exists(paths[name]):
             _write_wav(paths[name], make())
     return paths

@@ -18,10 +18,11 @@ from urllib.parse import quote_plus
 
 LAUNCHED = time.monotonic()  # для замера запуска: отсюда начинается загрузка Qt и библиотек
 
-from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QEvent, QObject, QPoint, QPointF, QPropertyAnimation,
-                            QRect, QRectF, QSize, QSizeF, Qt, QTimer, QUrl, QVariantAnimation, Signal)
-from PySide6.QtGui import (QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QIcon, QImage, QKeySequence,
-                           QLinearGradient, QMovie, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
+from PySide6.QtCore import (QAbstractAnimation, QAbstractNativeEventFilter, QEasingCurve, QEvent, QObject, QPoint,
+                            QPointF, QPropertyAnimation, QRect, QRectF, QSize, QSizeF, Qt, QTimer, QUrl,
+                            QVariantAnimation, Signal)
+from PySide6.QtGui import (QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QIcon, QImage, QImageReader,
+                           QKeySequence, QLinearGradient, QMovie, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
                            QRadialGradient, QShortcut, QTextCharFormat, QTextCursor, QTextFormat, QTextListFormat)
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer, QSoundEffect
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
@@ -148,7 +149,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.5.0.1"
+__version__ = "2.5.5"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -4816,6 +4817,43 @@ def _on_art_step_failed(page, kind, message):
     notify("warning", page.win, "SteamGridDB не ответил", message.split(": ", 1)[-1], 6000)
 
 
+class ShotThumb(QLabel):
+    """Миниатюра снимка экрана в ленте записи. Файла нет (удалили из папки) — подпись вместо картинки."""
+
+    SIZE = QSize(160, 90)
+    clicked = Signal()
+
+    def __init__(self, path, parent):
+        super().__init__(parent)
+        self.path = path
+        self.setFixedSize(self.SIZE)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet("QLabel {background: rgba(128, 128, 128, 40); border-radius: 6px; color: gray}")
+        if path:
+            self.setText("…")
+            self.setCursor(Qt.PointingHandCursor)
+            self.setToolTip(f"{os.path.basename(path)} — открыть")
+        else:
+            self.setText("файла нет")
+            self.setToolTip("Снимок удалили из папки screenshots")
+
+    def load(self):
+        reader = QImageReader(self.path)
+        size = reader.size()
+        if size.isValid():
+            reader.setScaledSize(size.scaled(self.SIZE, Qt.KeepAspectRatio))  # читается сразу маленьким
+        image = reader.read()
+        if image.isNull():
+            self.setText("не открылся")
+            return
+        self.setPixmap(QPixmap.fromImage(image))
+
+    def mouseReleaseEvent(self, event):
+        if self.path and event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
 class NotesDialog(MessageBoxBase):
     """«Свои заметки» игры: общий текст об игре и записи по сессиям с датой — мысли после игры, наброски обзора
     или статьи. Слева — «Об игре» и записи, новые сверху; справа — редактор с простым оформлением.
@@ -4906,11 +4944,35 @@ class NotesDialog(MessageBoxBase):
             shortcut.activated.connect(handler)
         self.status = CaptionLabel("", self)
         self.status.setWordWrap(True)
+        # Снимки экрана записи — лентой под текстом. Щелчок — снимок в программе просмотра Windows
+        self.shots_title = CaptionLabel("", self)
+        self.shots_folder = TransparentPushButton("Папка снимков", self, FIF.FOLDER)
+        self.shots_folder.setToolTip("Все снимки этой игры — в папке screenshots рядом с программой")
+        self.shots_folder.clicked.connect(self.open_shots_folder)
+        shots_head = QHBoxLayout()
+        shots_head.addWidget(self.shots_title)
+        shots_head.addStretch(1)
+        shots_head.addWidget(self.shots_folder)
+        self.shots_strip = QWidget()
+        self.shots_strip.setStyleSheet("background: transparent")
+        self.shots_layout = QHBoxLayout(self.shots_strip)
+        self.shots_layout.setContentsMargins(0, 0, 0, 0)
+        self.shots_layout.setSpacing(8)
+        self.shots_layout.addStretch(1)
+        self.shots_scroll = ScrollArea(self)
+        self.shots_scroll.setWidget(self.shots_strip)
+        self.shots_scroll.setWidgetResizable(True)
+        self.shots_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.shots_scroll.setFixedHeight(ShotThumb.SIZE.height() + 18)  # и место под полосу прокрутки
+        self.shots_scroll.setStyleSheet("QScrollArea {background: transparent; border: none}")
+        self._shot_queue = []
         right = QVBoxLayout()
         right.setSpacing(8)
         right.addWidget(self.entry_title)
         right.addLayout(tools)
         right.addWidget(self.editor, 1)
+        right.addLayout(shots_head)
+        right.addWidget(self.shots_scroll)
         right.addWidget(self.status)
 
         row = QHBoxLayout()
@@ -4947,7 +5009,10 @@ class NotesDialog(MessageBoxBase):
     def _entry_text(self, entry):
         if entry is None:
             return "Об игре\n" + (self._preview(self.note["text"]) or "пока пусто")
-        return f"{core.russian_date(entry['date'])}\n{self._preview(entry['text']) or 'пустая запись'}"
+        preview = self._preview(entry["text"])
+        if not preview and entry.get("images"):
+            preview = f"снимков: {len(entry['images'])}"
+        return f"{core.russian_date(entry['date'])}\n{preview or 'пустая запись'}"
 
     def _fill_list(self, select=None):
         """Список заново; открыть в редакторе select (None — «Об игре»)."""
@@ -4987,6 +5052,61 @@ class NotesDialog(MessageBoxBase):
             self.editor.setPlaceholderText("Что было в этой сессии: где остановились, что запомнилось, мысли…")
         self.delete_button.setEnabled(entry is not None)
         self._reset_delete()
+        self._show_shots(entry)
+
+    # --- Снимки записи ---
+    def _show_shots(self, entry):
+        while self.shots_layout.count() > 1:  # последней стоит растяжка
+            widget = self.shots_layout.takeAt(0).widget()
+            if widget:
+                widget.deleteLater()
+        images = (entry or {}).get("images") or []
+        for widget in (self.shots_title, self.shots_folder, self.shots_scroll):
+            widget.setVisible(bool(images))
+        self._shot_queue = []
+        if not images:
+            return
+        self.shots_title.setText(f"Снимки экрана: {len(images)}")
+        for image in images:
+            path = core.screenshot_file(image)
+            thumb = ShotThumb(path if path and os.path.exists(path) else None, self.shots_strip)
+            if thumb.path:
+                thumb.clicked.connect(lambda p=thumb.path: QDesktopServices.openUrl(QUrl.fromLocalFile(p)))
+                self._shot_queue.append(thumb)
+            self.shots_layout.insertWidget(self.shots_layout.count() - 1, thumb)
+        QTimer.singleShot(0, self._load_next_shot)
+
+    def _load_next_shot(self):
+        """Миниатюры — по одной за проход: два десятка снимков 4K не подвешивают окно."""
+        if not self._shot_queue:
+            return
+        thumb = self._shot_queue.pop(0)
+        try:
+            thumb.load()
+        except RuntimeError:  # запись уже сменили — миниатюра удалена
+            pass
+        QTimer.singleShot(0, self._load_next_shot)
+
+    def open_shots_folder(self):
+        folder = core.screenshot_folder(self.game)
+        if os.path.isdir(folder):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        else:
+            self._set_status("Папки со снимками этой игры ещё нет.", warning=True)
+
+    def add_screenshot(self, session_id, image):
+        """Снимок, сделанный, пока окно открыто, — сразу в заметку окна: иначе окно, сохраняясь, затёрло бы его."""
+        self._store()
+        session_id = core.attach_screenshot(self.note, session_id, image)
+        self.dirty = True
+        entry = next(s for s in self.note["sessions"] if s["id"] == session_id)
+        if entry is self.current:
+            self._show_shots(entry)
+            self._refresh_row()
+        else:
+            self._fill_list(select=self.current)
+        self.save()
+        return session_id
 
     def _store(self):
         """Текст из редактора — в заметку (в «Об игре» или в открытую запись)."""
@@ -5011,8 +5131,8 @@ class NotesDialog(MessageBoxBase):
         if entry is None:
             return
         self._store()
-        if entry["text"].strip() and not self._delete_armed:
-            # Запись с текстом удаляется вторым нажатием — случайно не потерять. Кнопка на это время красная
+        if (entry["text"].strip() or entry.get("images")) and not self._delete_armed:
+            # Запись с текстом или снимками удаляется вторым нажатием — случайно не потерять. Кнопка на это время красная
             self._delete_armed = True
             self.delete_button.setText("Точно удалить?")
             self.delete_button.setIcon(FIF.DELETE.icon(color=QColor("white")))
@@ -5024,7 +5144,10 @@ class NotesDialog(MessageBoxBase):
         self._opened = False  # в редакторе ещё текст удалённой записи — обратно его не забираем
         self.dirty = True
         self._fill_list()
-        self.save()
+        if self.save() and entry.get("images"):
+            # Сами файлы программа не удаляет: снимок мог пригодиться и без записи
+            self._set_status(f"Запись удалена. Её снимки ({len(entry['images'])}) остались в папке screenshots "
+                             "рядом с программой.")
 
     def _reset_delete(self):
         self.delete_timer.stop()
@@ -5127,7 +5250,11 @@ def open_notes(win, game, button):
     """«Свои заметки» — окном поверх программы; после закрытия на кнопке видно, сколько в заметке записей."""
     dialog = NotesDialog(win, game)
     core.log.info("Открыты заметки «%s»", game["name"])
-    dialog.exec()
+    win.notes_dialog = dialog  # снимок экрана, сделанный сейчас, пойдёт прямо в это окно
+    try:
+        dialog.exec()
+    finally:
+        win.notes_dialog = None
     failed = dialog.save_failed
     dialog.deleteLater()
     if failed:
@@ -9692,6 +9819,57 @@ class SettingsPage(QWidget):
         update_hint.setWordWrap(True)
         self.win.updater.changed.connect(self.update_updates)
         self.update_updates()
+
+        # Снимки экрана в портах и дисковых играх: клавиша или сочетание — своё
+        settings_hotkey = core.screenshot_hotkey(settings)
+        self.shots_switch = SwitchButton(self)
+        self.shots_switch.setOnText("Вкл")
+        self.shots_switch.setOffText("Выкл")
+        self.shots_switch.setChecked(bool(settings.get("screenshots_enabled", True)))
+        self.shots_switch.checkedChanged.connect(self.set_screenshots_enabled)
+        shots_row = QHBoxLayout()
+        shots_row.addWidget(BodyLabel("Снимки по клавише", self))
+        shots_row.addSpacing(16)
+        shots_row.addWidget(self.shots_switch)
+        shots_row.addStretch(1)
+        self.hotkey_button = HotkeyButton(settings_hotkey["text"], self)
+        self.hotkey_button.picked.connect(self.set_screenshot_hotkey)
+        self.hotkey_button.rejected.connect(lambda text: self._shots_status(text, warning=True))
+        hotkey_default = TransparentPushButton("По умолчанию", self, FIF.CANCEL)
+        hotkey_default.setToolTip(f"Вернуть {core.DEFAULT_SETTINGS['screenshot_hotkey']['text']}")
+        hotkey_default.clicked.connect(lambda: self.set_screenshot_hotkey(dict(core.DEFAULT_SETTINGS["screenshot_hotkey"])))
+        hotkey_row = QHBoxLayout()
+        hotkey_row.addWidget(BodyLabel("Клавиша снимка", self))
+        hotkey_row.addSpacing(16)
+        hotkey_row.addWidget(self.hotkey_button)
+        hotkey_row.addWidget(hotkey_default)
+        hotkey_row.addStretch(1)
+        self.shot_sound_switch = SwitchButton(self)
+        self.shot_sound_switch.setOnText("Вкл")
+        self.shot_sound_switch.setOffText("Выкл")
+        self.shot_sound_switch.setChecked(bool(settings.get("screenshot_sound", True)))
+        self.shot_sound_switch.checkedChanged.connect(lambda on: core.save_settings(screenshot_sound=on))
+        listen = TransparentPushButton("Послушать", self, FIF.VOLUME)
+        listen.clicked.connect(self._play_shutter)
+        shot_sound_row = QHBoxLayout()
+        shot_sound_row.addWidget(BodyLabel("Щелчок затвора", self))
+        shot_sound_row.addSpacing(16)
+        shot_sound_row.addWidget(self.shot_sound_switch)
+        shot_sound_row.addWidget(listen)
+        shot_sound_row.addStretch(1)
+        shots_hint = CaptionLabel(
+            "Работает, пока идёт порт или дисковая игра, запущенная из программы: снимается окно игры (без рамки), "
+            "если оно сейчас впереди. Снимок — PNG в папке screenshots рядом с программой и в запись этой сессии "
+            "в «Своих заметках». Поверх игры ничего не появляется — только щелчок затвора; не получилось — два "
+            "низких «бип». Клавиша нужна программе только на время игры: потом она снова свободна. Чёрные снимки — "
+            "у игр в исключительном полноэкранном режиме: включите в игре оконный или «безрамочный».", self)
+        shots_hint.setWordWrap(True)
+        self.shots_status = CaptionLabel("", self)
+        self.shots_status.setWordWrap(True)
+        self.shots_status.hide()
+        shots_folder = PushButton("Открыть папку снимков", self, FIF.FOLDER)
+        shots_folder.clicked.connect(self.open_screenshots_folder)
+
         # Настроек много — кладём их в прокручиваемую область
         content = QWidget()
         scroll = ScrollArea(self)
@@ -9718,6 +9896,11 @@ class SettingsPage(QWidget):
         sound_section = SettingsSection(FIF.MUSIC, "Звук", content)
         sound_section.add(sound)
         sound_section.add(self.credit_label)
+        shots_section = SettingsSection(fluent_icon("CAMERA", FIF.PHOTO), "Снимки экрана в портах и дисковых играх",
+                                        content)
+        for item in (shots_row, hotkey_row, shot_sound_row, shots_hint, self.shots_status):
+            shots_section.add(item)
+        shots_section.add(shots_folder, 0, Qt.AlignLeft)
         look = SettingsSection(fluent_icon("PALETTE", FIF.PHOTO), "Оформление", content)
         for item in (appearance, selection_row, selection_hint):
             look.add(item)
@@ -9729,9 +9912,47 @@ class SettingsPage(QWidget):
         browser.add(links_hint)
         browser.add(store_logout, 0, Qt.AlignLeft)
         browser.add(store_hint)
-        for section in (update, keys_section, sound_section, look, translate, browser):
+        for section in (update, keys_section, sound_section, shots_section, look, translate, browser):
             layout.addWidget(section)
         layout.addStretch(1)
+
+    # --- Снимки экрана ---
+    def _shots_status(self, text, warning=False):
+        self.shots_status.setText(text)
+        self.shots_status.setTextColor(*(WARNING_TEXT if warning else (QColor(0, 0, 0, 160),
+                                                                        QColor(255, 255, 255, 170))))
+        self.shots_status.setVisible(bool(text))
+
+    def set_screenshots_enabled(self, on):
+        core.save_settings(screenshots_enabled=on)
+        core.log.info("Снимки экрана по клавише: %s", "включены" if on else "выключены")
+        self.win.play_tracker.shots.sync()
+
+    def set_screenshot_hotkey(self, hotkey):
+        problem = core.hotkey_problem(hotkey["vk"], hotkey["mods"])
+        if problem:
+            self._shots_status(f"{hotkey['text']}: {problem}.", warning=True)
+            return
+        if not self.win.play_tracker.shots.check_free(hotkey["vk"], hotkey["mods"]):
+            self._shots_status(f"{hotkey['text']} уже забрала другая программа — выберите другое сочетание.",
+                               warning=True)
+            return
+        core.save_settings(screenshot_hotkey=hotkey)
+        self.hotkey_button.setText(hotkey["text"])
+        core.log.info("Клавиша снимка: %s", hotkey["text"])
+        self._shots_status(f"Снимок — {hotkey['text']}.")
+        self.win.play_tracker.shots.sync()  # игра уже идёт — новое сочетание сразу
+
+    def _play_shutter(self):
+        shots = self.win.play_tracker.shots
+        if not core.load_settings().get("screenshot_sound", True):
+            self._shots_status("Щелчок затвора выключен — включите его, чтобы послушать.")
+            return
+        shots.play("shot")
+
+    def open_screenshots_folder(self):
+        os.makedirs(core.SCREENSHOTS_DIR, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(core.SCREENSHOTS_DIR))
 
     def forget_store_login(self):
         if not confirm(self.win, "Выйти из магазина Steam?",
@@ -11841,6 +12062,266 @@ class PortPage(QWidget):
         QTimer.singleShot(0, lambda: self.header.fit_width(self.scroll.viewport().width()))
 
 
+class HotkeyButton(PushButton):
+    """Кнопка выбора клавиши снимка: нажали — «Нажмите клавишу…», следующая клавиша или сочетание с Ctrl, Alt,
+    Shift и есть выбор. Esc — отмена. Код клавиши берётся у Windows (nativeVirtualKey) — его и регистрируем."""
+
+    picked = Signal(dict)  # {"vk", "mods", "text"}
+    rejected = Signal(str)
+    MODIFIER_KEYS = (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta, Qt.Key_AltGr)
+
+    def __init__(self, text="", parent=None):
+        # Кнопки библиотеки, созданные с текстом и значком, заново зовут __init__ только с parent — поэтому
+        # создаём кнопку с одним parent, а текст и значок ставим потом
+        super().__init__(parent=parent)
+        self.capturing = False
+        self.swallow_release = False
+        self.shown = text
+        self.setText(text)
+        self.setIcon(fluent_icon("KEYBOARD", FIF.EDIT))
+        self.setToolTip("Нажмите и затем — клавишу или сочетание для снимка")
+        self.setMinimumWidth(200)
+        self.clicked.connect(self.start)
+
+    def setText(self, text):
+        if not getattr(self, "capturing", False):
+            self.shown = text
+        super().setText(text)
+
+    def start(self):
+        self.capturing = True
+        super().setText("Нажмите клавишу… (Esc — отмена)")
+        self.setFocus()
+        self.grabKeyboard()
+
+    def stop(self):
+        if self.capturing:
+            self.capturing = False
+            self.releaseKeyboard()
+            super().setText(self.shown)
+
+    def focusOutEvent(self, event):
+        self.stop()
+        super().focusOutEvent(event)
+
+    def keyPressEvent(self, event):
+        if not self.capturing:
+            return super().keyPressEvent(event)
+        if event.key() in self.MODIFIER_KEYS or event.key() == Qt.Key_Print:
+            return  # ждём основную клавишу; Print Screen Windows присылает только при отпускании
+        if event.key() == Qt.Key_Escape and not event.modifiers():
+            self.stop()
+            return
+        self._pick(event)
+
+    def keyReleaseEvent(self, event):
+        if self.capturing and event.key() == Qt.Key_Print:
+            self._pick(event)
+            return
+        if self.swallow_release:  # отпустили выбранную клавишу (пробел, Enter) — это не новое нажатие кнопки
+            self.swallow_release = False
+            return
+        super().keyReleaseEvent(event)
+
+    def _pick(self, event):
+        self.stop()
+        self.swallow_release = event.type() == QEvent.KeyPress
+        modifiers = event.modifiers()
+        if modifiers & Qt.MetaModifier:
+            self.rejected.emit("Сочетания с клавишей Win заняты самой Windows — возьмите Ctrl, Alt или Shift.")
+            return
+        mods, names = 0, []
+        for flag, mod, name in ((Qt.ControlModifier, core.MOD_CONTROL, "Ctrl"), (Qt.AltModifier, core.MOD_ALT, "Alt"),
+                                (Qt.ShiftModifier, core.MOD_SHIFT, "Shift")):
+            if modifiers & flag:
+                mods |= mod
+                names.append(name)
+        vk = int(event.nativeVirtualKey())
+        if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:
+            name = chr(vk)  # цифры и латинские буквы — по самой клавише, а не по знаку с Shift или раскладкой
+        else:
+            name = (core.HOTKEY_NAMES.get(vk) or QKeySequence(event.key()).toString(QKeySequence.NativeText)
+                    or f"код {vk}")
+        self.picked.emit({"vk": vk, "mods": mods, "text": "+".join(names + [name])})
+
+
+class HotkeyFilter(QAbstractNativeEventFilter):
+    """Ловит сообщение Windows «нажата клавиша снимка» (WM_HOTKEY) — и только его, остальные идут дальше как были."""
+
+    WM_HOTKEY = 0x0312
+
+    def __init__(self, hotkey_id, callback):
+        super().__init__()
+        self.hotkey_id, self.callback = hotkey_id, callback
+        self.warned = False
+
+    def nativeEventFilter(self, event_type, message):
+        try:
+            kind = event_type.data() if hasattr(event_type, "data") else event_type
+            if kind in (b"windows_generic_MSG", "windows_generic_MSG"):
+                from ctypes import wintypes
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == self.WM_HOTKEY and msg.wParam == self.hotkey_id:
+                    QTimer.singleShot(0, self.callback)  # снимаем после — не внутри обработки сообщения Windows
+                    return True, 0
+        except Exception as e:  # повторилась бы на каждом сообщении Windows — в журнал только один раз
+            if not self.warned:
+                self.warned = True
+                core.log.warning("Клавиша снимка: сообщение Windows не разобралось: %s", e)
+        return False, 0
+
+
+class Screenshots(QObject):
+    """Снимки экрана в портах и дисковых играх. Клавиша зарегистрирована, только пока идёт игра, запущенная из
+    программы (PlayTracker), и снимается только окно этой игры — если оно впереди. Снимок — PNG в папку
+    screenshots/<игра> и в запись сессии в «Своих заметках» (одна запись на запуск игры). Поверх игры ничего
+    не показывается: снимок получился — щелчок затвора, не получился — два низких «бип»."""
+
+    HOTKEY_ID = 0x5B01
+
+    def __init__(self, window, tracker):
+        super().__init__(window)
+        self.win, self.tracker = window, tracker
+        self.registered = None  # (vk, mods) — какое сочетание сейчас за программой
+        self.hwnd = None
+        self.failed = ""  # сочетание, которое Windows не дала (занято другой программой)
+        self.filter = None
+        self.saving = 0
+        self.effects = {}
+
+    # --- Клавиша ---
+    def sync(self):
+        """Клавиша — за программой, только если снимки включены и идёт хотя бы одна игра."""
+        settings = core.load_settings()
+        hotkey = core.screenshot_hotkey(settings)
+        want = (sys.platform == "win32" and bool(settings.get("screenshots_enabled", True))
+                and bool(self.tracker.sessions))
+        key = (hotkey["vk"], hotkey["mods"]) if want else None
+        if key == self.registered and (key or not self.failed):
+            return
+        self._unregister()
+        self.failed = ""
+        if key:
+            self._register(key, hotkey["text"])
+
+    def _register(self, key, text):
+        if self.filter is None:
+            self.filter = HotkeyFilter(self.HOTKEY_ID, self.take)
+            QApplication.instance().installNativeEventFilter(self.filter)
+        self.hwnd = int(self.win.winId())
+        if core.register_hotkey(self.hwnd, self.HOTKEY_ID, key[0], key[1]):
+            self.registered = key
+            for name in ("shot", "shot_fail"):  # звуки — заранее: первый щелчок прозвучит сразу
+                self._effect(name)
+            core.log.info("Снимки экрана: клавиша %s — за программой, пока идёт игра", text)
+            return
+        self.failed = text
+        core.log.warning("Снимки экрана: %s занято другой программой", text)
+        notify("warning", self.win, "Клавиша снимка занята",
+               f"{text} уже забрала другая программа — снимков в этой игре не будет. Выберите другое сочетание: "
+               "«Настройки» → «Снимки экрана».", 8000)
+
+    def _unregister(self):
+        if self.registered:
+            core.unregister_hotkey(self.hwnd, self.HOTKEY_ID)
+            core.log.info("Снимки экрана: клавиша отпущена — игр не идёт")
+        self.registered = None
+
+    def check_free(self, vk, mods):
+        """Свободно ли сочетание (для настроек): занимаем его на миг и сразу отпускаем. Своё — свободно."""
+        if self.registered == (vk, mods):
+            return True
+        hwnd = int(self.win.winId())
+        if not core.register_hotkey(hwnd, self.HOTKEY_ID + 1, vk, mods):
+            return False
+        core.unregister_hotkey(hwnd, self.HOTKEY_ID + 1)
+        return True
+
+    # --- Снимок ---
+    def _effect(self, name):
+        effect = self.effects.get(name)
+        if effect is None:
+            path = core.generate_sounds().get(name)
+            if not path:
+                return None
+            effect = QSoundEffect(self)
+            effect.setSource(QUrl.fromLocalFile(path))
+            effect.setVolume(0.8)
+            self.effects[name] = effect
+        return effect
+
+    def play(self, name):
+        if not core.load_settings().get("screenshot_sound", True):
+            return
+        effect = self._effect(name)
+        if effect is not None:
+            effect.play()
+
+    def take(self):
+        hwnd, program = core.foreground_window()
+        session = next((s for s in self.tracker.sessions.values()
+                        if program and core.folder_running(s["port"]["folder"], [program])), None)
+        if session is None:
+            self.play("shot_fail")
+            core.log.info("Снимок не сделан: впереди не окно запущенной игры")
+            return
+        port = session["port"]
+        if self.saving >= core.SCREENSHOT_SAVING_MAX:
+            self.play("shot_fail")
+            core.log.info("Снимок «%s» не сделан: прошлые ещё записываются на диск", port["name"])
+            return
+        try:
+            width, height, data = core.capture_window(hwnd)
+            digest = core.frame_digest(data)
+            if digest == session.get("last_frame"):
+                # Ровно тот же кадр, что в прошлый раз, — экран отдал застывшую картинку (игра в исключительном
+                # полноэкранном режиме рисует мимо Windows). Пробуем снять само окно
+                width, height, data = core.capture_window(hwnd, window_first=True)
+                digest = core.frame_digest(data)
+                if digest == session.get("last_frame"):
+                    raise core.ScreenshotError(
+                        "кадр не обновился — снимок получился бы таким же, как прошлый. Так бывает у игр в "
+                        "исключительном полноэкранном режиме: Windows видит только старую картинку. Включите в "
+                        "настройках игры оконный режим (в старых играх на движке Quake 3 — консоль, r_fullscreen 0)")
+            path = core.new_screenshot_path(port)
+        except (core.ScreenshotError, OSError) as e:
+            self.play("shot_fail")
+            core.log.warning("Снимок «%s» не получился: %s", port["name"], e)
+            notify("warning", self.win, "Снимок не получился", f"«{port['name']}»: {e}.", 8000)
+            return
+        session["last_frame"] = digest
+        self.play("shot")
+        self.saving += 1
+        worker = Worker(core.save_screenshot, path, width, height, data, parent=self)
+        worker.finished.connect(lambda image: self._on_saved(session, port, image))
+        worker.failed.connect(lambda message: self._on_failed(port, message))
+        worker.start()
+
+    def _on_failed(self, port, message):
+        self.saving -= 1
+        core.log.warning("Снимок «%s» не записался: %s", port["name"], message)
+        notify("error", self.win, "Снимок не записался", f"«{port['name']}»: {message.split(': ', 1)[-1]}", 8000)
+
+    def _on_saved(self, session, port, image):
+        self.saving -= 1
+        dialog = getattr(self.win, "notes_dialog", None)
+        try:
+            if dialog is not None and dialog.game is port:
+                session["note_session"] = dialog.add_screenshot(session.get("note_session"), image)
+            else:
+                note = core.load_note(port)
+                session["note_session"] = core.attach_screenshot(note, session.get("note_session"), image)
+                core.save_note(port, note)
+        except OSError as e:
+            core.log.warning("Снимок «%s» сохранён, но в заметку не попал: %s", port["name"], e)
+            notify("warning", self.win, "Снимок не попал в заметку",
+                   f"Файл сохранён в папке screenshots, а заметка «{port['name']}» не записалась: {e}", 8000)
+            return
+        page = getattr(session.get("page"), "page", None)  # страница игры на вкладке портов или дисковых
+        if page is not None and getattr(page, "port", None) is port and hasattr(page, "notes_button"):
+            show_notes_count(page.notes_button, port)  # на открытой странице игры — новое число записей
+
+
 class PlayTracker(QObject):
     """Время в портах и дисковых играх: после запуска программа раз в несколько секунд смотрит, работает ли
     что-нибудь из папки игры. Так считается и игра, которую запустил её лаунчер (Call of Duty: Launcher.exe →
@@ -11861,6 +12342,7 @@ class PlayTracker(QObject):
         self.timer = QTimer(self)
         self.timer.setInterval(self.POLL_MS)
         self.timer.timeout.connect(self._poll)
+        self.shots = Screenshots(window, self)  # снимки экрана — пока идёт игра
 
     def playing(self, port):
         session = self.sessions.get(port["id"])
@@ -11874,6 +12356,7 @@ class PlayTracker(QObject):
                                      "last_seen": now, "seen": False}
         if not self.timer.isActive():
             self.timer.start()
+        self.shots.sync()
         QTimer.singleShot(2000, self._poll)
 
     def _poll(self):
@@ -11907,6 +12390,7 @@ class PlayTracker(QObject):
                               "(возможно, её лаунчер запускает программу из другой папки)", session["port"]["name"])
         if not self.sessions:
             self.timer.stop()
+            self.shots.sync()  # игр не идёт — клавиша снимка снова свободна для других программ
         if changed:
             self.win.portsChanged.emit()
 
@@ -11940,6 +12424,7 @@ class PlayTracker(QObject):
                 self._finish(port_id, closing=True)
         self.sessions.clear()
         self.timer.stop()
+        self.shots.sync()
 
 
 class NativePortsPage(QWidget):
