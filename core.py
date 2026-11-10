@@ -129,6 +129,11 @@ DEFAULT_SETTINGS = {
     "screenshots_enabled": True,
     "screenshot_hotkey": {"vk": 0x7B, "mods": 2, "text": "Ctrl+F12"},
     "screenshot_sound": True,  # свой щелчок затвора — поверх игры программа ничего не показывает
+    # Коллекционные карточки (тест): показывать ли весь набор игры, вместе с недостающими (неофициальный способ)
+    "cards_show_missing": True,
+    "badges_sort": 0,  # витрина значков: 0 — новые первыми, 1 — старые, 2 — А→Я, 3 — Я→А
+    # Иллюстрации карточек — со страницы значка во встроенном браузере, где вы вошли в Steam: "yes" — разрешили
+    "cards_artwork_login": "",
 }
 
 
@@ -2120,6 +2125,9 @@ def fetch_game_details(appid):
         "translated": False,
         "metacritic_url": (d.get("metacritic") or {}).get("url"),
         "achievements_total": (d.get("achievements") or {}).get("total", 0),
+        # Есть ли у игры коллекционные карточки — отметка магазина (категория 29). У старых карточек в кэше
+        # ключа нет — тогда «не знаем», и кнопка «Карточки» видна
+        "trading_cards": any(c.get("id") == 29 for c in d.get("categories") or [] if isinstance(c, dict)),
         "genres": [g["description"] for g in d.get("genres") or [] if g.get("description")],
         "developers": d.get("developers") or [],
         "release_date": release.get("date", ""),
@@ -5125,9 +5133,25 @@ def _is_black(data):
     return max(data[::997], default=0) < 12
 
 
-def frame_digest(data):
-    """Отпечаток кадра — чтобы заметить, что снимок тот же, что и прошлый (кадр «застыл»)."""
-    return hashlib.blake2b(data, digest_size=16).digest()
+FRAME_GRID = (64, 36)  # по скольким точкам сравниваются кадры
+FRAME_ALIKE = 3.0  # средняя разница яркости (из 255), меньше которой кадры — один и тот же
+
+
+def frame_sample(width, height, data):
+    """Кадр в миниатюре — яркость в сетке 64×36 точек. По ней видно, что снимок тот же, что и прошлый (кадр
+    «застыл»), даже если два способа съёмки отдали эту картинку чуть по-разному."""
+    columns, rows = FRAME_GRID
+    sample = bytearray()
+    for row in range(rows):
+        line = (row * height // rows + height // rows // 2) * width
+        for column in range(columns):
+            offset = (line + column * width // columns + width // columns // 2) * 4
+            sample.append(data[offset + 1])  # зелёный — ближе всего к яркости
+    return bytes(sample)
+
+
+def frames_alike(first, second):
+    return len(first) == len(second) and sum(abs(a - b) for a, b in zip(first, second)) / len(first) < FRAME_ALIKE
 
 
 def capture_window(hwnd, window_first=False):
@@ -5169,6 +5193,580 @@ def capture_window(hwnd, window_first=False):
         return width, height, data
     finally:
         user32.ReleaseDC(None, screen)
+
+
+# --- Коллекционные карточки Steam (тестовая версия) -------------------------------
+# Только чтение и без входа. Свои карточки — из открытого инвентаря Steam (нужен только SteamID, инвентарь
+# в настройках приватности должен быть открытым). Весь набор игры, вместе с теми, которых ещё нет, — из поиска
+# торговой площадки Steam: официального способа узнать набор у Steam нет, этот может перестать работать.
+# Программа ничего не продаёт и не обменивает. Steam пускает в инвентарь всего несколько раз в минуту —
+# поэтому ответ хранится в кэше, а заново — по кнопке «Обновить» или через CARDS_TTL.
+STEAM_INVENTORY_URL = "https://steamcommunity.com/inventory/{steam_id}/753/6"
+STEAM_MARKET_SEARCH_URL = "https://steamcommunity.com/market/search/render/"
+STEAM_ECONOMY_IMAGE = "https://community.cloudflare.steamstatic.com/economy/image/"
+STEAM_BADGE_URL = "https://steamcommunity.com/profiles/{steam_id}/gamecards/{appid}/"
+CARDS_FILE = os.path.join(CACHE_DIR, "cards_inventory.json")
+CARD_SETS_FILE = os.path.join(CACHE_DIR, "card_sets.json")
+CARD_IMAGES_DIR = os.path.join(CACHE_DIR, "cards")
+CARDS_TTL = 15 * 60
+CARD_SETS_TTL = 30 * 24 * 3600  # набор карточек у игры почти не меняется
+CARDS_MAX_PAGES = 10  # по 2000 предметов — больше чем достаточно
+CARD_IMAGE_MAX = 5 * 1024 * 1024
+_ICON_RE = re.compile(r"[A-Za-z0-9_\-]{20,2000}")
+
+
+class CardsUnavailable(Exception):
+    """Карточки не получить. Текст — для пользователя."""
+
+
+def _read_cache(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def card_image_url(icon, size=""):
+    """Адрес картинки карточки на сервере Steam; size — «200fx200f» и т. п. (пусто — полный размер)."""
+    if not isinstance(icon, str) or not _ICON_RE.fullmatch(icon):
+        return None
+    return STEAM_ECONOMY_IMAGE + icon + (f"/{size}" if size else "")
+
+
+def _card_from_description(item):
+    """Описание предмета инвентаря → карточка, или None: фон профиля, смайлик и прочее — не карточки."""
+    tags = {t.get("category"): t for t in item.get("tags") or [] if isinstance(t, dict)}
+    if (tags.get("item_class") or {}).get("internal_name") != "item_class_2":
+        return None
+    game = tags.get("Game") or {}
+    match = re.fullmatch(r"app_(\d+)", game.get("internal_name") or "")
+    if not match:
+        return None
+    return {"key": str(item.get("market_hash_name") or item.get("name") or ""), "name": str(item.get("name") or ""),
+            "appid": int(match.group(1)), "game": str(game.get("localized_tag_name") or ""),
+            "foil": (tags.get("cardborder") or {}).get("internal_name") == "cardborder_1",
+            "icon": item.get("icon_url_large") or item.get("icon_url") or "",
+            "artwork": _artwork_link(item.get("actions"), int(match.group(1)))}
+
+
+def _artwork_link(actions, appid):
+    """Адрес иллюстрации карточки («View Full Size Artwork» в Steam) из её действий или "": только картинка
+    из папки этой игры на сервере картинок Steam."""
+    for action in actions if isinstance(actions, list) else []:
+        link = str((action or {}).get("link") or "") if isinstance(action, dict) else ""
+        if _is_artwork_url(link, appid):
+            return link
+    return ""
+
+
+def _is_artwork_url(url, appid):
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    return (parts.scheme == "https" and any(host == h or host.endswith("." + h) for h in _BADGE_IMAGE_HOSTS)
+            and bool(re.fullmatch(rf"/(?:steamcommunity/public|community_assets)/images/items/{int(appid)}/"
+                                  rf"[0-9A-Za-z_]+\.(?:jpg|jpeg|png)", parts.path)))
+
+
+def load_owned_cards(steam_id, force=False):
+    """Свои карточки: {"steam_id", "time", "games": {"appid": {"name", "cards": [{"key", "name", "foil", "icon",
+    "count"}]}}}. Из кэша, если он свежий. В фоновом потоке."""
+    if not re.fullmatch(r"\d{17}", steam_id or ""):
+        raise CardsUnavailable("программа не знает ваш SteamID — подключите Steam в «Настройках»")
+    cached = _read_cache(CARDS_FILE)
+    if (not force and cached.get("steam_id") == steam_id and isinstance(cached.get("games"), dict)
+            and time.time() - (cached.get("time") or 0) < CARDS_TTL):
+        return cached
+    amounts, descriptions, start = {}, {}, None
+    for page in range(CARDS_MAX_PAGES):
+        params = {"l": "russian", "count": 2000}
+        if start:
+            params["start_assetid"] = start
+        response = requests.get(STEAM_INVENTORY_URL.format(steam_id=steam_id), params=params,
+                                timeout=REQUEST_TIMEOUT)
+        if response.status_code in (401, 403):
+            raise CardsUnavailable("инвентарь Steam закрыт. Откройте его: профиль Steam → «Редактировать профиль» "
+                                   "→ «Приватность» → «Инвентарь: Открытый»")
+        if response.status_code == 429:
+            raise CardsUnavailable("Steam просит подождать: в инвентарь пускают всего несколько раз в минуту. "
+                                   "Попробуйте через пару минут")
+        response.raise_for_status()
+        data = response.json() or {}
+        if not data.get("success"):
+            raise CardsUnavailable("Steam не отдал инвентарь — попробуйте позже")
+        for asset in data.get("assets") or []:
+            key = (str(asset.get("classid")), str(asset.get("instanceid")))
+            amounts[key] = amounts.get(key, 0) + int(asset.get("amount") or 1)
+        for item in data.get("descriptions") or []:
+            descriptions[(str(item.get("classid")), str(item.get("instanceid")))] = item
+        if not data.get("more_items") or not data.get("last_assetid"):
+            break
+        start = data["last_assetid"]
+        time.sleep(1.5)  # бережём лимит Steam
+    games = {}
+    for key, count in amounts.items():
+        card = _card_from_description(descriptions.get(key) or {})
+        if not card:
+            continue
+        game = games.setdefault(str(card.pop("appid")), {"name": card["game"], "cards": {}})
+        card.pop("game")
+        same = game["cards"].get(card["key"])
+        if same:
+            same["count"] += count
+        else:
+            game["cards"][card["key"]] = dict(card, count=count)
+    result = {"steam_id": steam_id, "time": int(time.time()),
+              "games": {appid: {"name": g["name"], "cards": sorted(g["cards"].values(), key=lambda c: c["name"])}
+                        for appid, g in games.items()}}
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    save_json(CARDS_FILE, result)
+    log.info("Карточки Steam: %d шт. из %d игр (SteamID …%s)", sum(c["count"] for g in result["games"].values()
+                                                                  for c in g["cards"]), len(result["games"]),
+             steam_id[-4:])
+    return result
+
+
+def cached_card_count(appid, steam_id):
+    """Сколько карточек игры у вас — по кэшу, без сети (для подписи кнопки). None — ещё не загружали."""
+    cached = _read_cache(CARDS_FILE)
+    if cached.get("steam_id") != steam_id or not isinstance(cached.get("games"), dict):
+        return None
+    game = cached["games"].get(str(appid)) or {}
+    return sum(1 for c in game.get("cards") or [] if not c.get("foil"))
+
+
+def card_set(appid, force=False):
+    """Весь набор карточек игры: [{"key", "name", "foil", "icon"}]; пусто — у игры нет карточек. Неофициально —
+    через поиск торговой площадки Steam (только чтение, цены не берём). В фоновом потоке."""
+    appid = int(appid)
+    cache = _read_cache(CARD_SETS_FILE)
+    entry = cache.get(str(appid))
+    if not force and isinstance(entry, dict) and time.time() - (entry.get("time") or 0) < CARD_SETS_TTL:
+        return entry.get("cards") or []
+    cards, start = [], 0
+    while start < 300:
+        response = requests.get(STEAM_MARKET_SEARCH_URL, timeout=REQUEST_TIMEOUT, params={
+            "norender": 1, "appid": 753, "start": start, "count": 100, "sort_column": "name", "sort_dir": "asc",
+            "search_descriptions": 0, "l": "russian",
+            "category_753_Game[]": f"tag_app_{appid}", "category_753_item_class[]": "tag_item_class_2"})
+        if response.status_code == 429:
+            raise CardsUnavailable("торговая площадка Steam просит подождать — попробуйте через пару минут")
+        response.raise_for_status()
+        data = response.json() or {}
+        if not data.get("success"):
+            raise CardsUnavailable("торговая площадка Steam не ответила — набор не узнать, видны только ваши "
+                                   "карточки")
+        results = data.get("results") or []
+        for result in results:
+            asset = result.get("asset_description") or {}
+            key = str(result.get("hash_name") or asset.get("market_hash_name") or "")
+            if not key.startswith(f"{appid}-"):
+                continue  # чужая игра в выдаче
+            cards.append({"key": key, "name": str(asset.get("name") or result.get("name") or ""),
+                          "foil": "(Foil)" in key or "Foil" in str(asset.get("type") or ""),
+                          "icon": asset.get("icon_url_large") or asset.get("icon_url") or ""})
+        start += len(results)
+        if not results or start >= int(data.get("total_count") or 0):
+            break
+        time.sleep(1.0)
+    cards.sort(key=lambda c: (c["foil"], c["name"]))
+    cache[str(appid)] = {"time": int(time.time()), "cards": cards}
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    save_json(CARD_SETS_FILE, cache)
+    log.info("Набор карточек игры %s: %d (с площадки Steam)", appid, len(cards))
+    return cards
+
+
+# Значки игр. Какие есть — официальный Steam Web API (IPlayerService/GetBadges, тот же ключ, что у достижений):
+# игра, уровень, металлический ли, когда создан. Картинки значка в API нет — её адрес берётся с открытой страницы
+# значка в сообществе Steam (неофициально), а сама картинка — только с сервера картинок Steam.
+STEAM_BADGES_API_URL = "https://api.steampowered.com/IPlayerService/GetBadges/v1/"
+BADGES_FILE = os.path.join(CACHE_DIR, "badges.json")
+BADGE_IMAGES_FILE = os.path.join(CACHE_DIR, "badge_images.json")
+BADGE_IMAGES_DIR = os.path.join(CACHE_DIR, "badges")
+BADGES_TTL = 15 * 60
+BADGE_NONE_TTL = 7 * 24 * 3600  # значок без своей страницы — проверяем снова не раньше чем через неделю
+BADGE_PAGE_TIMEOUT = 30  # страница значка большая (~330 КБ), а Steam под нагрузкой отвечает медленно
+STEAM_OWNED_GAMES_URL = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/"
+# Запасной список: значки не за игры (распродажи, премии Steam, магазин очков, профиль) — на случай, когда
+# Steam не отдал список ваших игр (например, в приватности закрыты «Сведения об играх»)
+NON_GAME_BADGE_APPIDS = {4228010, 3812610, 3412320, 3027110, 2460510, 2243810, 2243720, 2055870, 1797760,
+                         1658760, 582280}
+
+
+def owned_game_names(api_key, steam_id):
+    """Все ваши игры, вместе со скрытыми и бесплатными, в которые вы играли: {appid: название}. None — Steam
+    не отдал список (закрыты «Сведения об играх» или нет ответа). В фоновом потоке."""
+    try:
+        response = requests.get(STEAM_OWNED_GAMES_URL, timeout=REQUEST_TIMEOUT, params={
+            "key": api_key, "steamid": steam_id, "include_appinfo": 1, "include_played_free_games": 1,
+            "include_free_sub": 1, "skip_unvetted_apps": 0, "format": "json"})
+        response.raise_for_status()
+        games = (response.json() or {}).get("response", {}).get("games")
+    except (requests.RequestException, ValueError) as e:
+        log.info("Список ваших игр для значков не получен: %s", type(e).__name__)
+        return None
+    if not games:
+        return None
+    return {int(g["appid"]): str(g.get("name") or "").strip() or f"Игра {g['appid']}"
+            for g in games if isinstance(g, dict) and g.get("appid")}
+
+
+BADGES_VERSION = 2  # 2: значки игр семейной библиотеки — тоже на витрине; старый кэш перечитывается
+BADGE_APPS_FILE = os.path.join(CACHE_DIR, "badge_apps.json")  # appid значка → название игры ("" — не игра)
+BADGE_APPS_RECHECK = 30 * 24 * 3600  # «не игра» проверяем снова не раньше чем через месяц
+BADGE_APPS_LIMIT = 40  # сколько незнакомых appid спрашиваем у магазина за одну загрузку значков
+
+
+def _listed_steam_games():
+    """Игры Steam из списка программы (games.json — туда импорт кладёт и семейные): {appid: название}.
+    Только чтение файла, без сети."""
+    try:
+        with open(GAMES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {int(g["appid"]): str(g.get("name") or "").strip() for g in data if isinstance(g, dict)
+            and isinstance(g.get("appid"), int) and g["appid"] > 0 and g.get("name")} if isinstance(data, list) else {}
+
+
+def _store_game_name(appid):
+    """Название игры из магазина Steam (только чтение, кратко) или "" — это не игра или магазин её не знает."""
+    data = fetch(STEAM_APP_DETAILS_URL, params={"appids": appid, "filters": "basic", "l": "russian"}).json()
+    info = (data or {}).get(str(appid)) or {}
+    details = info.get("data") or {} if info.get("success") else {}
+    if not isinstance(details, dict) or details.get("type") not in ("game", "dlc"):
+        return ""
+    return str(details.get("name") or "").strip()
+
+
+def _badge_app_names(appids):
+    """Названия игр для appid значков, которых нет ни среди ваших покупок, ни в списке программы: из магазина
+    Steam (только чтение страницы игры), запоминаются в cache/badge_apps.json. {appid: название или ""}.
+    Магазин не ответил — этот appid в ответе пропущен, спросим в следующий раз. В фоновом потоке."""
+    if not appids:
+        return {}
+    known = _read_cache(BADGE_APPS_FILE)
+    now, result, asked = time.time(), {}, 0
+    for appid in appids:
+        entry = known.get(str(appid))
+        if isinstance(entry, dict) and (entry.get("name") or now - (entry.get("time") or 0) < BADGE_APPS_RECHECK):
+            result[appid] = entry.get("name") or ""
+            continue
+        if asked >= BADGE_APPS_LIMIT:
+            continue
+        if asked:
+            time.sleep(0.4)  # бережём лимит магазина
+        asked += 1
+        try:
+            name = _store_game_name(appid)
+        except (requests.RequestException, ValueError) as e:
+            log.info("Магазин Steam не ответил про игру значка %s: %s", appid, type(e).__name__)
+            continue
+        known[str(appid)] = {"name": name, "time": int(now)}
+        result[appid] = name
+    if asked:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        save_json(BADGE_APPS_FILE, known)
+    return result
+
+
+_BADGE_IMAGE_HOSTS = ("steamstatic.com", "akamaihd.net", "steamcdn-a.akamaihd.net")
+
+
+def load_badges(api_key, steam_id, force=False):
+    """Значки игр: {"steam_id", "time", "level" (уровень Steam), "games": {"appid": {"level", "foil", "xp",
+    "completed"}}}. Металлический значок — отдельной строкой у той же игры ("foil": уровень, обычно 1).
+    В фоновом потоке."""
+    if not re.fullmatch(r"\d{17}", steam_id or ""):
+        raise CardsUnavailable("программа не знает ваш SteamID — подключите Steam в «Настройках»")
+    if not api_key:
+        raise CardsUnavailable("для значков нужен ключ Steam Web API — его можно указать в «Настройках»")
+    cached = _read_cache(BADGES_FILE)
+    if (not force and cached.get("steam_id") == steam_id and isinstance(cached.get("games"), dict)
+            and cached.get("version") == BADGES_VERSION and time.time() - (cached.get("time") or 0) < BADGES_TTL):
+        return cached
+    response = requests.get(STEAM_BADGES_API_URL, params={"key": api_key, "steamid": steam_id},
+                            timeout=REQUEST_TIMEOUT)
+    if response.status_code in (401, 403):
+        raise CardsUnavailable("Steam не принял ключ Web API — проверьте его в «Настройках»")
+    response.raise_for_status()
+    data = (response.json() or {}).get("response") or {}
+    if "badges" not in data:
+        raise CardsUnavailable("Steam не отдал значки — откройте в настройках приватности «Профиль: Открытый»")
+    games = {}
+    for badge in data.get("badges") or []:
+        appid = badge.get("appid")
+        if not isinstance(appid, int) or appid <= 0:
+            continue  # значки сообщества (за годы в Steam, распродажи) — не у игр
+        game = games.setdefault(str(appid), {"level": 0, "foil": 0, "xp": 0, "completed": 0})
+        level = int(badge.get("level") or 0)
+        if badge.get("border_color") == 1:
+            game["foil"] = max(game["foil"], level)
+        else:
+            game["level"] = max(game["level"], level)
+        game["xp"] += int(badge.get("xp") or 0)
+        game["completed"] = max(game["completed"], int(badge.get("completion_time") or 0))
+    # Значки распродаж, премий Steam, магазина очков и профиля тоже приходят «с appid», но игры за ними нет.
+    # Значок игры оставляем, если игра ваша (GetOwnedGames, со скрытыми — оттуда и названия), есть в списке
+    # игр программы (туда импорт кладёт и семейные) или магазин Steam знает её как игру — так остаются значки
+    # игр из семейной библиотеки: GetOwnedGames их не отдаёт
+    owned = owned_game_names(api_key, steam_id) or {}
+    listed = _listed_steam_games()
+    other = {}
+    for appid in list(games):
+        number = int(appid)
+        if number in owned:
+            games[appid]["name"] = owned[number]
+        elif number in NON_GAME_BADGE_APPIDS:
+            other[appid] = games.pop(appid)
+        elif number in listed:
+            games[appid].update(name=listed[number], family=True)
+    unknown = [a for a in games if "name" not in games[a]]
+    names = _badge_app_names([int(a) for a in unknown])
+    for appid in unknown:
+        if names.get(int(appid)):
+            games[appid].update(name=names[int(appid)], family=True)
+        else:
+            other[appid] = games.pop(appid)  # не игра или магазин не ответил — на витрину не ставим
+    family = sum(1 for g in games.values() if g.get("family"))
+    if family or other:
+        log.info("Значки: не из ваших покупок, но игры (семейная библиотека) — %d; не игры или не узнать — "
+                 "%d (%s)", family, len(other), ", ".join(sorted(other, key=int)) or "—")
+    result = {"version": BADGES_VERSION, "steam_id": steam_id, "time": int(time.time()),
+              "level": int(data.get("player_level") or 0), "games": games, "other": other}
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    save_json(BADGES_FILE, result)
+    log.info("Значки Steam: игр со значками %d, уровень Steam %d (SteamID …%s)", len(games), result["level"],
+             steam_id[-4:])
+    return result
+
+
+def cached_badge(appid, steam_id):
+    """Значок игры по кэшу, без сети: {"level", "foil", …} или None."""
+    cached = _read_cache(BADGES_FILE)
+    if cached.get("steam_id") != steam_id or not isinstance(cached.get("games"), dict):
+        return None
+    return game_badge(cached, appid)
+
+
+def game_badge(data, appid):
+    """Значок открытой игры из ответа load_badges — и с витрины, и из отложенных ("other")."""
+    other = data.get("other") if isinstance(data.get("other"), dict) else {}
+    return data["games"].get(str(appid)) or other.get(str(appid))
+
+
+def badge_image(steam_id, appid, foil=False):
+    """Картинка своего значка игры: путь к файлу в cache/badges или None. В фоновом потоке."""
+    return badge_info(steam_id, appid, foil)["path"]
+
+
+def badge_info(steam_id, appid, foil=False):
+    """Свой значок игры: {"path" (картинка в cache/badges или None), "title" (название значка или "")}.
+    Адрес картинки и название — со страницы значка (неофициально), запоминаются; картинка — только с сервера
+    Steam. В фоновом потоке."""
+    appid = int(appid)
+    key = f"{appid}{'f' if foil else ''}"
+    known = _read_cache(BADGE_IMAGES_FILE)
+    entry = known.get(key)
+    if isinstance(entry, str):  # до названий здесь хранился только адрес картинки
+        entry = {"url": entry}
+    if isinstance(entry, dict) and entry.get("none") and time.time() - entry["none"] < BADGE_NONE_TTL:
+        return {"path": None, "title": ""}  # у этого значка нет своей страницы — недавно проверяли
+    if not isinstance(entry, dict) or "title" not in entry:
+        try:
+            response = requests.get(STEAM_BADGE_URL.format(steam_id=steam_id, appid=appid),
+                                    params={"border": 1} if foil else None, timeout=BADGE_PAGE_TIMEOUT)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            # Steam не успел ответить — обычное дело, когда страниц много подряд. Без страшной ошибки в журнале:
+            # одна строка, и в следующий раз попробуем снова
+            log.info("Страница значка игры %s не ответила: %s", appid, type(e).__name__)
+            return {"path": None, "title": "", "error": True}
+        if f"/gamecards/{appid}" not in response.url:
+            # Steam увёл на общий список значков — значит, у этой игры значок не от карточек (за событие и т. п.)
+            log.info("У значка игры %s нет своей страницы с карточками — картинку не ищу", appid)
+            known[key] = {"none": int(time.time())}
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            save_json(BADGE_IMAGES_FILE, known)
+            return {"path": None, "title": ""}
+        page = response.text
+        # Картинка значка — первая картинка из папки этой игры. Steam держит их по двум адресам: прежнему
+        # (…/steamcommunity/public/images/items/…) и новому (…/community_assets/images/items/…)
+        match = re.search(rf'https://[A-Za-z0-9.\-]+/(?:steamcommunity/public|community_assets)/images/items/'
+                          rf'{appid}/[0-9a-f]+\.(?:png|jpg)', page)
+        title = re.search(r'<div class="badge_info_title">\s*(.*?)\s*</div>', page, re.DOTALL)
+        entry = {"url": match.group(0) if match else "",
+                 "title": re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", title.group(1)))).strip()[:120]
+                 if title else ""}
+        if not match:
+            log.info("Картинка значка игры %s на странице не нашлась (картинок предметов на странице: %d, "
+                     "размер страницы %d)", appid, page.count("/images/items/"), len(page))
+            return {"path": None, "title": entry["title"]}  # не запоминаем — в следующий раз попробуем снова
+        known[key] = entry
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        save_json(BADGE_IMAGES_FILE, known)
+    url = entry.get("url") or ""
+    result = {"path": None, "title": entry.get("title") or ""}
+    host = urlsplit(url).hostname or ""
+    if not any(host == h or host.endswith("." + h) for h in _BADGE_IMAGE_HOSTS):
+        return result
+    name = hashlib.sha1(url.encode("utf-8")).hexdigest() + os.path.splitext(urlsplit(url).path)[1]
+    path = os.path.join(BADGE_IMAGES_DIR, name)
+    if os.path.exists(path):
+        return dict(result, path=path)
+    try:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        log.info("Картинка значка игры %s не скачалась: %s", appid, type(e).__name__)
+        return dict(result, error=True)
+    if len(response.content) > CARD_IMAGE_MAX:
+        raise ValueError("картинка значка слишком большая")
+    os.makedirs(BADGE_IMAGES_DIR, exist_ok=True)
+    with open(path + ".tmp", "wb") as f:
+        f.write(response.content)
+    os.replace(path + ".tmp", path)
+    return dict(result, path=path)
+
+
+def download_card_image(icon, large=False):
+    """Картинка карточки в кэш (cache/cards); путь к файлу. Только с сервера картинок Steam. В фоновом потоке."""
+    url = card_image_url(icon, "" if large else "200fx200f")
+    if not url:
+        raise ValueError("у карточки нет картинки")
+    name = hashlib.sha1(icon.encode("ascii")).hexdigest() + ("_full" if large else "")
+    for ext in (".png", ".jpg"):
+        path = os.path.join(CARD_IMAGES_DIR, name + ext)
+        if os.path.exists(path):
+            return path
+    response = requests.get(url, timeout=REQUEST_TIMEOUT, stream=True)
+    response.raise_for_status()
+    content = b""
+    for chunk in response.iter_content(64 * 1024):
+        content += chunk
+        if len(content) > CARD_IMAGE_MAX:
+            raise ValueError("картинка карточки слишком большая")
+    ext = ".png" if content.startswith(b"\x89PNG") else ".jpg"
+    os.makedirs(CARD_IMAGES_DIR, exist_ok=True)
+    path = os.path.join(CARD_IMAGES_DIR, name + ext)
+    with open(path + ".tmp", "wb") as f:
+        f.write(content)
+    os.replace(path + ".tmp", path)
+    return path
+
+
+# Иллюстрация за карточкой — то, что в Steam открывается щелчком по карточке на странице значка
+# (GameCardArtDialog). У своих карточек адрес приходит и в инвентаре; у всех карточек набора, в том числе ушедших
+# в значок, — на странице значка /gamecards/{appid}/ (неофициально, только чтение): одна страница на весь набор,
+# адреса запоминаются. Сама картинка — только с сервера картинок Steam.
+CARD_ARTWORK_FILE = os.path.join(CACHE_DIR, "card_artwork.json")
+CARD_ARTWORK_DIR = os.path.join(CARD_IMAGES_DIR, "artwork")
+CARD_ARTWORK_MAX = 20 * 1024 * 1024  # иллюстрации — во весь экран, бывают и 4K
+CARD_ARTWORK_NONE_TTL = 24 * 3600  # «на странице значка этой карточки нет» — проверяем снова через сутки
+_FOIL_SUFFIX = re.compile(r"\s*\((?:foil|металлическая|металлический)\)\s*$", re.IGNORECASE)
+
+
+def _card_title(name):
+    """Имя карточки без пометки металлической — так её подписывает страница значка."""
+    return _FOIL_SUFFIX.sub("", html.unescape(str(name or ""))).strip().casefold()
+
+
+def _set_artwork(steam_id, appid, foil):
+    """Иллюстрации всего набора со страницы значка: {имя карточки: адрес}. В фоновом потоке."""
+    response = requests.get(STEAM_BADGE_URL.format(steam_id=steam_id, appid=appid),
+                            params={"border": 1} if foil else None, timeout=BADGE_PAGE_TIMEOUT)
+    response.raise_for_status()
+    if f"/gamecards/{appid}" not in response.url:
+        log.info("Страница значка игры %s увела на общий список значков — иллюстраций там нет", appid)
+        return {}
+    result, calls = parse_set_artwork(response.text, appid)
+    log.info("Иллюстрации карточек игры %s со страницы значка без входа: %d (вызовов на странице: %d, "
+             "размер страницы %d)", appid, len(result), calls, len(response.text))
+    return result
+
+
+def parse_set_artwork(page, appid):
+    """Иллюстрации набора из HTML страницы значка: ({имя карточки: адрес}, сколько вызовов нашлось). Вызов стоит
+    в onclick карточки: кавычки и косые черты бывают закодированы (&#39;, \\/) — раскодируем. Адреса — только
+    картинки этой игры на сервере картинок Steam."""
+    page = html.unescape(page or "").replace("\\/", "/")
+    result = {}
+    calls = re.findall(r"GameCardArtDialog\(\s*(['\"])((?:(?!\1)[^\\]|\\.)*)\1\s*,\s*(['\"])([^'\"]+)\3", page)
+    for _, name, _, link in calls:
+        name = re.sub(r"\\(.)", r"\1", name)
+        if _is_artwork_url(link.strip(), appid):
+            result[_card_title(name)] = link.strip()
+    return result, len(calls)
+
+
+def has_set_artwork(appid, foil):
+    """Иллюстрации набора уже запомнены — со страницы значка ничего читать не нужно. Только чтение кэша."""
+    entry = _read_cache(CARD_ARTWORK_FILE).get(f"{int(appid)}{'f' if foil else ''}")
+    return isinstance(entry, dict) and bool(entry.get("cards"))
+
+
+def remember_set_artwork(appid, foil, cards):
+    """Запомнить иллюстрации набора, прочитанные со страницы значка во встроенном браузере (там вы вошли
+    в Steam). Сохраняются только адреса картинок Steam — ни кук, ни самой страницы."""
+    cards = {str(k): v for k, v in (cards or {}).items() if _is_artwork_url(v, appid)}
+    if not cards:
+        return 0
+    known = _read_cache(CARD_ARTWORK_FILE)
+    known[f"{int(appid)}{'f' if foil else ''}"] = {"cards": cards, "time": int(time.time())}
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    save_json(CARD_ARTWORK_FILE, known)
+    return len(cards)
+
+
+def card_artwork(card, appid, steam_id):
+    """Иллюстрация карточки: путь к файлу в cache/cards/artwork или None — у карточки её не нашлось.
+    В фоновом потоке."""
+    appid = int(appid)
+    url = card.get("artwork") or ""
+    if not _is_artwork_url(url, appid):
+        set_key = f"{appid}{'f' if card.get('foil') else ''}"
+        known = _read_cache(CARD_ARTWORK_FILE)
+        entry = known.get(set_key) if isinstance(known.get(set_key), dict) else {}
+        title = _card_title(card.get("name"))
+        url = (entry.get("cards") or {}).get(title) or ""
+        # Пустой ответ не запоминаем: страницу спросим снова при следующем щелчке
+        if not url and steam_id and not (entry.get("cards") and entry.get("time")
+                                         and time.time() - entry["time"] < CARD_ARTWORK_NONE_TTL):
+            cards = _set_artwork(steam_id, appid, bool(card.get("foil")))
+            if cards:
+                known[set_key] = {"cards": cards, "time": int(time.time())}
+                os.makedirs(CACHE_DIR, exist_ok=True)
+                save_json(CARD_ARTWORK_FILE, known)
+            url = cards.get(title) or ""
+            if cards and not url:
+                log.info("Иллюстрация карточки игры %s: имени %r среди %d карточек страницы нет (есть: %s)", appid,
+                         title, len(cards), ", ".join(sorted(cards))[:300])
+        elif not url and entry.get("cards"):
+            log.info("Иллюстрация карточки игры %s: имени %r среди %d запомненных карточек набора нет (есть: %s)",
+                     appid, title, len(entry["cards"]), ", ".join(sorted(entry["cards"]))[:300])
+        if not url:
+            log.info("Иллюстрация карточки игры %s: ни в инвентаре, ни среди запомненных её нет", appid)
+            return None
+    if not _is_artwork_url(url, appid):
+        return None
+    name = hashlib.sha1(url.encode("utf-8")).hexdigest() + os.path.splitext(urlsplit(url).path)[1].lower()
+    path = os.path.join(CARD_ARTWORK_DIR, name)
+    if os.path.exists(path):
+        return path
+    response = requests.get(url, timeout=BADGE_PAGE_TIMEOUT, stream=True)
+    response.raise_for_status()
+    content = b""
+    for chunk in response.iter_content(256 * 1024):
+        content += chunk
+        if len(content) > CARD_ARTWORK_MAX:
+            raise ValueError("иллюстрация карточки слишком большая")
+    os.makedirs(CARD_ARTWORK_DIR, exist_ok=True)
+    with open(path + ".tmp", "wb") as f:
+        f.write(content)
+    os.replace(path + ".tmp", path)
+    return path
 
 
 def port_has_update(port):

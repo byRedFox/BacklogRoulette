@@ -19,9 +19,10 @@ from urllib.parse import quote_plus
 LAUNCHED = time.monotonic()  # для замера запуска: отсюда начинается загрузка Qt и библиотек
 
 from PySide6.QtCore import (QAbstractAnimation, QAbstractNativeEventFilter, QEasingCurve, QEvent, QObject, QPoint,
-                            QPointF, QPropertyAnimation, QRect, QRectF, QSize, QSizeF, Qt, QTimer, QUrl,
+                            QPointF, QPropertyAnimation, QRect, QRectF, QSize, QSizeF, QStandardPaths, Qt, QTimer, QUrl,
                             QVariantAnimation, Signal)
-from PySide6.QtGui import (QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QIcon, QImage, QImageReader,
+from PySide6.QtGui import (QBrush, QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QIcon, QImage,
+                           QImageReader,
                            QKeySequence, QLinearGradient, QMovie, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
                            QRadialGradient, QShortcut, QTextCharFormat, QTextCursor, QTextFormat, QTextListFormat)
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer, QSoundEffect
@@ -149,7 +150,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.5.5"
+__version__ = "2.6"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -4817,6 +4818,779 @@ def _on_art_step_failed(page, kind, message):
     notify("warning", page.win, "SteamGridDB не ответил", message.split(": ", 1)[-1], 6000)
 
 
+def card_steam_id(win):
+    return core.load_settings().get("steam_id") or getattr(win, "session_steam_id", "") or ""
+
+
+def html_escape(text):
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+class CardTile(QWidget):
+    """Карточка в наборе: картинка, название и сколько у вас. Нет — бледная, с подписью «нет».
+    Щелчок по своей — иллюстрация за карточкой в программе просмотра Windows."""
+
+    IMAGE = QSize(150, 176)
+    clicked = Signal()
+
+    def __init__(self, card, count, parent, in_badge=False):
+        super().__init__(parent)
+        self.card, self.count = card, count
+        self.setFixedWidth(self.IMAGE.width() + 8)
+        self.image = QLabel("…", self)
+        self.image.setFixedSize(self.IMAGE)
+        self.image.setAlignment(Qt.AlignCenter)
+        self.image.setStyleSheet("QLabel {background: rgba(128, 128, 128, 40); border-radius: 6px; color: gray}")
+        title = CaptionLabel(card["name"] + (" (металлическая)" if card.get("foil") else ""), self)
+        title.setWordWrap(True)
+        title.setAlignment(Qt.AlignHCenter)
+        # Карточки собранного значка Steam забрал из инвентаря — они «в значке», а не «нет»
+        status = CaptionLabel(f"у вас: {count}" if count else "в значке" if in_badge else "нет", self)
+        status.setAlignment(Qt.AlignHCenter)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+        layout.addWidget(self.image, 0, Qt.AlignHCenter)
+        layout.addWidget(title)
+        layout.addWidget(status)
+        if count or in_badge:
+            self.count = count or 1  # открыть картинку можно и у карточки из значка
+            self.setCursor(Qt.PointingHandCursor)
+            self.setToolTip("Открыть иллюстрацию карточки целиком" + ("" if count else " — карточка ушла в значок"))
+        else:
+            effect = QGraphicsOpacityEffect(self)
+            effect.setOpacity(0.35)
+            self.setGraphicsEffect(effect)
+            self.setToolTip("Этой карточки у вас ещё нет")
+
+    def set_image(self, path):
+        pixmap = QPixmap(path) if path else QPixmap()
+        if pixmap.isNull():
+            self.image.setText("нет картинки")
+            return
+        self.image.setPixmap(pixmap.scaled(self.IMAGE, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def mouseReleaseEvent(self, event):
+        if self.count and event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
+class ResizeWatcher(QObject):
+    """Зовёт callback, когда widget меняет размер. Отдельный объект, а не eventFilter самого окна: окна поверх
+    программы уже следят этим методом за главным окном, ещё до того, как у них появились свои части."""
+
+    def __init__(self, widget, callback):
+        super().__init__(widget)
+        self.callback = callback
+        widget.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Resize:
+            self.callback()
+        return False
+
+
+class CardsDialog(MessageBoxBase):
+    """Коллекционные карточки игры Steam (тестовая версия). Свои — из открытого инвентаря; весь набор вместе
+    с недостающими — неофициально, с торговой площадки Steam (галочка «Показывать недостающие»). Только чтение."""
+
+    COLUMNS = 5
+
+    def __init__(self, win, appid, name):
+        super().__init__(win)
+        self.win, self.appid, self.name = win, int(appid), name
+        self.steam_id = card_steam_id(win)
+        self.owned = []  # свои карточки этой игры
+        self.full_set = None  # весь набор; None — ещё не узнавали
+        self.tiles = []
+        self.images = []  # очередь картинок: (плитка, icon)
+        self.closed = False
+        self._busy = 0
+        self._art_reading = set()  # какие страницы значка (обычная — False, металлическая — True) сейчас читаются
+        self._art_waiting = {}  # карточка, которую открыть, когда страница прочитается
+        self.badge = None  # значок игры: {"level", "foil", "completed"} или None
+
+        title = SubtitleLabel(f"Коллекционные карточки — {name}", self)
+        title.setWordWrap(True)
+        # Вариант 1 — значок над набором: картинка, уровень и когда создан
+        self.badge_image = QLabel(self)
+        self.badge_image.setFixedSize(72, 72)
+        self.badge_image.setAlignment(Qt.AlignCenter)
+        self.badge_text = BodyLabel("", self)
+        self.badge_text.setWordWrap(True)
+        self.badge_row = QWidget(self)
+        badge_layout = QHBoxLayout(self.badge_row)
+        badge_layout.setContentsMargins(0, 0, 0, 0)
+        badge_layout.setSpacing(12)
+        badge_layout.addWidget(self.badge_image)
+        badge_layout.addWidget(self.badge_text, 1)
+        self.badge_row.hide()
+        hint = CaptionLabel("Свои карточки — из открытого инвентаря Steam, весь набор — с торговой площадки Steam "
+                            "(неофициально). Программа ничего не продаёт и не обменивает.", self)
+        hint.setWordWrap(True)
+        self.missing_box = CheckBox("Показывать недостающие", self)
+        self.missing_box.setChecked(bool(core.load_settings().get("cards_show_missing", True)))
+        self.missing_box.stateChanged.connect(self._on_missing_toggled)
+        refresh = PushButton("Обновить", self, FIF.SYNC)
+        refresh.setToolTip("Заново спросить Steam — например, если выпала новая карточка")
+        refresh.clicked.connect(lambda: self.load(force=True))
+        badge = TransparentPushButton("Страница значка в Steam", self, FIF.LINK)
+        badge.setToolTip("Там же — сколько карточек ещё выпадет (видно, если вы вошли на сайт Steam)")
+        badge.clicked.connect(self.open_badge)
+        badge.setEnabled(bool(self.steam_id))
+        tools = QHBoxLayout()
+        tools.addWidget(self.missing_box)
+        tools.addStretch(1)
+        tools.addWidget(badge)
+        tools.addWidget(refresh)
+        self.status = CaptionLabel("Загружаю карточки…", self)
+        self.status.setWordWrap(True)
+        self.grid_box = QWidget()
+        self.grid_box.setStyleSheet("background: transparent")
+        self.grid = QGridLayout(self.grid_box)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(10)
+        self.grid.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        self._columns = 0
+        self._resize_watcher = ResizeWatcher(self.grid_box, self._place)  # окно сузили — карточки перестраиваются
+        scroll = ScrollArea(self)
+        scroll.setWidget(self.grid_box)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea {background: transparent; border: none}")
+        self.scroll = scroll
+        self._fit_height()
+        self.viewLayout.addWidget(title)
+        self.viewLayout.addWidget(self.badge_row)
+        self.viewLayout.addWidget(hint)
+        self.viewLayout.addLayout(tools)
+        self.viewLayout.addWidget(self.status)
+        self.viewLayout.addWidget(scroll, 1)
+        width = (CardTile.IMAGE.width() + 18) * self.COLUMNS + 80
+        self.widget.setMinimumWidth(min(width, win.width() - 80))
+        self.yesButton.setText("Закрыть")
+        self.cancelButton.hide()
+        QTimer.singleShot(0, self.load)
+        QTimer.singleShot(0, self._prefetch_artwork)
+
+    def _fit_height(self):
+        """Высота сетки — чтобы окно целиком влезало в программу: строка значка забирает место у карточек,
+        иначе нижний ряд уезжает под кнопку «Закрыть»."""
+        reserve = 300 + (0 if self.badge_row.isHidden() else self.badge_image.height() + 12)
+        self.scroll.setMinimumHeight(max(200, min(560, self.win.height() - reserve)))
+
+    # --- Загрузка ---
+    def _run(self, fn, args, on_done, on_fail):
+        """Фон — от окна программы: окно карточек могут закрыть раньше, чем Steam ответит."""
+        self._busy += 1
+
+        def done(result):
+            self._busy -= 1
+            if not self.closed:
+                on_done(result)
+
+        def fail(message):
+            self._busy -= 1
+            if not self.closed:
+                on_fail(message.split(": ", 1)[-1])
+
+        worker = Worker(fn, *args, parent=self.win)
+        worker.finished.connect(done)
+        worker.failed.connect(fail)
+        worker.start()
+
+    def load(self, force=False):
+        self.status.setText("Спрашиваю Steam…")
+        api_key = core.load_settings().get("steam_api_key") or ""
+        if api_key and self.steam_id:
+            self._run(core.load_badges, (api_key, self.steam_id, force), self._on_badges,
+                      lambda message: core.log.warning("Значки не загрузились: %s", message))
+        self._run(core.load_owned_cards, (self.steam_id, force), lambda data: self._on_owned(data, force),
+                  self._on_owned_failed)
+
+    def _on_badges(self, data):
+        self.badge = core.game_badge(data, self.appid)
+        if not self.badge:
+            self.badge_row.hide()
+            self._fit_height()
+            return
+        parts = []
+        if self.badge["level"]:
+            parts.append(f"Значок — уровень {self.badge['level']} из 5")
+        if self.badge["foil"]:
+            parts.append("металлический значок")
+        if self.badge["completed"]:
+            parts.append("создан " + time.strftime("%d.%m.%Y", time.localtime(self.badge["completed"])))
+        if self.badge.get("xp"):
+            parts.append(f"{self.badge['xp']} XP")
+        self.badge_text.setText(" · ".join(parts))
+        self._badge_parts = parts
+        self.badge_row.show()
+        self._fit_height()
+        self.badge_image.setText("…")
+        self._run(core.badge_info, (self.steam_id, self.appid, bool(self.badge["foil"] and not self.badge["level"])),
+                  self._on_badge_info, lambda message: self.badge_image.setText(""))
+        self._show()
+
+    def _on_badge_info(self, info):
+        if info.get("title"):  # «Название значка» — первой строкой, над уровнем и XP
+            self.badge_text.setText(f"<b>{html_escape(info['title'])}</b><br>{' · '.join(self._badge_parts)}")
+        self._on_badge_image(info.get("path"))
+
+    def _on_badge_image(self, path):
+        pixmap = QPixmap(path) if path else QPixmap()
+        if pixmap.isNull():
+            self.badge_image.setText("")
+            return
+        self.badge_image.setPixmap(pixmap.scaled(self.badge_image.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def _on_owned(self, data, force):
+        self.owned = (data["games"].get(str(self.appid)) or {}).get("cards") or []
+        if self.missing_box.isChecked():
+            self._load_set(force)
+        self._show()
+
+    def _on_owned_failed(self, message):
+        core.log.warning("Карточки «%s» не загрузились: %s", self.name, message)
+        self.status.setText(f"Свои карточки не получить: {message}.")
+        if self.missing_box.isChecked() and self.full_set is None:
+            self._load_set(False)  # набор всё равно покажем — бледным
+
+    def _load_set(self, force):
+        if self.full_set is not None and not force:
+            return
+        self._run(core.card_set, (self.appid, force), self._on_set, self._on_set_failed)
+
+    def _on_set(self, cards):
+        self.full_set = cards
+        self._show()
+
+    def _on_set_failed(self, message):
+        core.log.warning("Набор карточек «%s» не узнать: %s", self.name, message)
+        self.full_set = []
+        self._show(f"Весь набор не узнать: {message}. Видны только ваши карточки.")
+
+    def _on_missing_toggled(self, *_):
+        core.save_settings(cards_show_missing=self.missing_box.isChecked())
+        if self.missing_box.isChecked():
+            self._load_set(False)
+        self._show()
+
+    # --- Показ ---
+    def _show(self, note=""):
+        owned = {c["key"]: c for c in self.owned}
+        if self.missing_box.isChecked() and self.full_set:
+            cards = [dict(c, count=(owned.get(c["key"]) or {}).get("count", 0)) for c in self.full_set]
+            known = {c["key"] for c in self.full_set}
+            cards += [c for c in self.owned if c["key"] not in known]  # на площадке её нет, а у вас есть
+        else:
+            cards = list(self.owned)
+        # Металлические — только свои или из металлического значка: остальные выпадают редко и только мешают
+        foil_badge = bool((self.badge or {}).get("foil"))
+        cards = [c for c in cards if not c.get("foil") or c.get("count") or foil_badge]
+        cards.sort(key=lambda c: (c.get("foil", False), c["name"]))
+        normal = [c for c in cards if not c.get("foil")]
+        have = sum(1 for c in normal if c.get("count"))
+        badge_level = (self.badge or {}).get("level") or 0
+        if self.missing_box.isChecked() and self.full_set:
+            if badge_level:
+                text = (f"Набор собран {badge_level} раз — карточки ушли в значок. Сейчас в инвентаре: "
+                        f"{have} из {len(normal)}.")
+            else:
+                text = f"Собрано: {have} из {len(normal)}."
+            if normal and have == len(normal):
+                text += " Набор полный — значок можно создать на странице значка в Steam."
+        elif cards:
+            text = f"У вас карточек этой игры: {have} (без металлических)."
+        elif self.missing_box.isChecked() and self.full_set is None:
+            text = "Узнаю набор карточек…"
+        elif self.missing_box.isChecked():
+            text = "У этой игры нет коллекционных карточек — или площадка Steam их не показала."
+        elif badge_level:
+            text = f"Набор собран {badge_level} раз — карточки ушли в значок, в инвентаре их сейчас нет."
+        else:
+            text = "Карточек этой игры у вас пока нет."
+        foil = sum(1 for c in cards if c.get("foil") and c.get("count"))
+        if foil:
+            text += f" Металлических: {foil}."
+        self.status.setText(" ".join(t for t in (text, note) if t))
+        self._fill(cards)
+
+    def _fill(self, cards):
+        for tile in self.tiles:
+            self.grid.removeWidget(tile)  # сразу из сетки: удаляется плитка чуть позже, а место нужно сейчас
+            tile.deleteLater()
+        self.tiles, self.images = [], []
+        badge = self.badge or {}
+        for card in cards:
+            in_badge = bool(badge.get("foil") if card.get("foil") else badge.get("level"))
+            tile = CardTile(card, card.get("count", 0), self.grid_box, in_badge=in_badge)
+            tile.clicked.connect(lambda c=card: self.open_card(c))
+            self.tiles.append(tile)
+            if card.get("icon"):
+                self.images.append((tile, card["icon"]))
+            else:
+                tile.set_image(None)
+        self._columns = 0
+        self._place()
+        self._next_image()
+
+    def _place(self):
+        """Карточки — столько столбцов, сколько влезает в ширину окна: в окне на половину экрана их меньше."""
+        step = CardTile.IMAGE.width() + 8 + self.grid.horizontalSpacing()
+        columns = max(1, min(self.COLUMNS, (self.grid_box.width() + self.grid.horizontalSpacing()) // step))
+        if columns == self._columns:
+            return
+        self._columns = columns
+        for tile in self.tiles:
+            self.grid.removeWidget(tile)
+        for i, tile in enumerate(self.tiles):
+            self.grid.addWidget(tile, i // columns, i % columns)
+
+    def _next_image(self):
+        """Картинки — по одной: Steam не любит, когда его спрашивают сразу о многом."""
+        if self.closed or not self.images or getattr(self, "_loading_image", False):
+            return
+        tile, icon = self.images.pop(0)
+        self._loading_image = True
+
+        def done(path, tile=tile):
+            self._loading_image = False
+            if tile in self.tiles:
+                tile.set_image(path)
+            self._next_image()
+
+        def fail(message, tile=tile):
+            self._loading_image = False
+            if tile in self.tiles:
+                tile.set_image(None)
+            self._next_image()
+
+        self._run(core.download_card_image, (icon,), done, fail)
+
+    def open_card(self, card):
+        """Иллюстрация за карточкой, как в Steam по щелчку на странице значка; её нет — сама карточка крупно.
+        Сначала — что уже известно (инвентарь, кэш, торговая площадка), потом — страница значка через вход
+        во встроенном браузере (с разрешения, один раз)."""
+        self.status.setText(f"Открываю иллюстрацию «{card['name']}»…")
+        # Без входа страница значка иллюстраций не отдаёт — её без входа спрашиваем, только если браузера нет
+        steam_id = "" if QWebEngineView else self.steam_id
+
+        def done(path):
+            if path:
+                self._open_file(path)
+            else:
+                self._artwork_via_login(card)
+
+        foil = bool(card.get("foil"))
+        if foil in self._art_reading and not card.get("artwork"):  # страница значка уже читается — ждём её
+            self._art_waiting[foil] = card
+            self.status.setText("Читаю иллюстрации набора со страницы значка…")
+            return
+        self._run(core.card_artwork, (card, self.appid, steam_id), done,
+                  lambda message: self._artwork_via_login(card, f"Иллюстрация не скачалась: {message}"))
+
+    def _open_file(self, path):
+        self.status.setText("")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _card_only(self, card, note):
+        self.status.setText(f"{note} — открываю саму карточку.")
+        self._run(core.download_card_image, (card["icon"], True), self._open_file,
+                  lambda message: self.status.setText(f"Картинка не скачалась: {message}."))
+
+    LOGIN_ART_TEXT = (
+        "Иллюстрации карточек Steam показывает на странице значка только тому, кто вошёл в Steam. Программа может "
+        "открыть вашу страницу значка невидимо во встроенном браузере — там, где вы уже вошли (например, для "
+        "саундтреков), — и взять с неё только адреса картинок.\n\n"
+        "Логин и пароль программа не видит и не спрашивает, куки входа не читает и никуда не отправляет. На "
+        "странице ничего не нажимается, в Steam ничего не меняется. Запоминаются только адреса иллюстраций.\n\n"
+        "Выйти из Steam во встроенном браузере — «Настройки» → «Выйти из магазина Steam».")
+
+    def _artwork_via_login(self, card, note="У этой карточки иллюстрации в Steam не нашлось"):
+        win = self.win
+        if not QWebEngineView or not self.steam_id:
+            self._card_only(card, note)
+            return
+        if core.load_settings().get("cards_artwork_login") != "yes":
+            if getattr(win, "_cards_login_declined", False):
+                self._card_only(card, "Иллюстрации без входа в Steam не видно")
+                return
+            core.log.info("Иллюстрации карточек: спрашиваю разрешение открыть страницу значка через вход")
+            if not confirm(win, "Иллюстрации — через вход в Steam", self.LOGIN_ART_TEXT, "Разрешить"):
+                win._cards_login_declined = True  # до закрытия программы больше не спрашиваем
+                self._card_only(card, "Иллюстрации без входа в Steam не видно")
+                return
+            core.save_settings(cards_artwork_login="yes")
+            core.log.info("Иллюстрации карточек: страницу значка читать через вход — разрешено")
+        self.status.setText("Читаю иллюстрации набора со страницы значка…")
+        self._read_set_artwork(bool(card.get("foil")), card)
+
+    def _artwork_allowed(self):
+        return bool(QWebEngineView and self.steam_id
+                    and core.load_settings().get("cards_artwork_login") == "yes")
+
+    def _prefetch_artwork(self):
+        """Вход разрешён раньше — иллюстрации набора читаются сразу при открытии окна, чтобы щелчок по карточке
+        открывал картинку без ожидания. Уже запомненные не перечитываются."""
+        if self._artwork_allowed() and not core.has_set_artwork(self.appid, False):
+            self._read_set_artwork(False)
+
+    def _read_set_artwork(self, foil, card=None):
+        """Страница значка во встроенном браузере. card — открыть её иллюстрацию, когда страница прочитается;
+        если страница уже читается — ждём её, второй раз не открываем."""
+        if card is not None:
+            self._art_waiting[foil] = card  # щёлкнули по нескольким — открываем последнюю
+        if foil in self._art_reading:
+            return
+        self._art_reading.add(foil)
+        reader = SteamBadgeArtwork(self.win, self.steam_id, self.appid, foil)  # от окна программы — переживёт окно
+        reader.finished.connect(lambda cards: self._on_set_artwork(foil, cards))
+        reader.failed.connect(lambda message: self._on_set_artwork(foil, None, message))
+        reader.start()
+
+    def _on_set_artwork(self, foil, cards, error=""):
+        self._art_reading.discard(foil)
+        if error:
+            core.log.info("Иллюстрации карточек игры %s: страница значка не прочиталась — %s", self.appid, error)
+        if cards:
+            try:
+                core.remember_set_artwork(self.appid, foil, cards)  # и если окно уже закрыли — пригодится потом
+            except OSError as e:
+                core.log.warning("Иллюстрации карточек не запомнились: %s", e)
+        card = self._art_waiting.pop(foil, None)
+        if self.closed or card is None:
+            return
+        if error:
+            self._card_only(card, f"Страница значка не открылась: {error}")
+            return
+        if not cards:
+            self._card_only(card, "Steam не показал иллюстрации — похоже, во встроенном браузере вы не вошли в "
+                                  "Steam. Войти: «Страница значка в Steam» → «Войти»")
+            return
+        self._run(core.card_artwork, (card, self.appid, ""),
+                  lambda path: self._open_file(path) if path else self._card_only(
+                      card, "На странице значка этой карточки нет"),
+                  lambda message: self._card_only(card, f"Иллюстрация не скачалась: {message}"))
+
+    def open_badge(self):
+        url = core.STEAM_BADGE_URL.format(steam_id=self.steam_id, appid=self.appid)
+        if getattr(self.win, "web_page", None):
+            self.win.open_web(url)  # во встроенном браузере: там вы, может быть, уже вошли
+            self.done(0)
+        else:
+            QDesktopServices.openUrl(QUrl(url))
+
+    def done(self, code):
+        self.closed = True
+        super().done(code)
+
+
+def open_cards(win, appid, name, after=None):
+    dialog = CardsDialog(win, appid, name)
+    core.log.info("Открыты карточки «%s»", name)
+    dialog.exec()
+    dialog.deleteLater()
+    if after is not None:
+        after()  # кнопка — по свежему кэшу значков
+
+
+class CardsPage(QWidget):
+    """Вкладка «Значки и карточки Steam»: витрина значков игр. Щелчок по значку — набор карточек игры."""
+
+    BADGE_TRIES = 2  # сколько раз ещё спросить Steam о значке, если он не ответил
+    SORTS = ["Сначала новые", "Сначала старые", "По алфавиту: А → Я", "По алфавиту: Я → А"]
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        self.setObjectName("cards")
+        self.data = None
+        title = TitleLabel("Значки и Коллекционные карточки Steam", self)
+        self.title = title
+        hint = CaptionLabel("Ваши значки игр Steam. Щелчок по значку — набор карточек игры. "
+                            "Только чтение: ничего не продаётся и не обменивается.", self)
+        hint.setWordWrap(True)
+        self.status = CaptionLabel("", self)
+        self.status.setWordWrap(True)
+        self.load_button = PrimaryPushButton("Обновить", self, FIF.SYNC)
+        self.load_button.setToolTip("Заново спросить Steam — например, если вы создали новый значок")
+        self.load_button.clicked.connect(lambda: self.load(force=True))  # первый раз вкладка грузит сама
+        # Порядок и отбор витрины — только показ: значки не перезагружаются, картинки остаются
+        self.sort_box = ComboBox(self)
+        self.sort_box.addItems(self.SORTS)
+        sort = core.load_settings().get("badges_sort", 0)
+        self.sort_box.setCurrentIndex(sort if isinstance(sort, int) and 0 <= sort < len(self.SORTS) else 0)
+        self.sort_box.setToolTip("Порядок значков: по дате создания или по названию игры")
+        self.sort_box.currentIndexChanged.connect(self._on_sort)
+        self.year_box = ComboBox(self)
+        self.year_box.setToolTip("Только значки, созданные в этом году")
+        self._years = []  # что в каждой строке year_box: None — все годы, иначе год
+        self.year_box.currentIndexChanged.connect(lambda *_: self._apply_view())
+        self.search = SearchLineEdit(self)
+        self.search.setPlaceholderText("Название игры")
+        self.search.setClearButtonEnabled(True)
+        self.search.setFixedWidth(260)
+        self.search.textChanged.connect(lambda *_: self._apply_view())
+        tools = QHBoxLayout()
+        tools.setSpacing(10)
+        tools.addWidget(self.load_button)
+        tools.addSpacing(12)
+        tools.addWidget(self.sort_box)
+        tools.addWidget(self.year_box)
+        tools.addWidget(self.search)
+        tools.addStretch(1)
+        self.list = ListWidget(self)
+        self.list.itemClicked.connect(self._open_item)
+        # Вариант 3 — витрина значков: сеткой, с уровнями. Щелчок — набор карточек игры
+        self.badges_title = SubtitleLabel("Значки", self)
+        self.badges_status = CaptionLabel("", self)
+        self.badges_status.setWordWrap(True)
+        self.badges = QListWidget(self)  # обычный список Qt: у списка Fluent свой рисовальщик строк, сеткой он не умеет
+        self.badges.setFrameShape(QFrame.NoFrame)
+        self.badges.setStyleSheet("QListWidget {background: transparent}")
+        if SmoothScrollDelegate:
+            self.badges._scroll = SmoothScrollDelegate(self.badges)
+        self.badges.setViewMode(QListView.IconMode)
+        self.badges.setResizeMode(QListView.Adjust)
+        self.badges.setMovement(QListView.Static)
+        self.badges.setWrapping(True)
+        self.badges.setIconSize(QSize(80, 80))
+        self.badges.setGridSize(QSize(150, 150))
+        self.badges.setWordWrap(True)
+        self.badges.setUniformItemSizes(True)
+        self.badges.itemClicked.connect(self._open_item)
+        self._badge_queue = []
+        self._badge_loading = False
+        self._badges_level = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(36, 20, 36, 28)
+        layout.setSpacing(12)
+        layout.addWidget(title)
+        layout.addWidget(hint)
+        layout.addLayout(tools)
+        layout.addWidget(self.badges_status)
+        layout.addWidget(self.badges, 1)  # витрина — на всю ширину и высоту вкладки
+        # Список карточек в инвентаре на вкладке больше не показываем — он есть в окне карточек у каждой игры
+        self.badges_title.hide()
+        self.status.hide()
+        self.list.hide()
+        self.mini = MiniPlayerSpot(self, title)
+        self._loaded_once = False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.mini.place()
+
+    def load(self, force=False):
+        steam_id = card_steam_id(self.win)
+        api_key = core.load_settings().get("steam_api_key") or ""
+        if not (api_key and steam_id):
+            self.badges_status.setText("Для значков нужны SteamID и ключ Steam Web API — их можно указать "
+                                       "в «Настройках».")
+            return
+        self.load_button.setEnabled(False)
+        self.badges_status.setText("Загружаю значки…")
+        worker = Worker(core.load_badges, api_key, steam_id, force, parent=self)
+        worker.finished.connect(self._on_badges)
+        worker.failed.connect(self._on_badges_failed)
+        worker.start()
+
+    def _on_badges_failed(self, message):
+        self.load_button.setEnabled(True)
+        self.load_button.setText("Попробовать ещё раз")
+        self.badges_status.setText(f"Значки не получить: {message.split(': ', 1)[-1]}.")
+
+    def _game_name(self, appid):
+        game = next((g for g in self.win.library.games if str(g.get("appid")) == str(appid)), None)
+        if game:
+            return game["name"]
+        owned = (core._read_cache(core.CARDS_FILE).get("games") or {}).get(str(appid)) or {}
+        return owned.get("name") or f"Игра {appid}"
+
+    def _on_badges(self, data):
+        self.load_button.setEnabled(True)
+        self.load_button.setText("Обновить")
+        self.badges.clear()
+        self._badge_queue = []
+        games = sorted(data["games"].items(), key=lambda pair: -(pair[1].get("completed") or 0))  # новые — первыми
+        steam_id = data["steam_id"]
+        placeholder = PolaroidIcon().icon()
+        for appid, badge in games:
+            name = badge.get("name") or self._game_name(appid)  # из Steam — даже у скрытых игр
+            level = f"ур. {badge['level']}" if badge["level"] else ""
+            if badge["foil"]:
+                level = (level + " · " if level else "") + "металлический"
+            if badge.get("family"):
+                level = (level + " · " if level else "") + "семейная библиотека"
+            item = QListWidgetItem(placeholder, name)
+            item.setData(Qt.UserRole, (appid, name))
+            item.setData(Qt.UserRole + 1, (name, level))
+            item.setData(Qt.UserRole + 3, (steam_id, int(appid), bool(badge["foil"] and not badge["level"])))
+            item.setData(Qt.UserRole + 4, int(badge.get("completed") or 0))  # для порядка и года
+            item.setToolTip(name + (" — создан " + time.strftime("%d.%m.%Y", time.localtime(badge["completed"]))
+                                    if badge.get("completed") else ""))
+            item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            item.setForeground(QColor(255, 255, 255) if isDarkTheme() else QColor(0, 0, 0))  # под тему программы
+            self.badges.addItem(item)
+            self._badge_queue.append((item, steam_id, int(appid), bool(badge["foil"] and not badge["level"]), 0))
+        self._fill_years()
+        self._apply_view()
+        self._update_badges_status(data)
+        self._next_badge()
+
+    def _fill_years(self):
+        """Годы, в которые создавались значки, — новые сверху. Выбранный год остаётся, если он ещё есть."""
+        chosen = self._years[self.year_box.currentIndex()] if 0 <= self.year_box.currentIndex() < len(self._years) \
+            else None
+        years = sorted({time.localtime(self.badges.item(row).data(Qt.UserRole + 4)).tm_year
+                        for row in range(self.badges.count()) if self.badges.item(row).data(Qt.UserRole + 4)},
+                       reverse=True)
+        self._years = [None] + years
+        self.year_box.blockSignals(True)
+        self.year_box.clear()
+        self.year_box.addItems(["Все годы"] + [f"Созданы в {year}" for year in years])
+        self.year_box.setCurrentIndex(self._years.index(chosen) if chosen in self._years else 0)
+        self.year_box.blockSignals(False)
+
+    def _on_sort(self, index):
+        core.save_settings(badges_sort=index)
+        self._apply_view()
+
+    def _apply_view(self):
+        """Порядок и отбор витрины. Значки переставляются теми же строками — картинки и очередь картинок
+        остаются при них."""
+        items = [self.badges.takeItem(0) for _ in range(self.badges.count())]
+        sort = self.sort_box.currentIndex()
+        if sort in (0, 1):  # по дате создания; без даты — в конце
+            items.sort(key=lambda it: it.data(Qt.UserRole + 4) or (0 if sort == 0 else float("inf")),
+                       reverse=sort == 0)
+        else:
+            items.sort(key=lambda it: core.natural_key(it.data(Qt.UserRole + 1)[0]), reverse=sort == 3)
+        for item in items:
+            self.badges.addItem(item)
+        index = self.year_box.currentIndex()
+        year = self._years[index] if 0 <= index < len(self._years) else None
+        text = self.search.text().strip().casefold()
+        for item in items:
+            completed = item.data(Qt.UserRole + 4)
+            hidden = bool(year and (not completed or time.localtime(completed).tm_year != year))
+            hidden = hidden or bool(text and text not in item.data(Qt.UserRole + 1)[0].casefold())
+            item.setHidden(hidden)
+        self._update_badges_status()
+
+    def _update_badges_status(self, data=None):
+        if data is not None:
+            self._badges_level = data.get("level")
+        total = self.badges.count()
+        shown = sum(1 for row in range(total) if not self.badges.item(row).isHidden())
+        level = f"Уровень Steam: {self._badges_level or '—'}."
+        if not total:
+            self.badges_status.setText("Значков игр пока нет.")
+        elif shown == total:
+            self.badges_status.setText(f"Значков игр: {total}. {level}")
+        else:
+            self.badges_status.setText(f"Показано значков: {shown} из {total}. {level}"
+                                       if shown else f"Под отбор не подошёл ни один значок из {total}.")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._loaded_once:
+            self._loaded_once = True
+            QTimer.singleShot(0, self.load)  # первый раз — из кэша, если он свежий
+            return
+        # Вернулись на вкладку — значкам без картинки ещё одна попытка: картинка могла появиться в кэше
+        # (например, её скачало окно карточек игры), а Steam мог отойти
+        if not self._badge_queue and not self._badge_loading:
+            for row in range(self.badges.count()):
+                item = self.badges.item(row)
+                if not item.data(Qt.UserRole + 2) and item.data(Qt.UserRole + 3):
+                    self._badge_queue.append((item,) + tuple(item.data(Qt.UserRole + 3)) + (0,))
+            self._next_badge()
+
+    def _remove_badge(self, item):
+        row = self.badges.row(item)
+        if row >= 0:
+            self.badges.takeItem(row)
+            self._update_badges_status()
+
+    def _next_badge(self):
+        """Картинки значков — по одной: за каждой программа заходит на страницу значка в Steam."""
+        if self._badge_loading or not self._badge_queue:
+            return
+        item, steam_id, appid, foil, tries = self._badge_queue.pop(0)
+        self._badge_loading = True
+
+        def done(info):
+            self._badge_loading = False
+            info = info or {}
+            path = info.get("path")
+            pixmap = QPixmap(path) if path else QPixmap()
+            try:
+                if not pixmap.isNull():
+                    item.setIcon(QIcon(pixmap))
+                    item.setData(Qt.UserRole + 2, True)  # картинка есть
+                    name, level = item.data(Qt.UserRole + 1)
+                    # Под значком — только игра; название значка и уровень — в подсказке
+                    tip = " — ".join(t for t in (info.get("title"), name) if t)
+                    item.setToolTip(tip + (f", {level}" if level else ""))
+                elif info.get("error"):
+                    if tries < self.BADGE_TRIES:  # Steam не ответил — ещё попытка, в конце очереди
+                        self._badge_queue.append((item, steam_id, appid, foil, tries + 1))
+                else:
+                    # Картинки нет и не будет: это значок не за карточки игры (выслуга лет, число игр,
+                    # события) — на витрине таким не место
+                    self._remove_badge(item)
+            except RuntimeError:  # список уже перестроили
+                pass
+            # Steam не ответил — он перегружен или просит не спешить: следующая страница через 5 с, а не сразу
+            QTimer.singleShot(5000 if info.get("error") else 300, self._next_badge)
+
+        def failed(message):
+            self._badge_loading = False
+            core.log.info("Картинка значка %s не скачалась: %s", appid, message)
+            QTimer.singleShot(300, self._next_badge)
+
+        worker = Worker(core.badge_info, steam_id, appid, foil, parent=self)
+        worker.finished.connect(done)
+        worker.failed.connect(failed)
+        worker.start()
+
+    def _on_failed(self, message):
+        self.load_button.setEnabled(True)
+        self.load_button.setText("Попробовать ещё раз")
+        self.status.setText(f"Карточки не получить: {message.split(': ', 1)[-1]}.")
+
+    def _on_loaded(self, data):
+        self.data = data
+        self.load_button.setEnabled(True)
+        self.load_button.setText("Обновить")
+        self.list.clear()
+        games = sorted(data["games"].items(), key=lambda pair: core.natural_key(pair[1]["name"]))
+        total = 0
+        for appid, game in games:
+            normal = sum(1 for c in game["cards"] if not c.get("foil"))
+            foil = sum(1 for c in game["cards"] if c.get("foil"))
+            count = sum(c["count"] for c in game["cards"])
+            total += count
+            text = f"{game['name'] or 'Игра ' + appid} — разных карточек: {normal}"
+            if foil:
+                text += f", металлических: {foil}"
+            if count > normal + foil:
+                text += f" (всего штук: {count})"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, (appid, game["name"]))
+            self.list.addItem(item)
+        when = time.strftime("%d.%m.%Y %H:%M", time.localtime(data.get("time") or time.time()))
+        self.status.setText(f"Игр с карточками: {len(games)}, карточек всего: {total}. Сведения от {when}."
+                            if games else "Карточек в инвентаре Steam пока нет.")
+
+    def _open_item(self, item):
+        appid, name = item.data(Qt.UserRole)
+        open_cards(self.win, appid, name or f"Игра {appid}")
+
+
 class ShotThumb(QLabel):
     """Миниатюра снимка экрана в ленте записи. Файла нет (удалили из папки) — подпись вместо картинки."""
 
@@ -4985,7 +5759,7 @@ class NotesDialog(MessageBoxBase):
         width = max(640, min(1000, parent.width() - 160))
         self.widget.setMinimumWidth(width)
         self.widget.setMaximumWidth(width)
-        self.yesButton.setText("Готово")
+        self.yesButton.setText("Закрыть")  # всё сохраняется само — кнопка только закрывает окно
         self.cancelButton.hide()
 
         self._fill_list()
@@ -5358,6 +6132,13 @@ class GamePage(QWidget):
         self.cover_button.clicked.connect(self.home.choose_cover)
         self.notes_button = PushButton("Свои заметки", self, fluent_icon("QUICK_NOTE", FIF.EDIT))
         self.notes_button.clicked.connect(lambda: self.game and open_notes(self.win, self.game, self.notes_button))
+        # Коллекционные карточки (тест) — у игр, связанных со Steam
+        self.cards_button = PushButton("Карточки Steam", self, PolaroidIcon())
+        self.cards_button.setToolTip("Коллекционные карточки и значок игры")
+        self.cards_button.clicked.connect(lambda: self.game and self.game.get("appid") and open_cards(
+            self.win, self.game["appid"], self.game["name"], after=self._update_cards_button))
+        self.cards_button.hide()
+        self._cards_details = None  # отметка магазина «есть карточки»: None — ещё не знаем
         self.store_button = PushButton("Магазин Steam", self, FIF.SHOPPING_CART)
         self.store_button.clicked.connect(self.open_store)
         self.link_button = PrimaryPushButton("Найти в Steam", self, FIF.SEARCH)
@@ -5383,8 +6164,8 @@ class GamePage(QWidget):
         buttons_box = QWidget(self)
         buttons = CenteredFlowLayout(buttons_box, spacing=12)
         for button in (self.play_button, self.link_button, self.spin_button, self.done_button, self.notes_button,
-                       self.cover_button, self.store_button, self.soundtrack_button, self.collection_button,
-                       back_button, library_button):
+                       self.cards_button, self.cover_button, self.store_button, self.soundtrack_button,
+                       self.collection_button, back_button, library_button):
             buttons.addWidget(button)
         self.buttons = buttons
 
@@ -5553,7 +6334,14 @@ class GamePage(QWidget):
             settings = core.load_settings()
             self._run(core.get_achievements, (game["appid"], settings["steam_api_key"], settings["steam_id"]),
                       self._on_achievements, self._on_achievements_failed)
+            self._cards_details = None
+            self._update_cards_button()
+            if settings.get("steam_api_key") and card_steam_id(self.win):
+                # Значки — из кэша или раз в 15 минут из Steam; пришли — кнопка и её значок обновятся
+                self._run(core.load_badges, (settings["steam_api_key"], card_steam_id(self.win), False),
+                          lambda _data: self._update_cards_button(), lambda _message: None)
         else:
+            self.cards_button.hide()
             self._show_without_details("Игра добавлена вручную, без связи со Steam. Нажмите «Найти в Steam» — "
                                        "программа найдёт её в магазине, и здесь появятся описание, скриншоты "
                                        "и трейлеры.")
@@ -5692,7 +6480,22 @@ class GamePage(QWidget):
         else:
             self.media_view.show_pixmap(pixmap)
 
+    # --- Коллекционные карточки (тест) ---
+    def _update_cards_button(self):
+        """Кнопка «Карточки» — только у игр, у которых карточки есть (отметка магазина) или есть ваш значок.
+        Вариант 2: картинка значка — значком на самой кнопке."""
+        game = self.game
+        if not game or not game.get("appid"):
+            self.cards_button.hide()
+            return
+        steam_id = card_steam_id(self.win)
+        badge = core.cached_badge(game["appid"], steam_id) if steam_id else None
+        has_cards = (self._cards_details or {}).get("trading_cards")  # None — магазин ещё не ответил
+        self.cards_button.setVisible(bool(badge) or has_cards is not False)
+
     def _on_details(self, details):
+        self._cards_details = details if isinstance(details, dict) else None
+        self._update_cards_button()
         self._timing_mark("описание")
         if not details:
             self._show_without_details("Магазин Steam не отдаёт страницу этой игры — возможно, её сняли с продажи.")
@@ -6094,7 +6897,51 @@ def web_profile(widget):
         _web_profile.setCachePath(os.path.join(storage, "cache"))
         # Вход в магазин Steam — «сессионная» кука; без этого он забывался бы при каждом закрытии программы
         _web_profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+        window = widget.window()
+        _web_profile.downloadRequested.connect(lambda request: _save_web_image(window, request))
     return _web_profile
+
+
+WEB_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+
+
+def _save_web_image(window, request):
+    """«Сохранить картинку» во встроенном браузере (правый щелчок по картинке). Сохраняются только картинки и только
+    туда, куда вы сами укажете в окне «Сохранить как». Остальные скачивания встроенный браузер не принимает —
+    файлы программ и архивы качайте в обычном браузере."""
+    name = os.path.basename(request.downloadFileName() or "") or "картинка.jpg"
+    mime = (request.mimeType() or "").lower()
+    image = mime.startswith("image/") or os.path.splitext(name)[1].lower() in WEB_IMAGE_EXTENSIONS
+    if not image or mime in ("image/svg+xml",):
+        core.log.info("Встроенный браузер: скачивание «%s» (%s) не принято — сохраняются только картинки",
+                      name, mime or "тип не указан")
+        request.cancel()
+        notify("info", window, "Скачать здесь можно только картинку",
+               "Встроенный браузер сохраняет только картинки. Другие файлы откройте «Во внешнем браузере».", 7000)
+        return
+    if not os.path.splitext(name)[1]:
+        name += {"image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}.get(mime, ".jpg")
+    folder = QStandardPaths.writableLocation(QStandardPaths.PicturesLocation) or os.path.expanduser("~")
+    path, _ = QFileDialog.getSaveFileName(window, "Сохранить картинку", os.path.join(folder, name),
+                                          "Изображения (" + " ".join("*" + e for e in WEB_IMAGE_EXTENSIONS) + ")")
+    if not path:
+        request.cancel()
+        return
+    request.setDownloadDirectory(os.path.dirname(path))
+    request.setDownloadFileName(os.path.basename(path))
+    core.log.info("Встроенный браузер: сохраняю картинку «%s»", os.path.basename(path))
+
+    def finished():
+        if not request.isFinished():
+            return
+        if request.state() == request.DownloadState.DownloadCompleted:
+            notify("success", window, "Картинка сохранена", path, 5000)
+        else:
+            notify("warning", window, "Картинка не сохранилась", request.interruptReasonString() or "", 6000)
+
+    if hasattr(request, "isFinishedChanged"):
+        request.isFinishedChanged.connect(finished)
+    request.accept()
 
 
 class BrowserPage(QWidget):
@@ -8406,6 +9253,44 @@ class SteamWebToken(SteamOwnedApps):
             return
         token = ((data.get("data") or {}).get("webapi_token") if isinstance(data, dict) else None)
         self._finish(token if isinstance(token, str) and token else None)  # без входа токена нет
+
+
+class SteamBadgeArtwork(SteamOwnedApps):
+    """Иллюстрации карточек набора — со страницы значка игры. Steam рисует их на странице только тому, кто вошёл
+    в Steam, поэтому страница открывается невидимой во встроенном браузере (вход хранится в его куках, программа
+    их не читает). Со страницы берутся только адреса картинок; ничего не нажимается и не меняется.
+    finished({имя карточки: адрес}) — пусто, если вход не выполнен; failed(текст) — страница не открылась."""
+
+    TIMEOUT_MS = 30000
+
+    def __init__(self, parent, steam_id, appid, foil):
+        super().__init__(parent)
+        self.appid = int(appid)
+        self.url = core.STEAM_BADGE_URL.format(steam_id=steam_id, appid=self.appid) + ("?border=1" if foil else "")
+
+    def start(self):
+        self.timer.start(self.TIMEOUT_MS)
+        self.page.load(QUrl(self.url))
+
+    def _on_loaded(self, ok):
+        if self._done:
+            return
+        if not ok:
+            self._finish(error="страница значка в Steam не открылась")
+            return
+        if f"/gamecards/{self.appid}" not in self.page.url().toString():
+            core.log.info("Страница значка игры %s во встроенном браузере увела на другую страницу", self.appid)
+            self._finish({})
+            return
+        self.page.toHtml(self._on_text)
+
+    def _on_text(self, text):
+        if self._done:
+            return
+        cards, calls = core.parse_set_artwork(text, self.appid)
+        core.log.info("Иллюстрации карточек игры %s со страницы значка во встроенном браузере: %d (вызовов: %d)",
+                      self.appid, len(cards), calls)
+        self._finish(cards)
 
 
 class AlbumBackdrop(QWidget):
@@ -11388,6 +12273,31 @@ def completed_text(port):
     return "пройдена " + time.strftime("%d.%m.%Y", time.localtime(port["completed_at"]))
 
 
+POLAROID_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+<g transform="rotate(-8 8 8)">
+<rect x="2.8" y="1.2" width="10.4" height="13.6" rx="1.2" fill="none" stroke="{c}" stroke-width="1.2"/>
+<rect x="4.6" y="3" width="6.8" height="6.8" fill="{c}" fill-opacity="0.45"/>
+<polygon points="4.6,9.8 7.2,6.1 8.8,7.9 9.9,6.7 11.4,9.8" fill="{c}"/>
+<circle cx="9.7" cy="4.8" r="0.9" fill="{c}"/>
+</g>
+</svg>"""
+
+
+class PolaroidIcon(FluentIconBase):
+    """Значок «коллекционная карточка» — снимок-полароид чуть наискосок. Как значки библиотеки интерфейса:
+    белый в тёмной теме, чёрный в светлой, и сам перекрашивается, когда тему меняют."""
+
+    def path(self, theme=Theme.AUTO):
+        dark = isDarkTheme() if theme == Theme.AUTO else theme == Theme.DARK
+        name = "polaroid_dark.svg" if dark else "polaroid_light.svg"
+        path = os.path.join(core.CACHE_DIR, "icons", name)
+        if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(POLAROID_SVG.format(c="#FFFFFF" if dark else "#000000"))
+        return path
+
+
 class PortTileDelegate(CoverTileDelegate):
     """Плитка порта — как у игр Steam, а если на GitHub вышла новая версия, в углу обложки кружок со стрелкой.
     Пройденная игра — с платиновым кубком в левом верхнем углу, как трофей в PlayStation."""
@@ -11418,19 +12328,26 @@ class PortTileDelegate(CoverTileDelegate):
         painter.restore()
 
     def _paint_trophy(self, painter, option):
+        """Пройденная игра: медаль с кубком на левом верхнем углу обложки, как трофей в PlayStation."""
         rect = QRectF(option.rect)
         left = rect.x() + (rect.width() - self.COVER.width()) / 2
-        center = QPointF(left + 20, rect.y() + self.PAD + 20)
+        cover = QRectF(left, rect.y() + self.PAD, self.COVER.width(), self.COVER.height())
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
-        # Платина: светлый серебристо-голубой металл с бликом сверху слева
-        metal = QLinearGradient(center.x() - 15, center.y() - 15, center.x() + 15, center.y() + 15)
-        metal.setColorAt(0, QColor(246, 249, 252))
-        metal.setColorAt(0.5, QColor(196, 208, 222))
-        metal.setColorAt(1, QColor(132, 148, 168))
-        painter.setPen(QPen(QColor(255, 255, 255, 230), 2))
-        painter.setBrush(metal)
-        painter.drawEllipse(center, 15, 15)
+        # Медаль — почти в самом углу обложки, но целиком внутри плитки
+        medal = 15
+        shift = max(3.0, medal - self.PAD)
+        center = QPointF(cover.left() + shift, cover.top() + shift)
+        face = QLinearGradient(center.x() - medal, center.y() - medal, center.x() + medal, center.y() + medal)
+        face.setColorAt(0, QColor(246, 249, 252))
+        face.setColorAt(0.5, QColor(196, 208, 222))
+        face.setColorAt(1, QColor(132, 148, 168))
+        painter.setPen(QPen(QColor(0, 0, 0, 90), 1))  # тень-кромка: медаль отделяется от рамки
+        painter.setBrush(face)
+        painter.drawEllipse(center, medal, medal)
+        painter.setPen(QPen(QColor(255, 255, 255, 230), 1.5))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(center, medal - 2, medal - 2)
         painter.restore()
         draw_trophy(painter, center, 18, TROPHY_DARK)
 
@@ -12178,6 +13095,7 @@ class Screenshots(QObject):
     не показывается: снимок получился — щелчок затвора, не получился — два низких «бип»."""
 
     HOTKEY_ID = 0x5B01
+    FRAMES_KEPT = 50  # со сколькими прошлыми снимками запуска сверяется новый
 
     def __init__(self, window, tracker):
         super().__init__(window)
@@ -12271,14 +13189,19 @@ class Screenshots(QObject):
             core.log.info("Снимок «%s» не сделан: прошлые ещё записываются на диск", port["name"])
             return
         try:
+            frames = session.setdefault("frames", [])  # миниатюры снимков этого запуска игры
+
+            def seen(sample):
+                return any(core.frames_alike(sample, frame) for frame in frames)
+
             width, height, data = core.capture_window(hwnd)
-            digest = core.frame_digest(data)
-            if digest == session.get("last_frame"):
-                # Ровно тот же кадр, что в прошлый раз, — экран отдал застывшую картинку (игра в исключительном
+            sample = core.frame_sample(width, height, data)
+            if seen(sample):
+                # Тот же кадр, что уже снимали, — экран отдал застывшую картинку (игра в исключительном
                 # полноэкранном режиме рисует мимо Windows). Пробуем снять само окно
                 width, height, data = core.capture_window(hwnd, window_first=True)
-                digest = core.frame_digest(data)
-                if digest == session.get("last_frame"):
+                sample = core.frame_sample(width, height, data)
+                if seen(sample):
                     raise core.ScreenshotError(
                         "кадр не обновился — снимок получился бы таким же, как прошлый. Так бывает у игр в "
                         "исключительном полноэкранном режиме: Windows видит только старую картинку. Включите в "
@@ -12289,7 +13212,8 @@ class Screenshots(QObject):
             core.log.warning("Снимок «%s» не получился: %s", port["name"], e)
             notify("warning", self.win, "Снимок не получился", f"«{port['name']}»: {e}.", 8000)
             return
-        session["last_frame"] = digest
+        frames.append(sample)
+        del frames[:-self.FRAMES_KEPT]
         self.play("shot")
         self.saving += 1
         worker = Worker(core.save_screenshot, path, width, height, data, parent=self)
@@ -14547,12 +15471,14 @@ class MainWindow(FluentWindow):
         self.music_page = MusicPage(self)
         self.web_page = WebPage(self) if QWebEngineView else None
         self.shop_page = ShopPage(self)  # «Найти игры на Plati.Market»
+        self.cards_page = CardsPage(self)  # значки и коллекционные карточки Steam
         self.settings_page = SettingsPage(self)
         self.logs_page = LogsPage(self)
         self.about_page = AboutPage(self)
         startup.mark("вкладки")
         self.addSubInterface(self.home_page, FIF.GAME, "Рулетка")
         self.addSubInterface(self.library_page, FIF.LIBRARY, "Игры Steam")
+        self.addSubInterface(self.cards_page, PolaroidIcon(), "Значки и карточки Steam")
         self.addSubInterface(self.native_page, FIF.APPLICATION, "Игры Native Port's")
         self.addSubInterface(self.disc_page, DISC_ICON, "Дисковые игры")
         self.addSubInterface(self.collections_page, COLLECTION_ICON, "Коллекции")
