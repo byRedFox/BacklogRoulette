@@ -150,7 +150,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.6"
+__version__ = "2.6.0.1"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -190,7 +190,7 @@ class Worker(QObject):
     def _run(self):
         try:
             result = self.fn(*self.args)
-        except core.ServiceBusy as e:  # сайт не ответил — обычное дело, простыня в логе не нужна
+        except (core.ServiceBusy, core.CardsUnavailable) as e:  # сайт не ответил — обычное дело, простыня не нужна
             core.log.warning("%s: %s", getattr(self.fn, "__name__", self.fn), core.mask_secrets(e))
             self.failed.emit(core.mask_secrets(f"{type(e).__name__}: {e}"))
         except Exception as e:  # noqa: BLE001 — показываем любую ошибку пользователю
@@ -5417,7 +5417,13 @@ class CardsPage(QWidget):
         games = sorted(data["games"].items(), key=lambda pair: -(pair[1].get("completed") or 0))  # новые — первыми
         steam_id = data["steam_id"]
         placeholder = PolaroidIcon().icon()
+        # Что уже скачано — сразу из кэша, без очереди: за страницами значков в Steam ходим только за новыми
+        known = core.cached_badge_infos()
         for appid, badge in games:
+            foil = bool(badge["foil"] and not badge["level"])
+            info = known.get(f"{appid}{'f' if foil else ''}")
+            if info and not info["path"]:
+                continue  # картинки нет и не будет (значок не за карточки) — недавно проверяли
             name = badge.get("name") or self._game_name(appid)  # из Steam — даже у скрытых игр
             level = f"ур. {badge['level']}" if badge["level"] else ""
             if badge["foil"]:
@@ -5427,18 +5433,33 @@ class CardsPage(QWidget):
             item = QListWidgetItem(placeholder, name)
             item.setData(Qt.UserRole, (appid, name))
             item.setData(Qt.UserRole + 1, (name, level))
-            item.setData(Qt.UserRole + 3, (steam_id, int(appid), bool(badge["foil"] and not badge["level"])))
+            item.setData(Qt.UserRole + 3, (steam_id, int(appid), foil))
             item.setData(Qt.UserRole + 4, int(badge.get("completed") or 0))  # для порядка и года
             item.setToolTip(name + (" — создан " + time.strftime("%d.%m.%Y", time.localtime(badge["completed"]))
                                     if badge.get("completed") else ""))
             item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
             item.setForeground(QColor(255, 255, 255) if isDarkTheme() else QColor(0, 0, 0))  # под тему программы
             self.badges.addItem(item)
-            self._badge_queue.append((item, steam_id, int(appid), bool(badge["foil"] and not badge["level"]), 0))
+            if not (info and self._show_badge_image(item, info)):
+                self._badge_queue.append((item, steam_id, int(appid), foil, 0))
         self._fill_years()
         self._apply_view()
         self._update_badges_status(data)
         self._next_badge()
+
+    @staticmethod
+    def _show_badge_image(item, info):
+        """Картинка значка — на витрину. False — файл не открылся."""
+        pixmap = QPixmap(info["path"]) if info.get("path") else QPixmap()
+        if pixmap.isNull():
+            return False
+        item.setIcon(QIcon(pixmap))
+        item.setData(Qt.UserRole + 2, True)  # картинка есть
+        name, level = item.data(Qt.UserRole + 1)
+        # Под значком — только игра; название значка и уровень — в подсказке
+        tip = " — ".join(t for t in (info.get("title"), name) if t)
+        item.setToolTip(tip + (f", {level}" if level else ""))
+        return True
 
     def _fill_years(self):
         """Годы, в которые создавались значки, — новые сверху. Выбранный год остаётся, если он ещё есть."""
@@ -5516,7 +5537,8 @@ class CardsPage(QWidget):
             self._update_badges_status()
 
     def _next_badge(self):
-        """Картинки значков — по одной: за каждой программа заходит на страницу значка в Steam."""
+        """Картинки новых значков — по одной: за каждой программа заходит на страницу значка в Steam.
+        Уже скачанные ставятся сразу, ещё в _on_badges."""
         if self._badge_loading or not self._badge_queue:
             return
         item, steam_id, appid, foil, tries = self._badge_queue.pop(0)
@@ -5525,16 +5547,9 @@ class CardsPage(QWidget):
         def done(info):
             self._badge_loading = False
             info = info or {}
-            path = info.get("path")
-            pixmap = QPixmap(path) if path else QPixmap()
             try:
-                if not pixmap.isNull():
-                    item.setIcon(QIcon(pixmap))
-                    item.setData(Qt.UserRole + 2, True)  # картинка есть
-                    name, level = item.data(Qt.UserRole + 1)
-                    # Под значком — только игра; название значка и уровень — в подсказке
-                    tip = " — ".join(t for t in (info.get("title"), name) if t)
-                    item.setToolTip(tip + (f", {level}" if level else ""))
+                if self._show_badge_image(item, info):
+                    pass  # картинка на месте
                 elif info.get("error"):
                     if tries < self.BADGE_TRIES:  # Steam не ответил — ещё попытка, в конце очереди
                         self._badge_queue.append((item, steam_id, appid, foil, tries + 1))

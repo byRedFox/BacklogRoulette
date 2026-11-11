@@ -5336,22 +5336,53 @@ def cached_card_count(appid, steam_id):
     return sum(1 for c in game.get("cards") or [] if not c.get("foil"))
 
 
+MARKET_PAUSE = 120  # площадка попросила подождать — столько секунд её не спрашиваем
+_market_pause_until = 0.0
+
+
 def card_set(appid, force=False):
     """Весь набор карточек игры: [{"key", "name", "foil", "icon"}]; пусто — у игры нет карточек. Неофициально —
-    через поиск торговой площадки Steam (только чтение, цены не берём). В фоновом потоке."""
+    через поиск торговой площадки Steam (только чтение, цены не берём). Площадка не ответила или просит подождать,
+    а набор уже узнавали раньше — отдаём прежний: он почти не меняется. В фоновом потоке."""
     appid = int(appid)
     cache = _read_cache(CARD_SETS_FILE)
     entry = cache.get(str(appid))
     if not force and isinstance(entry, dict) and time.time() - (entry.get("time") or 0) < CARD_SETS_TTL:
         return entry.get("cards") or []
+    try:
+        cards = _market_card_set(appid)
+    except (CardsUnavailable, requests.RequestException, ValueError) as e:
+        if isinstance(entry, dict) and entry.get("cards"):
+            log.info("Набор карточек игры %s: площадка не ответила (%s) — показываю запомненный", appid,
+                     e if isinstance(e, CardsUnavailable) else type(e).__name__)
+            return entry["cards"]
+        if isinstance(e, CardsUnavailable):
+            raise
+        raise CardsUnavailable("торговая площадка Steam не ответила — набор не узнать, видны только ваши "
+                               "карточки. Попробуйте «Обновить» чуть позже") from None
+    cache[str(appid)] = {"time": int(time.time()), "cards": cards}
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    save_json(CARD_SETS_FILE, cache)
+    log.info("Набор карточек игры %s: %d (с площадки Steam)", appid, len(cards))
+    return cards
+
+
+def _market_card_set(appid):
+    global _market_pause_until
+    wait = int(_market_pause_until - time.time())
+    if wait > 0:  # не стучимся, пока площадка просит подождать: каждый лишний запрос продлевает запрет
+        raise CardsUnavailable(f"торговая площадка Steam просит подождать — набор узнаю примерно через "
+                               f"{max(1, (wait + 59) // 60)} мин., пока видны только ваши карточки")
     cards, start = [], 0
     while start < 300:
-        response = requests.get(STEAM_MARKET_SEARCH_URL, timeout=REQUEST_TIMEOUT, params={
+        response = requests.get(STEAM_MARKET_SEARCH_URL, timeout=BADGE_PAGE_TIMEOUT, params={
             "norender": 1, "appid": 753, "start": start, "count": 100, "sort_column": "name", "sort_dir": "asc",
             "search_descriptions": 0, "l": "russian",
             "category_753_Game[]": f"tag_app_{appid}", "category_753_item_class[]": "tag_item_class_2"})
         if response.status_code == 429:
-            raise CardsUnavailable("торговая площадка Steam просит подождать — попробуйте через пару минут")
+            _market_pause_until = time.time() + MARKET_PAUSE
+            raise CardsUnavailable("торговая площадка Steam просит подождать — набор узнаю через пару минут, "
+                                   "пока видны только ваши карточки")
         response.raise_for_status()
         data = response.json() or {}
         if not data.get("success"):
@@ -5371,10 +5402,6 @@ def card_set(appid, force=False):
             break
         time.sleep(1.0)
     cards.sort(key=lambda c: (c["foil"], c["name"]))
-    cache[str(appid)] = {"time": int(time.time()), "cards": cards}
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    save_json(CARD_SETS_FILE, cache)
-    log.info("Набор карточек игры %s: %d (с площадки Steam)", appid, len(cards))
     return cards
 
 
@@ -5562,6 +5589,34 @@ def badge_image(steam_id, appid, foil=False):
     return badge_info(steam_id, appid, foil)["path"]
 
 
+def _badge_file(url):
+    """Где лежит скачанная картинка значка: путь в cache/badges или None — адрес не с сервера картинок Steam."""
+    host = urlsplit(url or "").hostname or ""
+    if not any(host == h or host.endswith("." + h) for h in _BADGE_IMAGE_HOSTS):
+        return None
+    name = hashlib.sha1(url.encode("utf-8")).hexdigest() + os.path.splitext(urlsplit(url).path)[1]
+    return os.path.join(BADGE_IMAGES_DIR, name)
+
+
+def cached_badge_infos():
+    """Что о значках уже известно с диска, без сети, — для витрины: {"appid" или "appidf": {"path", "title"}}.
+    path — скачанная картинка, None — недавно проверяли: картинки нет. Остальных значков в ответе нет."""
+    result, now = {}, time.time()
+    for key, entry in _read_cache(BADGE_IMAGES_FILE).items():
+        if isinstance(entry, str):
+            entry = {"url": entry}
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("none"):
+            if now - entry["none"] < BADGE_NONE_TTL:
+                result[key] = {"path": None, "title": entry.get("title") or ""}
+            continue
+        path = _badge_file(entry.get("url"))
+        if path and os.path.exists(path):
+            result[key] = {"path": path, "title": entry.get("title") or ""}
+    return result
+
+
 def badge_info(steam_id, appid, foil=False):
     """Свой значок игры: {"path" (картинка в cache/badges или None), "title" (название значка или "")}.
     Адрес картинки и название — со страницы значка (неофициально), запоминаются; картинка — только с сервера
@@ -5573,7 +5628,7 @@ def badge_info(steam_id, appid, foil=False):
     if isinstance(entry, str):  # до названий здесь хранился только адрес картинки
         entry = {"url": entry}
     if isinstance(entry, dict) and entry.get("none") and time.time() - entry["none"] < BADGE_NONE_TTL:
-        return {"path": None, "title": ""}  # у этого значка нет своей страницы — недавно проверяли
+        return {"path": None, "title": entry.get("title") or ""}  # страницы или картинки нет — недавно проверяли
     if not isinstance(entry, dict) or "title" not in entry:
         try:
             response = requests.get(STEAM_BADGE_URL.format(steam_id=steam_id, appid=appid),
@@ -5603,17 +5658,16 @@ def badge_info(steam_id, appid, foil=False):
         if not match:
             log.info("Картинка значка игры %s на странице не нашлась (картинок предметов на странице: %d, "
                      "размер страницы %d)", appid, page.count("/images/items/"), len(page))
-            return {"path": None, "title": entry["title"]}  # не запоминаем — в следующий раз попробуем снова
+            # Запоминаем, как и значок без страницы: иначе страница читалась бы заново при каждом запуске
+            entry = {"none": int(time.time()), "title": entry["title"]}
         known[key] = entry
         os.makedirs(CACHE_DIR, exist_ok=True)
         save_json(BADGE_IMAGES_FILE, known)
     url = entry.get("url") or ""
     result = {"path": None, "title": entry.get("title") or ""}
-    host = urlsplit(url).hostname or ""
-    if not any(host == h or host.endswith("." + h) for h in _BADGE_IMAGE_HOSTS):
+    path = _badge_file(url)
+    if not path:
         return result
-    name = hashlib.sha1(url.encode("utf-8")).hexdigest() + os.path.splitext(urlsplit(url).path)[1]
-    path = os.path.join(BADGE_IMAGES_DIR, name)
     if os.path.exists(path):
         return dict(result, path=path)
     try:
@@ -5695,16 +5749,32 @@ def parse_set_artwork(page, appid):
     result = {}
     calls = re.findall(r"GameCardArtDialog\(\s*(['\"])((?:(?!\1)[^\\]|\\.)*)\1\s*,\s*(['\"])([^'\"]+)\3", page)
     for _, name, _, link in calls:
-        name = re.sub(r"\\(.)", r"\1", name)
+        name = _js_unescape(name)
         if _is_artwork_url(link.strip(), appid):
             result[_card_title(name)] = link.strip()
     return result, len(calls)
 
 
+def _js_unescape(text):
+    """Строка из JavaScript — как есть: русские имена Steam пишет кодами \\u0413…"""
+    def one(match):
+        code = match.group(1) or match.group(2)
+        return chr(int(code, 16)) if code else match.group(3)
+    return re.sub(r"\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})|\\(.)", one, text)
+
+
+ARTWORK_CACHE_VERSION = 2  # 2: русские имена карточек раскодированы верно; старые записи перечитываются
+
+
+def _artwork_entry(known, appid, foil):
+    entry = known.get(f"{int(appid)}{'f' if foil else ''}")
+    return entry if isinstance(entry, dict) and entry.get("v") == ARTWORK_CACHE_VERSION else {}
+
+
 def has_set_artwork(appid, foil):
     """Иллюстрации набора уже запомнены — со страницы значка ничего читать не нужно. Только чтение кэша."""
-    entry = _read_cache(CARD_ARTWORK_FILE).get(f"{int(appid)}{'f' if foil else ''}")
-    return isinstance(entry, dict) and bool(entry.get("cards"))
+    entry = _artwork_entry(_read_cache(CARD_ARTWORK_FILE), appid, foil)
+    return bool(entry.get("cards"))
 
 
 def remember_set_artwork(appid, foil, cards):
@@ -5714,7 +5784,8 @@ def remember_set_artwork(appid, foil, cards):
     if not cards:
         return 0
     known = _read_cache(CARD_ARTWORK_FILE)
-    known[f"{int(appid)}{'f' if foil else ''}"] = {"cards": cards, "time": int(time.time())}
+    known[f"{int(appid)}{'f' if foil else ''}"] = {"v": ARTWORK_CACHE_VERSION, "cards": cards,
+                                                    "time": int(time.time())}
     os.makedirs(CACHE_DIR, exist_ok=True)
     save_json(CARD_ARTWORK_FILE, known)
     return len(cards)
@@ -5728,7 +5799,7 @@ def card_artwork(card, appid, steam_id):
     if not _is_artwork_url(url, appid):
         set_key = f"{appid}{'f' if card.get('foil') else ''}"
         known = _read_cache(CARD_ARTWORK_FILE)
-        entry = known.get(set_key) if isinstance(known.get(set_key), dict) else {}
+        entry = _artwork_entry(known, appid, card.get("foil"))
         title = _card_title(card.get("name"))
         url = (entry.get("cards") or {}).get(title) or ""
         # Пустой ответ не запоминаем: страницу спросим снова при следующем щелчке
