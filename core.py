@@ -2936,6 +2936,80 @@ class RouletteList:
         self._keys = {self._key(r) for r in self.removed}
 
 
+# --- Экспорт для телефона -----------------------------------------------------------
+# Один файл JSON для Backlog Roulette на Android: игры, порты и дисковые игры, коллекции, кто убран из рулетки
+# и что она крутит, жанры, годы и оценки для фильтров. Без ключей, SteamID, путей к папкам и файлам запуска
+# (в путях бывает имя пользователя Windows) — только названия, номера и ссылки на GitHub. Файлы программы
+# только читаются: повреждённый не откладывается в сторону, а просто пропускается.
+PHONE_EXPORT_FORMAT = "backlog-roulette-export"
+PHONE_EXPORT_VERSION = 1
+
+
+def _read_json_file(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return default
+    return data if isinstance(data, type(default)) else default
+
+
+def _plain_int(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _export_port(port, kind):
+    item = {"id": str(port["id"]), "name": str(port["name"]), "kind": kind,
+            "appid": _plain_int(port.get("appid")), "added": _plain_int(port.get("added"))}
+    if kind == "port":
+        latest = port.get("latest") if isinstance(port.get("latest"), dict) else {}
+        about = port.get("about") if isinstance(port.get("about"), dict) else {}
+        item.update(repo=parse_github_repo(port.get("repo") or "") or "",
+                    installed_tag=str(port.get("installed_tag") or ""),
+                    latest={"tag": str(latest.get("tag") or ""), "url": str(latest.get("url") or ""),
+                            "published": str(latest.get("published") or "")} if latest.get("tag") else None,
+                    description=str(about.get("description") or "")[:500])
+    return item
+
+
+def phone_export(app_version=""):
+    """Всё для телефона одним словарём (формат — в начале раздела)."""
+    games = [{"name": str(g["name"]), "appid": _plain_int(g.get("appid"))}
+             for g in _read_json_file(GAMES_FILE, []) if isinstance(g, dict) and g.get("name")]
+    ports = [_export_port(p, kind) for path, kind in ((PORTS_FILE, "port"), (DISCS_FILE, "disc"))
+             for p in _read_json_file(path, []) if isinstance(p, dict) and p.get("id") and p.get("name")]
+    collections = []
+    for item in _read_json_file(COLLECTIONS_FILE, {}).get("collections") or []:
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and isinstance(item.get("name"), str):
+            collections.append({"id": item["id"], "name": item["name"][:COLLECTION_NAME_MAX],
+                                "items": [r for r in item.get("items") or [] if CollectionLibrary._valid_ref(r)],
+                                "created": _plain_int(item.get("created"))})
+    removed = [r for r in _read_json_file(ROULETTE_FILE, {}).get("removed") or [] if CollectionLibrary._valid_ref(r)]
+    settings = load_settings()
+    meta, steam_meta = {}, load_steam_meta()
+    for game in games:
+        entry = steam_meta.get(str(game["appid"])) if game["appid"] else None
+        if entry:
+            meta[str(game["appid"])] = {"genres": list(entry.get("genres") or []), "year": meta_year(entry),
+                                        "percent": entry.get("percent")}
+    return {"format": PHONE_EXPORT_FORMAT, "version": PHONE_EXPORT_VERSION, "app": app_version,
+            "exported": int(time.time()), "games": games, "ports": ports, "collections": collections,
+            "roulette": {"removed": removed, "pool": str(settings.get("roulette_pool") or "steam"),
+                         "filters": settings.get("roulette_filters") or {}},
+            "meta": meta}
+
+
+def save_phone_export(path, app_version=""):
+    """Записать файл для телефона. Возвращает {"games", "ports", "discs", "collections"} — сколько чего."""
+    data = phone_export(app_version)
+    save_json(path, data)
+    counts = {"games": len(data["games"]), "ports": sum(p["kind"] == "port" for p in data["ports"]),
+              "discs": sum(p["kind"] == "disc" for p in data["ports"]), "collections": len(data["collections"])}
+    log.info("Экспорт для телефона: игр %d, портов %d, дисковых %d, коллекций %d — %s", counts["games"],
+             counts["ports"], counts["discs"], counts["collections"], os.path.basename(path))
+    return counts
+
+
 # --- Другой вариант картинки из SteamGridDB --------------------------------------
 # «Обложка из SteamGridDB» в меню и кнопки «Фон ›» и «Логотип ›» в шапке страницы игры берут из SteamGridDB
 # следующий вариант при каждом нажатии, по кругу. Обложки — только 600×900, как остальные на барабане

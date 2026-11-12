@@ -150,7 +150,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.6.0.1"
+__version__ = "2.6.1"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -10812,9 +10812,35 @@ class SettingsPage(QWidget):
         browser.add(links_hint)
         browser.add(store_logout, 0, Qt.AlignLeft)
         browser.add(store_hint)
-        for section in (update, keys_section, sound_section, shots_section, look, translate, browser):
+        # Файл для Backlog Roulette на Android: без ключей, SteamID и путей к папкам
+        phone_button = PushButton("Экспорт для телефона…", self, FIF.SAVE)
+        phone_button.clicked.connect(self.export_for_phone)
+        phone_hint = CaptionLabel("Игры, порты и дисковые игры, коллекции и список рулетки — одним файлом для "
+                                  "Backlog Roulette на Android. Перенесите его на телефон (Telegram, облако, кабель) "
+                                  "и откройте в приложении: «Настройки» → «Импорт с ПК». Ключей, SteamID и путей к "
+                                  "папкам в файле нет.", self)
+        phone_hint.setWordWrap(True)
+        phone = SettingsSection(fluent_icon("PHONE", FIF.SHARE), "Телефон", content)
+        phone.add(phone_button, 0, Qt.AlignLeft)
+        phone.add(phone_hint)
+        for section in (update, keys_section, sound_section, shots_section, look, translate, browser, phone):
             layout.addWidget(section)
         layout.addStretch(1)
+
+    def export_for_phone(self):
+        folder = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation) or core.BASE_DIR
+        path, _ = QFileDialog.getSaveFileName(self.win, "Экспорт для телефона",
+                                              os.path.join(folder, "BacklogRoulette-export.json"), "JSON (*.json)")
+        if not path:
+            return
+        try:
+            counts = core.save_phone_export(path, __version__)
+        except OSError as e:
+            notify("error", self.win, "Файл не сохранился", str(e))
+            return
+        notify("success", self.win, "Файл для телефона готов",
+               f"Игр Steam: {counts['games']}, портов: {counts['ports']}, дисковых: {counts['discs']}, "
+               f"коллекций: {counts['collections']}. Перенесите {os.path.basename(path)} на телефон.", duration=8000)
 
     # --- Снимки экрана ---
     def _shots_status(self, text, warning=False):
