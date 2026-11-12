@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Разрешений пока нет никаких — даже интернета: каркас ничего не скачивает. -->
+<!-- Интернет — только для обложек с сервера картинок Steam. Доступа ко всем файлам нет: файл с ПК
+     Android отдаёт приложению только тот, что выбрал пользователь. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:allowBackup="false"
