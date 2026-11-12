@@ -3,6 +3,7 @@ package io.github.byredfox.backlogroulette.data
 import android.content.Context
 import android.net.Uri
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.Dispatchers
@@ -16,7 +17,8 @@ import java.io.InputStream
 /**
  * Данные приложения во внутренней папке (другим приложениям недоступна):
  * library.json — последний импортированный файл с ПК как есть, state.json — что изменили на телефоне
- * (убранные из рулетки, что крутит рулетка). Повторный импорт заменяет library.json, а state.json остаётся.
+ * (убранные из рулетки, какую коллекцию крутить, фильтры, подкачка обложек). Повторный импорт заменяет
+ * library.json, а state.json остаётся.
  */
 class LibraryStore(context: Context) {
     private val app = context.applicationContext
@@ -27,15 +29,28 @@ class LibraryStore(context: Context) {
         private set
     var removedHere by mutableStateOf<Set<GameRef>>(emptySet())
         private set
-    var pool by mutableStateOf<String?>(null) // null — как на ПК
+    var pool by mutableStateOf<String?>(null) // null — все игры Steam, иначе "col:<id>" — коллекция
+        private set
+    var filters by mutableStateOf(RouletteFilters())
+        private set
+    private var filtersSaved = false // фильтры уже меняли на телефоне — импорт их не трогает
+    var prefetchOn by mutableStateOf(true)
         private set
     var message by mutableStateOf<String?>(null) // для уведомления внизу экрана
     var picked by mutableStateOf<Game?>(null) // что выпало — остаётся, пока переключаются разделы
+    var coversDone by mutableIntStateOf(0) // подкачка обложек: сколько уже на телефоне
+    var coversTotal by mutableIntStateOf(0)
+    var coversWaiting by mutableStateOf(false) // ждёт Wi-Fi
 
-    val activePool: String get() = pool ?: library?.pool ?: "steam"
+    val inCollection: Boolean get() = pool != null
 
     suspend fun load() = withContext(Dispatchers.IO) {
-        val state = readState()
+        val state = try {
+            stateFile.takeIf { it.exists() }?.let { JSONObject(it.readText()) }
+        } catch (e: Exception) {
+            AppLog.warning("state.json не прочитался: ${e.message}")
+            null
+        }
         val loaded = try {
             libraryFile.takeIf { it.exists() }?.let { ExportParser.parse(it.readText()) }
         } catch (e: Exception) {
@@ -43,8 +58,16 @@ class LibraryStore(context: Context) {
             null
         }
         withContext(Dispatchers.Main) {
-            removedHere = state.first
-            pool = state.second
+            if (state != null) {
+                removedHere = state.objects("removed").mapNotNull(ExportParser::parseRef).toSet()
+                pool = state.str("pool").takeIf { it.startsWith(COLLECTION_POOL) }
+                filtersSaved = state.has("filters")
+                filters = if (filtersSaved) RouletteFilters.fromJson(state.optJSONObject("filters"))
+                else loaded?.filters ?: RouletteFilters()
+                prefetchOn = state.optBoolean("prefetch", true)
+            } else {
+                filters = loaded?.filters ?: RouletteFilters()
+            }
             library = loaded
         }
         loaded?.let { AppLog.info("Данные с ПК: игр ${it.games.size}, коллекций ${it.collections.size}") }
@@ -57,8 +80,8 @@ class LibraryStore(context: Context) {
             val text = bytes.toString(Charsets.UTF_8)
             val parsed = ExportParser.parse(text)
             writeAtomic(libraryFile, text)
-            AppLog.info("Импорт с ПК: Steam ${parsed.count(Game.KIND_STEAM)}, портов ${parsed.count(Game.KIND_PORT)}, " +
-                "дисковых ${parsed.count(Game.KIND_DISC)}, коллекций ${parsed.collections.size}")
+            AppLog.info("Импорт с ПК: игр Steam ${parsed.games.size}, коллекций ${parsed.collections.size}, " +
+                "сведений для фильтров ${parsed.meta.size}")
             parsed
         } catch (e: ImportError) {
             AppLog.warning("Импорт с ПК не получился: ${e.message}")
@@ -71,7 +94,8 @@ class LibraryStore(context: Context) {
         }
         withContext(Dispatchers.Main) {
             library = result
-            if (pool?.startsWith(COLLECTION_POOL) == true && result.collections.none { "$COLLECTION_POOL${it.id}" == pool }) {
+            if (!filtersSaved) filters = result.filters
+            if (pool != null && result.collections.none { "$COLLECTION_POOL${it.id}" == pool }) {
                 pool = null // крутили коллекцию, которой больше нет
             }
             message = "Готово: игр ${result.games.size}, коллекций ${result.collections.size}"
@@ -79,37 +103,40 @@ class LibraryStore(context: Context) {
     }
 
     /** Игры, которые крутит рулетка сейчас. */
-    fun poolGames(): List<Game> {
+    fun poolGames(): List<Game> = poolGames(filters)
+
+    fun poolGames(using: RouletteFilters): List<Game> {
         val lib = library ?: return emptyList()
-        val current = activePool
-        if (current.startsWith(COLLECTION_POOL)) {
+        collection()?.let { collection ->
             // В коллекции крутятся и убранные из рулетки — как на ПК
-            val collection = lib.collections.firstOrNull { it.id == current.removePrefix(COLLECTION_POOL) }
-            return collection?.items?.mapNotNull(lib::find)?.distinct().orEmpty()
+            return collection.items.mapNotNull(lib::find).distinct()
         }
-        val kinds = current.split("+").mapNotNull { SOURCE_KINDS[it] }.toSet()
-        return lib.games.filter { it.kind in kinds && !lib.isRemoved(it, removedHere) }
+        return lib.games.filter { !lib.isRemoved(it, removedHere) && using.matches(lib.meta(it)) }
     }
 
-    fun poolTitle(): String {
-        val current = activePool
-        if (current.startsWith(COLLECTION_POOL)) {
-            val name = library?.collections?.firstOrNull { it.id == current.removePrefix(COLLECTION_POOL) }?.name
-            return "Коллекция «${name ?: "?"}»"
-        }
-        return current.split("+").mapNotNull { SOURCE_TITLES[it] }.joinToString(" + ").ifEmpty { "Ничего не выбрано" }
-    }
+    fun collection(): GameCollection? =
+        pool?.let { current -> library?.collections?.firstOrNull { "$COLLECTION_POOL${it.id}" == current } }
+
+    fun poolTitle(): String = collection()?.let { "Коллекция «${it.name}»" } ?: "Steam"
 
     fun choosePool(value: String?) {
         pool = value
         saveState()
-        AppLog.info("Рулетка крутит: ${value ?: "как на ПК"}")
+        AppLog.info("Рулетка крутит: ${value ?: "все игры Steam"}")
     }
 
-    fun toggleSource(source: String) {
-        val current = activePool.takeUnless { it.startsWith(COLLECTION_POOL) }?.split("+")?.toMutableSet() ?: mutableSetOf()
-        if (!current.add(source)) current.remove(source)
-        choosePool(SOURCE_TITLES.keys.filter { it in current }.joinToString("+"))
+    fun chooseFilters(value: RouletteFilters) {
+        if (value == filters && filtersSaved) return
+        filters = value
+        filtersSaved = true
+        saveState()
+        AppLog.info("Фильтры рулетки: жанры ${value.genres.size}, годы ${value.yearFrom ?: "…"}–${value.yearTo ?: "…"}, " +
+            "отзывы от ${value.reviews} %")
+    }
+
+    fun choosePrefetch(on: Boolean) {
+        prefetchOn = on
+        saveState()
     }
 
     fun removeFromRoulette(game: Game) {
@@ -126,25 +153,17 @@ class LibraryStore(context: Context) {
         picked = null
         removedHere = emptySet()
         pool = null
+        filters = RouletteFilters()
+        filtersSaved = false
         AppLog.info("Данные с ПК удалены с телефона")
-    }
-
-    private fun readState(): Pair<Set<GameRef>, String?> = try {
-        if (!stateFile.exists()) {
-            emptySet<GameRef>() to null
-        } else {
-            val root = JSONObject(stateFile.readText())
-            root.objects("removed").mapNotNull(ExportParser::parseRef).toSet() to root.str("pool").ifEmpty { null }
-        }
-    } catch (e: Exception) {
-        AppLog.warning("state.json не прочитался: ${e.message}")
-        emptySet<GameRef>() to null
     }
 
     private fun saveState() {
         val root = JSONObject()
         root.put("removed", JSONArray().apply { removedHere.forEach { put(it.toJson()) } })
         pool?.let { root.put("pool", it) }
+        if (filtersSaved) root.put("filters", filters.toJson())
+        root.put("prefetch", prefetchOn)
         try {
             writeAtomic(stateFile, root.toString(2))
         } catch (e: Exception) {
@@ -156,8 +175,6 @@ class LibraryStore(context: Context) {
     companion object {
         const val COLLECTION_POOL = "col:"
         private const val MAX_IMPORT_BYTES = 20 * 1024 * 1024
-        val SOURCE_KINDS = mapOf("steam" to Game.KIND_STEAM, "ports" to Game.KIND_PORT, "discs" to Game.KIND_DISC)
-        val SOURCE_TITLES = linkedMapOf("steam" to "Steam", "ports" to "Порты", "discs" to "Дисковые")
 
         private fun readLimited(input: InputStream): ByteArray {
             val out = ByteArrayOutputStream()

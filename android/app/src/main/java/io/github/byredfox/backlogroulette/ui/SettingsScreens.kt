@@ -20,6 +20,7 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -60,14 +61,14 @@ fun SettingsScreen(store: LibraryStore, onImport: () -> Unit) {
                 val from = if (library.appVersion.isNotEmpty()) ", Backlog Roulette ${library.appVersion}" else ""
                 Text("Файл от $date$from")
                 Text(
-                    "Steam: ${library.count(Game.KIND_STEAM)} · порты: ${library.count(Game.KIND_PORT)} · " +
-                        "дисковые: ${library.count(Game.KIND_DISC)} · коллекций: ${library.collections.size}",
+                    "Игр Steam: ${library.games.size} · коллекций: ${library.collections.size}",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
             Text(
                 "На ПК: «Настройки» → «Телефон» → «Экспорт для телефона…». Новый импорт заменяет данные, а игры, " +
-                    "убранные из рулетки на телефоне, остаются убранными.",
+                    "убранные из рулетки на телефоне, остаются убранными. Порты и дисковые игры на телефоне пока " +
+                    "не показываются.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -79,21 +80,25 @@ fun SettingsScreen(store: LibraryStore, onImport: () -> Unit) {
             }
         }
         if (library != null) {
-            SettingsCard("Что крутит рулетка") {
-                val pool = store.activePool
-                val inCollection = pool.startsWith(LibraryStore.COLLECTION_POOL)
-                val sources = if (inCollection) emptySet() else pool.split("+").toSet()
-                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    LibraryStore.SOURCE_TITLES.forEach { (key, title) ->
-                        FilterChip(selected = key in sources, onClick = { store.toggleSource(key) }, label = { Text(title) })
-                    }
+            SettingsCard("Обложки") {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Подкачивать по Wi-Fi", modifier = Modifier.weight(1f))
+                    Switch(checked = store.prefetchOn, onCheckedChange = store::choosePrefetch)
                 }
-                if (inCollection) {
-                    Text("Сейчас крутится ${store.poolTitle().replaceFirstChar { it.lowercase() }}.")
+                val status = when {
+                    store.coversTotal == 0 -> ""
+                    store.coversDone >= store.coversTotal -> "Все обложки на телефоне: ${store.coversTotal}"
+                    store.coversWaiting -> "На телефоне ${store.coversDone} из ${store.coversTotal} — остальные ждут Wi-Fi"
+                    store.prefetchOn -> "Скачиваю: ${store.coversDone} из ${store.coversTotal}"
+                    else -> "На телефоне ${store.coversDone} из ${store.coversTotal}"
                 }
-                if (store.pool != null) {
-                    TextButton(onClick = { store.choosePool(null) }) { Text("Как на ПК") }
-                }
+                if (status.isNotEmpty()) Text(status, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    "Обложки игр — с сервера картинок Steam, около 80 КБ каждая. В фоне они качаются только по Wi-Fi " +
+                        "и только пока приложение открыто; без неё обложка скачивается, когда игра попадается на глаза.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
@@ -157,8 +162,8 @@ fun AboutScreen() {
         Text("Версия для Android ${BuildConfig.VERSION_NAME} — пробная сборка")
         Text("Рандомайзер «Во что сыграть дальше?». Лицензия GNU GPL v3.")
         Text(
-            "Приложение берёт из интернета только обложки игр с сервера картинок Steam. Данные с ПК хранятся " +
-                "только на этом телефоне.",
+            "Из интернета приложение берёт обложки игр с сервера картинок Steam, а встроенный браузер открывает " +
+                "только те сайты, на которые вы перешли сами. Данные с ПК хранятся только на этом телефоне.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

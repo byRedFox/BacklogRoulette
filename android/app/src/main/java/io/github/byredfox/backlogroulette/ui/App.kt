@@ -9,9 +9,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
-import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
@@ -29,6 +29,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -38,13 +39,15 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import io.github.byredfox.backlogroulette.data.Covers
 import io.github.byredfox.backlogroulette.data.LibraryStore
 import kotlinx.coroutines.launch
 
-/** Разделы в нижней панели — как в меню программы на ПК. */
+/** Разделы в нижней панели. Порты и дисковые игры на телефоне пока не показываются. */
 enum class Section(val title: String, val icon: ImageVector) {
     ROULETTE("Рулетка", Icons.Filled.Refresh),
-    PORTS("Порты", Icons.Filled.Build),
+    GAMES("Игры Steam", Icons.Filled.PlayArrow),
     COLLECTIONS("Коллекции", Icons.AutoMirrored.Filled.List),
     BROWSER("Браузер", Icons.Filled.Search),
 }
@@ -66,14 +69,26 @@ fun App(store: LibraryStore) {
     val opened = extra
     BackHandler(enabled = opened != null) { extra = null } // «назад» со служебного экрана — к разделу
 
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     // Файл с ПК — через системный выбор файла: приложение получает только этот файл, без доступа к остальным
     val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) scope.launch { store.import(uri) }
     }
     val startImport = { importer.launch(arrayOf("application/json", "application/octet-stream", "text/*")) }
+    // Браузер живёт, пока открыто приложение: переключились на другой раздел и обратно — та же страница
+    val browser = remember { BrowserHolder(context) }
+    DisposableEffect(Unit) { onDispose { browser.destroy() } }
+    val openInBrowser = { url: String ->
+        browser.open(url)
+        extra = null
+        section = Section.BROWSER
+    }
 
     LaunchedEffect(Unit) { store.load() }
+    LaunchedEffect(store.library, store.prefetchOn) {
+        if (store.library != null && store.prefetchOn) Covers.prefetchAll(context, store)
+    }
     val snackbar = remember { SnackbarHostState() }
     val message = store.message
     LaunchedEffect(message) {
@@ -134,11 +149,11 @@ fun App(store: LibraryStore) {
                 opened == Extra.ABOUT -> AboutScreen()
                 opened == Extra.SETTINGS -> SettingsScreen(store, startImport)
                 opened == Extra.LOGS -> LogsScreen()
-                section == Section.ROULETTE -> RouletteScreen(store, startImport)
-                section == Section.PORTS -> PortsScreen(store, startImport)
+                section == Section.ROULETTE -> RouletteScreen(store, startImport, openInBrowser)
+                section == Section.GAMES -> GamesScreen(store, startImport, openInBrowser)
                 section == Section.COLLECTIONS ->
                     CollectionsScreen(store, startImport, onSpin = { section = Section.ROULETTE })
-                else -> Placeholder("«${section.title}» — скоро здесь")
+                else -> BrowserScreen(browser)
             }
         }
     }
