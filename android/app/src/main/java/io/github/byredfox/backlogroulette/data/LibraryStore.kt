@@ -100,7 +100,7 @@ class LibraryStore(context: Context) {
         return current.split("+").mapNotNull { SOURCE_TITLES[it] }.joinToString(" + ").ifEmpty { "Ничего не выбрано" }
     }
 
-    fun setPool(value: String?) {
+    fun choosePool(value: String?) {
         pool = value
         saveState()
         AppLog.info("Рулетка крутит: ${value ?: "как на ПК"}")
@@ -109,7 +109,7 @@ class LibraryStore(context: Context) {
     fun toggleSource(source: String) {
         val current = activePool.takeUnless { it.startsWith(COLLECTION_POOL) }?.split("+")?.toMutableSet() ?: mutableSetOf()
         if (!current.add(source)) current.remove(source)
-        setPool(SOURCE_TITLES.keys.filter { it in current }.joinToString("+"))
+        choosePool(SOURCE_TITLES.keys.filter { it in current }.joinToString("+"))
     }
 
     fun removeFromRoulette(game: Game) {

@@ -92,7 +92,7 @@ fun SettingsScreen(store: LibraryStore, onImport: () -> Unit) {
                     Text("Сейчас крутится ${store.poolTitle().replaceFirstChar { it.lowercase() }}.")
                 }
                 if (store.pool != null) {
-                    TextButton(onClick = { store.setPool(null) }) { Text("Как на ПК") }
+                    TextButton(onClick = { store.choosePool(null) }) { Text("Как на ПК") }
                 }
             }
         }

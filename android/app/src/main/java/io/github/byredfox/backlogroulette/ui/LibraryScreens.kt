@@ -129,7 +129,7 @@ fun CollectionsScreen(store: LibraryStore, onImport: () -> Unit, onSpin: () -> U
         ) {
             Text(opened.name, style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
             FilledTonalButton(
-                onClick = { store.setPool(LibraryStore.COLLECTION_POOL + opened.id); onSpin() },
+                onClick = { store.choosePool(LibraryStore.COLLECTION_POOL + opened.id); onSpin() },
                 enabled = games.isNotEmpty(),
             ) { Text("Крутить её") }
         }

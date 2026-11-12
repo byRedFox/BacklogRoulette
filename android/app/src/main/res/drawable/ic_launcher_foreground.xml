@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Передний слой значка — icon.png программы (кубик BR), чуть с отступом: лаунчер обрезает края слоя
+<!-- Передний слой значка — icon.png программы (кубик BR), уменьшенный: лаунчер обрезает края слоя
      под свою форму (круг, «сквиркл»), и кубик в центре остаётся целым -->
 <inset xmlns:android="http://schemas.android.com/apk/res/android"
     android:drawable="@drawable/ic_launcher_art"
-    android:inset="3%" />
+    android:inset="12dp" />
