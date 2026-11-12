@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Тема окна до появления интерфейса Compose (на миг при запуске). Остальное оформление — в Theme.kt -->
+    <style name="Theme.BacklogRoulette" parent="android:Theme.Material.Light.NoActionBar" />
+
+    <color name="ic_launcher_background">#0F8C82</color>
+</resources>
