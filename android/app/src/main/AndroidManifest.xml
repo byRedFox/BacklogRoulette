@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Интернет — для обложек (серверы картинок Steam, SteamGridDB со своим ключом) и встроенного браузера.
+<!-- Интернет — для обложек (серверы картинок Steam, SteamGridDB со своим ключом). Встроенного браузера нет:
+     ссылки открываются в браузере телефона или в приложении Steam.
      Состояние сети — чтобы качать обложки в фоне только по Wi-Fi. Фоновая служба и уведомление — чтобы подкачка
      обложек шла и при погасшем экране, с ходом загрузки в шторке (уведомления Android 13+ спрашивает отдельно,
      без них подкачка тоже идёт). Доступа ко всем файлам нет: файл с ПК Android отдаёт приложению только тот,
@@ -12,6 +13,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Страницы Steam — в приложении Steam, если оно стоит. Android сообщает только о нём одном -->
+    <queries>
+        <package android:name="com.valvesoftware.android.steam.community" />
+    </queries>
 
     <application
         android:name=".BacklogApp"

@@ -60,6 +60,7 @@ import io.github.byredfox.backlogroulette.data.CoverUrls
 import io.github.byredfox.backlogroulette.data.Covers
 import io.github.byredfox.backlogroulette.data.Game
 import io.github.byredfox.backlogroulette.data.LibraryStore
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -75,7 +76,13 @@ private const val SIDE = 3 // по столько карточек слева и
 private val SPIN_EASING = CubicBezierEasing(0.12f, 0.65f, 0.08f, 1f) // быстрый разгон, долгое торможение
 
 @Composable
-fun RouletteScreen(store: LibraryStore, onImport: () -> Unit, onOpenUrl: (String) -> Unit) {
+fun RouletteScreen(
+    store: LibraryStore,
+    onImport: () -> Unit,
+    onOpenUrl: (String) -> Unit,
+    spinPending: Boolean = false,
+    onSpinStarted: () -> Unit = {},
+) {
     val library = store.library
     if (library == null) {
         EmptyLibrary(onImport)
@@ -112,7 +119,7 @@ fun RouletteScreen(store: LibraryStore, onImport: () -> Unit, onOpenUrl: (String
     }
 
     fun spin() = scope.launch {
-        if (pool.isEmpty()) return@launch
+        if (pool.isEmpty() || spinning) return@launch
         spinning = true
         val start = position.value.roundToInt().coerceIn(0, max(0, strip.lastIndex))
         val keep = strip.subList(max(0, start - SIDE), min(strip.size, start + SIDE + 1)) // видимое не прыгает
@@ -125,6 +132,14 @@ fun RouletteScreen(store: LibraryStore, onImport: () -> Unit, onOpenUrl: (String
         store.picked = result
         spinning = false
         AppLog.info("Рулетка: «${result.name}»")
+    }
+
+    // Нажали логотип сверху: рулетка появляется и, дав себя рассмотреть, крутится сама
+    LaunchedEffect(spinPending) {
+        if (!spinPending) return@LaunchedEffect
+        delay(350)
+        spin() // прокрут идёт в своей корутине — сброс флага ниже его не остановит
+        onSpinStarted()
     }
 
     val centerGame = strip.getOrNull(position.value.roundToInt())

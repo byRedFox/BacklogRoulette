@@ -9,6 +9,7 @@ import io.github.byredfox.backlogroulette.data.AppLog
 import io.github.byredfox.backlogroulette.data.CoverUrls
 import io.github.byredfox.backlogroulette.data.LibraryStore
 import io.github.byredfox.backlogroulette.data.SteamGridKey
+import io.github.byredfox.backlogroulette.data.UiPrefs
 import okio.Path.Companion.toOkioPath
 
 /** Общее на всё приложение: данные с ПК нужны и экрану, и подкачке обложек в фоне (она идёт и без экрана). */
@@ -20,6 +21,7 @@ class BacklogApp : Application(), SingletonImageLoader.Factory {
         AppLog.init(filesDir)
         CoverUrls.init(filesDir)
         SteamGridKey.init(filesDir)
+        UiPrefs.init(this)
     }
 
     // Кэш обложек на диске — 512 МБ: по умолчанию он не больше 250 МБ, а библиотека в 800+ игр туда не влезает

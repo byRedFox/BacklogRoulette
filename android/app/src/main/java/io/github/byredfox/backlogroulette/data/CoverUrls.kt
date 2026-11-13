@@ -51,6 +51,9 @@ object CoverUrls {
     // Без фигурных скобок в выражении: регулярные выражения Android (ICU) не принимают «}» без экранирования
     private val SAFE_PATH = Regex("[A-Za-z0-9_./?=&-]+")
     private val SAFE_NAME = Regex("[A-Za-z0-9_.-]+")
+    // Регион магазина — страна из настроек телефона (две латинские буквы), иначе США
+    private val homeCountry: String =
+        java.util.Locale.getDefault().country.uppercase().takeIf { it.matches(Regex("[A-Z]{2}")) } ?: "US"
 
     // Ступени: 0 — старый адрес (не хранится), 1 — вертикальная из магазина, 2 — шапка, 3 — ничего нет,
     // 4 — вертикальная из SteamGridDB. grid — когда спрашивали SteamGridDB (0 — ещё нет).
@@ -176,7 +179,11 @@ object CoverUrls {
         val found = mutableMapOf<Int, Entry>()
         for (part in ids.chunked(BATCH)) {
             val items = try {
-                storeItems(part)
+                // Сначала магазин своего региона, а чего там нет — магазин США: игра, которой нет в одном
+                // регионе, не снята с продажи, и у неё есть обложка
+                val local = storeItems(part, homeCountry)
+                val rest = part.filter { it !in local }
+                if (rest.isNotEmpty() && homeCountry != "US") local + storeItems(rest, "US") else local
             } catch (e: Exception) {
                 AppLog.warning("Магазин Steam не ответил, где обложки ${part.size} игр: ${e.message}")
                 continue // в следующий раз спросим снова
@@ -284,10 +291,10 @@ object CoverUrls {
     }
 
     /** {appid: (вертикальная обложка или null, шапка или null)} — только для игр, которые магазин знает. */
-    private fun storeItems(appids: List<Int>): Map<Int, Pair<String?, String?>> {
+    private fun storeItems(appids: List<Int>, country: String): Map<Int, Pair<String?, String?>> {
         val query = JSONObject()
             .put("ids", JSONArray().apply { appids.forEach { put(JSONObject().put("appid", it)) } })
-            .put("context", JSONObject().put("language", "russian").put("country_code", "US"))
+            .put("context", JSONObject().put("language", "russian").put("country_code", country))
             .put("data_request", JSONObject().put("include_assets", true))
         val connection = URL(ITEMS_URL + "?input_json=" + URLEncoder.encode(query.toString(), "UTF-8"))
             .openConnection() as HttpURLConnection

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Кубик 24 dp — значок уведомления о подкачке и вкладки «Рулетка». Тот же кубик, что в одноцветном значке
+     приложения, но во весь размер: там он занимает середину круга 108 dp, и в шторке выходил крошечным -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="54"
+    android:viewportHeight="54">
+    <group
+        android:translateX="-27"
+        android:translateY="-27">
+        <group
+            android:pivotX="54"
+            android:pivotY="54"
+            android:rotation="-12">
+            <path
+                android:fillColor="#FFFFFFFF"
+                android:fillType="evenOdd"
+                android:pathData="M42,32 h24 a10,10 0 0 1 10,10 v24 a10,10 0 0 1 -10,10 h-24 a10,10 0 0 1 -10,-10 v-24 a10,10 0 0 1 10,-10 z
+                    M39.5,43 a3.5,3.5 0 1,0 7,0 a3.5,3.5 0 1,0 -7,0 z
+                    M61.5,43 a3.5,3.5 0 1,0 7,0 a3.5,3.5 0 1,0 -7,0 z
+                    M39.5,65 a3.5,3.5 0 1,0 7,0 a3.5,3.5 0 1,0 -7,0 z
+                    M61.5,65 a3.5,3.5 0 1,0 7,0 a3.5,3.5 0 1,0 -7,0 z
+                    M50.5,54 a3.5,3.5 0 1,0 7,0 a3.5,3.5 0 1,0 -7,0 z" />
+        </group>
+    </group>
+</vector>

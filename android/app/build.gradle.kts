@@ -19,8 +19,8 @@ android {
         applicationId = "io.github.byredfox.backlogroulette"
         minSdk = 26 // Android 8 — ставится и на старые телефоны
         targetSdk = 36 // Android 16
-        versionCode = 6 // растёт с каждой сборкой для телефона: меньший номер Android поверх не поставит
-        versionName = "0.4.0"
+        versionCode = 7 // растёт с каждой сборкой для телефона: меньший номер Android поверх не поставит
+        versionName = "0.5.0"
     }
 
     signingConfigs {

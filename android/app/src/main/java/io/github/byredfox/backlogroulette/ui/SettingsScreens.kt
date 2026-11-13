@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -24,6 +25,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -54,6 +56,7 @@ import io.github.byredfox.backlogroulette.data.CoverUrls
 import io.github.byredfox.backlogroulette.data.Covers
 import io.github.byredfox.backlogroulette.data.LibraryStore
 import io.github.byredfox.backlogroulette.data.SteamGridKey
+import io.github.byredfox.backlogroulette.data.UiPrefs
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -94,6 +97,23 @@ fun SettingsScreen(store: LibraryStore, onImport: () -> Unit, onOpenUrl: (String
                     OutlinedButton(onClick = { confirmClear = true }) { Text("Удалить с телефона") }
                 }
             }
+        }
+        SettingsCard("Оформление") {
+            Text("Тема", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                UiPrefs.Theme.entries.forEach { theme ->
+                    FilterChip(
+                        selected = UiPrefs.theme == theme,
+                        onClick = { UiPrefs.chooseTheme(theme) },
+                        label = { Text(theme.title) },
+                    )
+                }
+            }
+            Text(
+                "Системная — светлая или тёмная, как весь телефон. Цвета — из обоев (Material You).",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
         if (library != null) {
             // Кому не нашлось вертикальной обложки — по тому, что уже выяснили (обновляется на ходу)
@@ -318,23 +338,69 @@ fun LogsScreen() {
 }
 
 @Composable
-fun AboutScreen() {
-    val links = LocalUriHandler.current
+fun AboutScreen(onOpenUrl: (String) -> Unit) {
     Column(
-        Modifier.fillMaxSize().padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Text("Backlog Roulette", style = MaterialTheme.typography.headlineSmall)
-        Text("Версия для Android ${BuildConfig.VERSION_NAME} — пробная сборка")
-        Text("Рандомайзер «Во что сыграть дальше?». Лицензия GNU GPL v3.")
-        Text(
-            "Из интернета приложение берёт обложки игр с серверов картинок Steam (и SteamGridDB, если вы добавили " +
-                "свой ключ), а встроенный браузер открывает только те сайты, на которые вы перешли сами. Данные с ПК " +
-                "хранятся только на этом телефоне.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        TextButton(onClick = { links.openUri(GITHUB_URL) }) { Text("Проект на GitHub") }
+        Column(
+            Modifier.fillMaxWidth().padding(top = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            AppLogo(Modifier.size(96.dp))
+            Text("Backlog Roulette", style = MaterialTheme.typography.headlineSmall)
+            Text(
+                "Версия для Android ${BuildConfig.VERSION_NAME} — пробная сборка",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "Рандомайзер «Во что сыграть дальше?» для вашей библиотеки Steam",
+                textAlign = TextAlign.Center,
+            )
+        }
+        SettingsCard("Что умеет") {
+            listOf(
+                "Рулетка с обложками: лента быстро прокручивается и плавно тормозит, с вибрацией на каждой " +
+                    "карточке. Одна игра не выпадает два раза подряд",
+                "Фильтры рулетки: жанры, год выхода и отзывы в Steam",
+                "«Игры Steam» — коллаж из обложек во весь экран и поиск",
+                "Коллекции с ПК — и рулетка любой из них",
+                "Обложки Steam, а для игр без вертикальной — из SteamGridDB (со своим ключом). Подкачка в фоне по Wi-Fi",
+                "Игры и коллекции переносятся с ПК одним файлом: «Настройки» → «Телефон» → «Экспорт для телефона…»",
+            ).forEach { line ->
+                Text("•  $line", style = MaterialTheme.typography.bodyMedium)
+            }
+        }
+        SettingsCard("Автор") {
+            Text("Sergey Tsepa (byRedFox), © 2026", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                "Программа свободная и распространяется по лицензии GNU GPL v3: её можно использовать, изменять и " +
+                    "распространять, сохраняя ту же лицензию и указание автора.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilledTonalButton(onClick = { onOpenUrl(GITHUB_URL) }) { Text("Проект на GitHub") }
+                OutlinedButton(onClick = { onOpenUrl(ISSUES_URL) }) { Text("Сообщить об ошибке") }
+                OutlinedButton(onClick = { onOpenUrl(AUTHOR_URL) }) { Text("byRedFox") }
+            }
+        }
+        SettingsCard("Данные и безопасность") {
+            Text(
+                "Из интернета приложение берёт только обложки игр — с серверов картинок Steam и SteamGridDB (если вы " +
+                    "добавили свой ключ). Ссылки открываются в браузере телефона или в приложении Steam. Данные с ПК и " +
+                    "ключ хранятся только на этом телефоне, в копии Android не попадают. Логина и пароля Steam " +
+                    "приложение не знает.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "Steam — торговая марка Valve Corporation. Backlog Roulette не связан с Valve и не одобрен ею.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 

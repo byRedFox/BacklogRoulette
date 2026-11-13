@@ -54,7 +54,7 @@ class CoverWorker(context: Context, params: WorkerParameters) : CoroutineWorker(
             PendingIntent.FLAG_IMMUTABLE,
         )
         val notification = NotificationCompat.Builder(applicationContext, CHANNEL)
-            .setSmallIcon(R.drawable.ic_launcher_monochrome)
+            .setSmallIcon(R.drawable.ic_die)
             .setContentTitle("Качаю обложки")
             .setContentText(if (total > 0) "На телефоне $done из $total" else "Готовлюсь")
             .setProgress(total, done, total == 0)

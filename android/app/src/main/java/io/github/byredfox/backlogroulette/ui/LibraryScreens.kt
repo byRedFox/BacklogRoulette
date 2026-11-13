@@ -30,9 +30,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
+import io.github.byredfox.backlogroulette.R
 import io.github.byredfox.backlogroulette.data.Game
 import io.github.byredfox.backlogroulette.data.LibraryStore
 
@@ -53,7 +55,7 @@ fun CollectionsScreen(store: LibraryStore, onImport: () -> Unit, onSpin: () -> U
                 ListItem(
                     headlineContent = { Text(collection.name) },
                     supportingContent = { Text("игр Steam: ${collection.items.count { library.find(it) != null }}") },
-                    leadingContent = { Icon(Icons.AutoMirrored.Filled.List, contentDescription = null) },
+                    leadingContent = { Icon(painterResource(R.drawable.ic_folder), contentDescription = null) },
                     trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null) },
                     modifier = Modifier.clickable { openId = collection.id },
                 )
