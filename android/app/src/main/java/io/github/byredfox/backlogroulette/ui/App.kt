@@ -86,8 +86,9 @@ fun App(store: LibraryStore) {
     }
 
     LaunchedEffect(Unit) { store.load() }
+    // Подкачка обложек — фоновой задачей: идёт и со свёрнутым приложением, и при погасшем экране
     LaunchedEffect(store.library, store.prefetchOn) {
-        if (store.library != null && store.prefetchOn) Covers.prefetchAll(context, store)
+        if (store.library != null && store.prefetchOn) Covers.schedule(context, store)
     }
     val snackbar = remember { SnackbarHostState() }
     val message = store.message
@@ -147,7 +148,7 @@ fun App(store: LibraryStore) {
         Box(Modifier.padding(padding).fillMaxSize()) {
             when {
                 opened == Extra.ABOUT -> AboutScreen()
-                opened == Extra.SETTINGS -> SettingsScreen(store, startImport)
+                opened == Extra.SETTINGS -> SettingsScreen(store, startImport, openInBrowser)
                 opened == Extra.LOGS -> LogsScreen()
                 section == Section.ROULETTE -> RouletteScreen(store, startImport, openInBrowser)
                 section == Section.GAMES -> GamesScreen(store, startImport, openInBrowser)

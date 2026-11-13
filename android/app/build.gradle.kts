@@ -19,8 +19,8 @@ android {
         applicationId = "io.github.byredfox.backlogroulette"
         minSdk = 26 // Android 8 — ставится и на старые телефоны
         targetSdk = 36 // Android 16
-        versionCode = 5 // растёт с каждой сборкой для телефона: меньший номер Android поверх не поставит
-        versionName = "0.3.2"
+        versionCode = 6 // растёт с каждой сборкой для телефона: меньший номер Android поверх не поставит
+        versionName = "0.4.0"
     }
 
     signingConfigs {
@@ -76,4 +76,6 @@ dependencies {
     // Обложки: загрузка и кэш картинок (только с серверов картинок Steam — адреса программа собирает сама)
     implementation("io.coil-kt.coil3:coil-compose:3.2.0")
     implementation("io.coil-kt.coil3:coil-network-okhttp:3.2.0")
+    // Подкачка обложек в фоне: продолжается при погасшем экране, ждёт Wi-Fi, переживает перезапуск телефона
+    implementation("androidx.work:work-runtime-ktx:2.10.1")
 }

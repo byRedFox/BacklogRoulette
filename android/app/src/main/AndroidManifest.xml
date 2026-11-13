@@ -1,13 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Интернет — для обложек с сервера картинок Steam и встроенного браузера. Состояние сети — чтобы качать
-     обложки в фоне только по Wi-Fi. Доступа ко всем файлам нет: файл с ПК Android отдаёт приложению только
-     тот, что выбрал пользователь. -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<!-- Интернет — для обложек (серверы картинок Steam, SteamGridDB со своим ключом) и встроенного браузера.
+     Состояние сети — чтобы качать обложки в фоне только по Wi-Fi. Фоновая служба и уведомление — чтобы подкачка
+     обложек шла и при погасшем экране, с ходом загрузки в шторке (уведомления Android 13+ спрашивает отдельно,
+     без них подкачка тоже идёт). Доступа ко всем файлам нет: файл с ПК Android отдаёт приложению только тот,
+     что выбрал пользователь. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
+        android:name=".BacklogApp"
         android:allowBackup="false"
         android:enableOnBackInvokedCallback="true"
         android:icon="@mipmap/ic_launcher"
@@ -24,5 +31,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Служба WorkManager для подкачки обложек: тип «синхронизация данных», как требует Android 14+ -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge" />
     </application>
 </manifest>

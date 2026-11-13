@@ -7,6 +7,8 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -45,7 +47,18 @@ class LibraryStore(context: Context) {
 
     val inCollection: Boolean get() = pool != null
 
-    suspend fun load() = withContext(Dispatchers.IO) {
+    private val loadLock = Mutex()
+    private var loadDone = false
+
+    /** Прочитать сохранённое. Один раз: зовут и экран, и подкачка обложек в фоне — кто первый. */
+    suspend fun load() = loadLock.withLock {
+        if (!loadDone) {
+            readSaved()
+            loadDone = true
+        }
+    }
+
+    private suspend fun readSaved() = withContext(Dispatchers.IO) {
         val state = try {
             stateFile.takeIf { it.exists() }?.let { JSONObject(it.readText()) }
         } catch (e: Exception) {
@@ -100,6 +113,7 @@ class LibraryStore(context: Context) {
                 pool = null // крутили коллекцию, которой больше нет
             }
             message = "Готово: игр ${result.games.size}, коллекций ${result.collections.size}"
+            if (prefetchOn) Covers.schedule(app, this@LibraryStore, replace = true) // новые игры — сразу в подкачку
         }
     }
 
@@ -138,6 +152,11 @@ class LibraryStore(context: Context) {
     fun choosePrefetch(on: Boolean) {
         prefetchOn = on
         saveState()
+        if (on) {
+            if (library != null) Covers.schedule(app, this)
+        } else {
+            Covers.cancel(app)
+        }
     }
 
     fun removeFromRoulette(game: Game) {
@@ -148,9 +167,13 @@ class LibraryStore(context: Context) {
     }
 
     fun clear() {
+        Covers.cancel(app)
         libraryFile.delete()
         stateFile.delete()
         library = null
+        coversTotal = 0
+        coversDone = 0
+        coversMissing = 0
         picked = null
         removedHere = emptySet()
         pool = null
