@@ -38,8 +38,17 @@ object CoverUrls {
     private const val ITEMS_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/"
     private const val NONE_TTL = 7L * 24 * 3600 * 1000
     private const val BATCH = 100
-    private val SAFE_FORMAT = Regex("""[A-Za-z0-9_./-]+\$\{FILENAME}[A-Za-z0-9_.?=&-]*""")
-    private val SAFE_NAME = Regex("""[A-Za-z0-9_.-]+""")
+    private const val PLACEHOLDER = "\${FILENAME}" // в адресе-шаблоне магазина — место для имени файла
+    // Без фигурных скобок в выражении: регулярные выражения Android (ICU) не принимают «}» без экранирования
+    private val SAFE_PATH = Regex("[A-Za-z0-9_./?=&-]+")
+    private val SAFE_NAME = Regex("[A-Za-z0-9_.-]+")
+
+    /** Шаблон адреса из ответа магазина годится: одно место для имени, остальное — обычный путь, без «..». */
+    private fun safeFormat(format: String): Boolean {
+        val parts = format.split(PLACEHOLDER)
+        return parts.size == 2 && parts[0].isNotEmpty() && ".." !in format &&
+            parts.all { it.isEmpty() || SAFE_PATH.matches(it) }
+    }
 
     // Ступени: 0 — старый адрес (не хранится), 1 — вертикальная из магазина, 2 — шапка, 3 — ничего нет
     private data class Entry(val stage: Int, val url: String?, val time: Long)
@@ -153,11 +162,11 @@ object CoverUrls {
             val appid = item.positiveInt("appid") ?: item.positiveInt("id") ?: return@forEach
             if (item.optInt("success") != 1) return@forEach
             val assets = item.optJSONObject("assets") ?: JSONObject()
-            val format = assets.str("asset_url_format").takeIf { SAFE_FORMAT.matches(it) && ".." !in it }
+            val format = assets.str("asset_url_format").takeIf(::safeFormat)
             fun asset(vararg names: String): String? {
                 format ?: return null
                 val name = names.map { assets.str(it) }.firstOrNull { SAFE_NAME.matches(it) } ?: return null
-                return ASSETS + format.replace("\${FILENAME}", name)
+                return ASSETS + format.replace(PLACEHOLDER, name)
             }
             result[appid] = asset("library_capsule_2x", "library_capsule") to asset("header")
         }
