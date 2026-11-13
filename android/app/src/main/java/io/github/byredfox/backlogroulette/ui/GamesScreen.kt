@@ -7,7 +7,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -29,8 +29,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import io.github.byredfox.backlogroulette.data.Game
 import io.github.byredfox.backlogroulette.data.LibraryStore
@@ -86,10 +88,17 @@ fun GamesScreen(store: LibraryStore, onImport: () -> Unit, onOpenUrl: (String) -
             onDismissRequest = { opened = null },
             title = { Text(game.name) },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Cover(game, Modifier.height(300.dp).aspectRatio(2f / 3f))
+                // Обложка — по центру окна, во всю его ширину (но не выше 360 dp), подпись — под ней по центру
+                Column(
+                    Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Cover(game, Modifier.heightIn(max = 360.dp).aspectRatio(2f / 3f))
                     val details = gameDetails(library.meta(game))
-                    if (details.isNotEmpty()) Text(details, style = MaterialTheme.typography.bodyMedium)
+                    if (details.isNotEmpty()) {
+                        Text(details, style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
+                    }
                     if (removed) {
                         Text("Убрана из рулетки", color = MaterialTheme.colorScheme.error,
                             style = MaterialTheme.typography.bodySmall)

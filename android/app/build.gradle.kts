@@ -6,6 +6,11 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// Постоянный ключ подписи — только на GitHub: файл ключа из секрета BR_KEYSTORE_BASE64 сборка кладёт во временную
+// папку и передаёт путь и пароль через переменные окружения. В репозитории ключа нет. Одна и та же подпись —
+// чтобы новая версия ставилась поверх прежней, с данными.
+val keystorePath: String? = System.getenv("BR_KEYSTORE_PATH")
+
 android {
     namespace = "io.github.byredfox.backlogroulette"
     compileSdk = 36
@@ -14,13 +19,25 @@ android {
         applicationId = "io.github.byredfox.backlogroulette"
         minSdk = 26 // Android 8 — ставится и на старые телефоны
         targetSdk = 36 // Android 16
-        versionCode = 4
-        versionName = "0.3.1"
+        versionCode = 5 // растёт с каждой сборкой для телефона: меньший номер Android поверх не поставит
+        versionName = "0.3.2"
+    }
+
+    signingConfigs {
+        create("release") {
+            if (keystorePath != null) {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("BR_KEYSTORE_PASSWORD")
+                keyAlias = "backlogroulette"
+                keyPassword = System.getenv("BR_KEYSTORE_PASSWORD") // в ключе PKCS12 пароль один
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = if (keystorePath != null) signingConfigs.getByName("release") else null
         }
     }
 
@@ -32,6 +49,10 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+
+    lint {
+        checkReleaseBuilds = false // проверку кода (lint) запустим отдельно, когда дойдём до релизов
     }
 }
 
@@ -52,7 +73,7 @@ dependencies {
     implementation("androidx.compose.material:material-icons-core")
     implementation("androidx.compose.ui:ui-tooling-preview")
     debugImplementation("androidx.compose.ui:ui-tooling")
-    // Обложки: загрузка и кэш картинок (только с сервера картинок Steam — адреса программа собирает сама)
+    // Обложки: загрузка и кэш картинок (только с серверов картинок Steam — адреса программа собирает сама)
     implementation("io.coil-kt.coil3:coil-compose:3.2.0")
     implementation("io.coil-kt.coil3:coil-network-okhttp:3.2.0")
 }

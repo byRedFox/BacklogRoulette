@@ -1,5 +1,8 @@
 # Сборка Android-приложения на GitHub: при каждом push в ветку android (если менялась папка android)
 # и по кнопке «Run workflow». Готовый APK — во вкладке Actions → сборка → Artifacts.
+# Подпись — постоянным ключом из секретов репозитория (Settings → Secrets and variables → Actions):
+#   BR_KEYSTORE_BASE64 — файл ключа в base64, BR_KEYSTORE_PASSWORD — его пароль.
+# Без них сборка останавливается: неподписанный APK не установить, а другой подписью — не обновить.
 name: Android
 
 on:
@@ -28,18 +31,38 @@ jobs:
         with:
           gradle-version: "8.14.2"
 
+      - name: Ключ подписи
+        env:
+          KEYSTORE_BASE64: ${{ secrets.BR_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.BR_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
+            echo "::error::Нет секретов BR_KEYSTORE_BASE64 и BR_KEYSTORE_PASSWORD — см. начало android.yml"
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "BR_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
       - name: Собрать APK
         working-directory: android
-        run: gradle assembleDebug --no-daemon --stacktrace
+        env:
+          BR_KEYSTORE_PASSWORD: ${{ secrets.BR_KEYSTORE_PASSWORD }}
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Убрать ключ
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks"
 
       - name: Контрольная сумма
-        working-directory: android/app/build/outputs/apk/debug
-        run: sha256sum *.apk | tee SHA256SUMS.txt
+        working-directory: android/app/build/outputs/apk/release
+        run: |
+          mv app-release.apk BacklogRoulette-android.apk
+          sha256sum BacklogRoulette-android.apk | tee SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v5
         with:
-          name: BacklogRoulette-android-debug
+          name: BacklogRoulette-android
           path: |
-            android/app/build/outputs/apk/debug/*.apk
-            android/app/build/outputs/apk/debug/SHA256SUMS.txt
+            android/app/build/outputs/apk/release/BacklogRoulette-android.apk
+            android/app/build/outputs/apk/release/SHA256SUMS.txt
           retention-days: 14
