@@ -26,10 +26,6 @@ data class Game(val kind: String, val name: String, val appid: Int? = null, val 
     val refs: List<GameRef>
         get() = if (kind == KIND_STEAM && appid != null) listOf(ref, GameRef(KIND_STEAM, name = name)) else listOf(ref)
 
-    /** Вертикальная обложка Steam — только по номеру игры, адрес собирается здесь. */
-    val coverUrl: String?
-        get() = appid?.let { "https://cdn.cloudflare.steamstatic.com/steam/apps/$it/library_600x900.jpg" }
-
     val storeUrl: String?
         get() = appid?.let { "https://store.steampowered.com/app/$it/" }
 

@@ -85,17 +85,25 @@ fun SettingsScreen(store: LibraryStore, onImport: () -> Unit) {
                     Text("Подкачивать по Wi-Fi", modifier = Modifier.weight(1f))
                     Switch(checked = store.prefetchOn, onCheckedChange = store::choosePrefetch)
                 }
+                val total = store.coversTotal
+                val have = store.coversDone
+                val none = store.coversMissing
                 val status = when {
-                    store.coversTotal == 0 -> ""
-                    store.coversDone >= store.coversTotal -> "Все обложки на телефоне: ${store.coversTotal}"
-                    store.coversWaiting -> "На телефоне ${store.coversDone} из ${store.coversTotal} — остальные ждут Wi-Fi"
-                    store.prefetchOn -> "Скачиваю: ${store.coversDone} из ${store.coversTotal}"
-                    else -> "На телефоне ${store.coversDone} из ${store.coversTotal}"
+                    total == 0 -> ""
+                    have + none >= total -> "Обложки на телефоне: $have из $total"
+                    store.coversWaiting -> "На телефоне $have из $total — остальные ждут Wi-Fi"
+                    store.prefetchOn -> "Скачиваю: $have из $total"
+                    else -> "На телефоне $have из $total"
                 }
                 if (status.isNotEmpty()) Text(status, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (none > 0) {
+                    Text("Нет ни обложки, ни шапки в Steam: $none — у таких игр видно название",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
                 Text(
-                    "Обложки игр — с сервера картинок Steam, около 80 КБ каждая. В фоне они качаются только по Wi-Fi " +
-                        "и только пока приложение открыто; без неё обложка скачивается, когда игра попадается на глаза.",
+                    "Обложки игр — с серверов картинок Steam, около 80 КБ каждая. Нет вертикальной — показывается " +
+                        "шапка игры. В фоне обложки качаются только по Wi-Fi и только пока приложение открыто; без " +
+                        "подкачки обложка скачивается, когда игра попадается на глаза.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

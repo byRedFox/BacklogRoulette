@@ -41,6 +41,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
@@ -53,7 +54,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import coil3.compose.AsyncImage
+import coil3.compose.AsyncImagePainter
 import io.github.byredfox.backlogroulette.data.AppLog
+import io.github.byredfox.backlogroulette.data.CoverUrls
 import io.github.byredfox.backlogroulette.data.Covers
 import io.github.byredfox.backlogroulette.data.Game
 import io.github.byredfox.backlogroulette.data.LibraryStore
@@ -258,7 +261,8 @@ fun gameDetails(meta: io.github.byredfox.backlogroulette.data.GameMeta?): String
     ).joinToString(" · ")
 }
 
-/** Обложка игры 2:3; нет обложки (Steam её не отдал или ещё качается) — название на цветной карточке. */
+/** Обложка игры 2:3. Вертикальной нет — шапка игры на размытой себе же; нет ничего (или ещё качается) —
+ *  название на цветной карточке. Где брать картинку — CoverUrls. */
 @Composable
 fun Cover(game: Game?, modifier: Modifier = Modifier, small: Boolean = false) {
     Card(modifier, shape = if (small) MaterialTheme.shapes.medium else MaterialTheme.shapes.extraLarge) {
@@ -278,14 +282,37 @@ fun Cover(game: Game?, modifier: Modifier = Modifier, small: Boolean = false) {
                 textAlign = TextAlign.Center,
                 modifier = Modifier.padding(if (small) 6.dp else 20.dp),
             )
-            game?.let { g ->
-                g.coverUrl?.let { url ->
-                    AsyncImage(
+            if (game != null) {
+                val cover = CoverUrls.cover(game)
+                val url = cover.url
+                val onError = { state: AsyncImagePainter.State.Error ->
+                    if (CoverUrls.isMissing(state.result.throwable)) CoverUrls.failed(game, url)
+                }
+                when {
+                    url == null -> Unit
+                    cover.kind == CoverUrls.Kind.PORTRAIT -> AsyncImage(
                         model = url,
-                        contentDescription = g.name,
+                        contentDescription = game.name,
                         contentScale = ContentScale.Crop,
+                        onError = onError,
                         modifier = Modifier.fillMaxSize(),
                     )
+                    else -> {
+                        // Шапка 460×215 — по центру, а вокруг она же, растянутая и размытая
+                        AsyncImage(
+                            model = url,
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize().blur(if (small) 10.dp else 28.dp),
+                        )
+                        AsyncImage(
+                            model = url,
+                            contentDescription = game.name,
+                            contentScale = ContentScale.FillWidth,
+                            onError = onError,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
             }
         }

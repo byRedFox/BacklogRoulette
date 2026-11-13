@@ -38,7 +38,8 @@ class LibraryStore(context: Context) {
         private set
     var message by mutableStateOf<String?>(null) // для уведомления внизу экрана
     var picked by mutableStateOf<Game?>(null) // что выпало — остаётся, пока переключаются разделы
-    var coversDone by mutableIntStateOf(0) // подкачка обложек: сколько уже на телефоне
+    var coversDone by mutableIntStateOf(0) // подкачка обложек: у скольких картинка уже на телефоне
+    var coversMissing by mutableIntStateOf(0) // у скольких её нет нигде в Steam
     var coversTotal by mutableIntStateOf(0)
     var coversWaiting by mutableStateOf(false) // ждёт Wi-Fi
 

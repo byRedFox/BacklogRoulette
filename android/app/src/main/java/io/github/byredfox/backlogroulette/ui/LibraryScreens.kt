@@ -82,24 +82,8 @@ fun CollectionsScreen(store: LibraryStore, onImport: () -> Unit, onSpin: () -> U
     }
 }
 
-/** Маленькая обложка в списке; нет обложки — первая буква названия. */
+/** Маленькая обложка в списке. */
 @Composable
 private fun Thumb(game: Game) {
-    Surface(
-        color = MaterialTheme.colorScheme.secondaryContainer,
-        shape = RoundedCornerShape(6.dp),
-        modifier = Modifier.size(width = 40.dp, height = 60.dp),
-    ) {
-        Box(contentAlignment = Alignment.Center) {
-            Text(game.name.take(1), style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
-            game.coverUrl?.let { url ->
-                AsyncImage(
-                    model = url,
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize(),
-                )
-            }
-        }
-    }
+    Cover(game, Modifier.size(width = 40.dp, height = 60.dp), small = true)
 }

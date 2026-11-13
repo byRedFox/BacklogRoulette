@@ -14,8 +14,8 @@ android {
         applicationId = "io.github.byredfox.backlogroulette"
         minSdk = 26 // Android 8 — ставится и на старые телефоны
         targetSdk = 36 // Android 16
-        versionCode = 3
-        versionName = "0.3.0"
+        versionCode = 4
+        versionName = "0.3.1"
     }
 
     buildTypes {
