@@ -134,7 +134,76 @@ DEFAULT_SETTINGS = {
     "badges_sort": 0,  # витрина значков: 0 — новые первыми, 1 — старые, 2 — А→Я, 3 — Я→А
     # Иллюстрации карточек — со страницы значка во встроенном браузере, где вы вошли в Steam: "yes" — разрешили
     "cards_artwork_login": "",
+    # Окно: крестик сворачивает в трей (по умолчанию — да, выключить можно в настройках); при запуске вместе
+    # с Windows — сразу в трей. Сам автозапуск хранится не здесь, а в автозагрузке Windows (autostart_enabled),
+    # и по умолчанию его нет
+    "close_to_tray": True,
+    "autostart_hidden": True,
+    "tray_hint_shown": False,  # подсказка «программа работает в трее» — один раз
 }
+
+
+# --- Автозапуск вместе с Windows ----------------------------------------------
+# Запись в автозагрузке текущего пользователя (HKCU\...\Run): прав администратора не нужно, другие учётные записи
+# её не видят. В «Диспетчере задач» запись можно выключить — тогда Windows помечает её в StartupApproved\Run
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_APPROVED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+AUTOSTART_NAME = "BacklogRoulette"
+AUTOSTART_ARG = "--autostart"
+
+
+def autostart_command():
+    """Команда для автозагрузки: этот .exe, а из исходников — pythonw (без чёрного окна) с этим скриптом."""
+    if getattr(sys, "frozen", False):
+        parts = [sys.executable]
+    else:
+        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        parts = [pythonw if os.path.isfile(pythonw) else sys.executable,
+                 os.path.join(BASE_DIR, "MySteamRandomApp.py")]
+    return " ".join(f'"{part}"' for part in parts) + " " + AUTOSTART_ARG
+
+
+def autostart_enabled():
+    """Программа запустится вместе с Windows: запись есть, ведёт на эту копию программы (папку могли перенести)
+    и не выключена в «Диспетчере задач»."""
+    if sys.platform != "win32":
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as key:
+            value, _kind = winreg.QueryValueEx(key, AUTOSTART_NAME)
+    except OSError:
+        return False
+    if not isinstance(value, str) or value.strip().casefold() != autostart_command().casefold():
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_APPROVED_KEY) as key:
+            approved, _kind = winreg.QueryValueEx(key, AUTOSTART_NAME)
+    except OSError:
+        return True  # отметки нет — запись включена
+    return not (isinstance(approved, bytes) and approved and approved[0] & 1)  # 03 … — выключена вручную
+
+
+def set_autostart(enabled):
+    """Добавить программу в автозагрузку Windows или убрать оттуда."""
+    if sys.platform != "win32":
+        raise OSError("автозапуск есть только в Windows")
+    import winreg
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as key:
+        if enabled:
+            winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ, autostart_command())
+        else:
+            try:
+                winreg.DeleteValue(key, AUTOSTART_NAME)
+            except FileNotFoundError:
+                pass
+    # Отметку «выключено в Диспетчере задач» снимаем: галочку в программе поставили сами — значит, включить
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_APPROVED_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, AUTOSTART_NAME)
+    except OSError:
+        pass
+    log.info("Автозапуск вместе с Windows: %s", "включён" if enabled else "выключен")
 
 
 def find_resource(name):
