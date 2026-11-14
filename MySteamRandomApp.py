@@ -27,10 +27,11 @@ from PySide6.QtGui import (QBrush, QColor, QCursor, QDesktopServices, QFont, QFo
                            QRadialGradient, QShortcut, QTextCharFormat, QTextCursor, QTextFormat, QTextListFormat)
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer, QSoundEffect
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFrame, QGraphicsOpacityEffect,
                                QGraphicsScene, QGraphicsView, QGridLayout, QHBoxLayout, QLabel, QLayout,
-                               QListView, QListWidget, QListWidgetItem, QSizePolicy, QStyle, QStyledItemDelegate,
-                               QStackedWidget, QVBoxLayout, QWidget)
+                               QListView, QListWidget, QListWidgetItem, QMenu, QSizePolicy, QStyle,
+                               QStyledItemDelegate, QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget)
 from qfluentwidgets import (Action, BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon as FIF, InfoBar,
                             IndeterminateProgressBar, InfoBarPosition, LineEdit, ListWidget, MessageBox,
                             MessageBoxBase, RadioButton,
@@ -150,7 +151,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.6.1"
+__version__ = "2.6.2"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -10534,10 +10535,10 @@ class SettingsPage(QWidget):
             ("SteamID64", self.steam_id_edit, "17 цифр, например 7656119…; проще — «Войти через Steam»"),
         ]
         for row, (label, edit, hint) in enumerate(rows):
-            edit.setMinimumWidth(360)
+            edit.setMinimumWidth(260)  # шире — окно на половину экрана уже не вмещает строку
             keys.addWidget(BodyLabel(label, self), row * 2, 0)
             keys.addWidget(edit, row * 2, 1)
-            keys.addWidget(CaptionLabel(hint, self), row * 2 + 1, 1)
+            keys.addWidget(CaptionLabel(hint, self), row * 2 + 1, 1, 1, 2)
         keys.setColumnStretch(2, 1)
 
         # Фоновая музыка: встроенная тема или своя папка/трек. Саундтреки Steam — на своей вкладке.
@@ -10547,7 +10548,7 @@ class SettingsPage(QWidget):
             core.save_settings(music_custom=settings["music_path"])
         self.music_edit = LineEdit(self)
         self.music_edit.setReadOnly(True)
-        self.music_edit.setMinimumWidth(360)
+        self.music_edit.setMinimumWidth(260)
         builtin_button = PushButton("Встроенная тема", self, FIF.HOME)
         builtin_button.clicked.connect(self.play_builtin)
         self.custom_button = PushButton("Своя музыка", self, FIF.PLAY)
@@ -10590,7 +10591,7 @@ class SettingsPage(QWidget):
         sound.addWidget(music_buttons, 3, 1, 1, 2)
         sound.addWidget(CaptionLabel("Саундтреки Steam, громкость и плеер — на вкладке «Саундтреки». "
                                      "Пауза, треки и «вперемешку» — кнопками справа вверху на рулетке.", self),
-                        4, 1)
+                        4, 1, 1, 2)
         sound.addWidget(BodyLabel("Звуки барабана", self), 5, 0)
         sound.addWidget(self.sounds_switch, 5, 1)
         sound.setColumnStretch(2, 1)
@@ -10770,6 +10771,31 @@ class SettingsPage(QWidget):
         shots_folder = PushButton("Открыть папку снимков", self, FIF.FOLDER)
         shots_folder.clicked.connect(self.open_screenshots_folder)
 
+        # Настройки запуска: автозапуск — запись в автозагрузке Windows только для своей учётной записи,
+        # трей — значок у часов, пока окно спрятано
+        tray_ok = QSystemTrayIcon.isSystemTrayAvailable()
+        self.autostart_box = CheckBox("Запускать вместе с Windows", self)
+        self.autostart_box.toggled.connect(self.set_autostart)
+        self.autostart_hidden_box = CheckBox("При входе в Windows — сразу в трей, без окна", self)
+        self.autostart_hidden_box.setChecked(bool(settings.get("autostart_hidden", True)))
+        self.autostart_hidden_box.toggled.connect(self.set_autostart_hidden)
+        self.tray_box = CheckBox("Крестик сворачивает программу в трей, а не закрывает её", self)
+        self.tray_box.setChecked(bool(settings.get("close_to_tray", True)))
+        self.tray_box.toggled.connect(self.win.set_close_to_tray)
+        startup_hint = CaptionLabel(
+            "Автозапуск — запись в автозагрузке Windows только для вашей учётной записи, прав администратора не "
+            "нужно; выключить можно здесь или в «Диспетчере задач» → «Автозагрузка приложений». В трее программа "
+            "работает дальше: музыка играет, время в портах считается. Открыть — щелчок по значку у часов, выйти — "
+            "правый клик по нему → «Выход».", self)
+        if sys.platform != "win32":
+            self.autostart_box.setEnabled(False)
+            startup_hint.setText("Автозапуск есть только в Windows.")
+        if not tray_ok:
+            for box in (self.tray_box, self.autostart_hidden_box):
+                box.setEnabled(False)
+                box.setToolTip("В этой системе нет области уведомлений (трея)")
+        self._show_autostart()
+
         # Настроек много — кладём их в прокручиваемую область
         content = QWidget()
         scroll = ScrollArea(self)
@@ -10804,6 +10830,10 @@ class SettingsPage(QWidget):
         look = SettingsSection(fluent_icon("PALETTE", FIF.PHOTO), "Оформление", content)
         for item in (appearance, selection_row, selection_hint):
             look.add(item)
+        startup = SettingsSection(fluent_icon("POWER_BUTTON", FIF.SETTING), "Настройки запуска", content)
+        for box in (self.autostart_box, self.autostart_hidden_box, self.tray_box):
+            startup.add(box, 0, Qt.AlignLeft)
+        startup.add(startup_hint)
         translate = SettingsSection(fluent_icon("LANGUAGE", FIF.GLOBE), "Перевод описаний", content)
         for item in (translate_row, model_row, self.model_status):
             translate.add(item)
@@ -10820,12 +10850,44 @@ class SettingsPage(QWidget):
                                   "и откройте в приложении: «Настройки» → «Импорт с ПК». Ключей, SteamID и путей к "
                                   "папкам в файле нет.", self)
         phone_hint.setWordWrap(True)
-        phone = SettingsSection(fluent_icon("PHONE", FIF.SHARE), "Телефон", content)
+        # Раздел — на будущее: пока здесь только экспорт, потом появятся и другие настройки для телефона
+        phone = SettingsSection(fluent_icon("PHONE", FIF.SHARE), "Мобильное приложение", content)
         phone.add(phone_button, 0, Qt.AlignLeft)
         phone.add(phone_hint)
-        for section in (update, keys_section, sound_section, shots_section, look, translate, browser, phone):
+        for section in (update, keys_section, sound_section, shots_section, look, startup, translate, browser, phone):
             layout.addWidget(section)
         layout.addStretch(1)
+        # Подсказки — с переносом строк: без него длинная строка не даёт странице стать уже окна, и при открытии
+        # программы в окне конец текста уходит за правый край (прокрутки вбок у настроек нет)
+        for label in content.findChildren(CaptionLabel):
+            label.setWordWrap(True)
+
+    # --- Настройки запуска ---
+    def _show_autostart(self):
+        """Галочки — как есть на самом деле: запись в автозагрузке могли убрать в «Диспетчере задач»."""
+        on = core.autostart_enabled()
+        self.autostart_box.blockSignals(True)
+        self.autostart_box.setChecked(on)
+        self.autostart_box.blockSignals(False)
+        # Не прячем, а гасим: показ и скрытие строки перестраивали раздел, и на миг мелькало пустое окно
+        self.autostart_hidden_box.setEnabled(on and QSystemTrayIcon.isSystemTrayAvailable())
+
+    def set_autostart(self, on):
+        try:
+            core.set_autostart(on)
+        except OSError as e:
+            core.log.warning("Автозапуск не изменился: %s", e)
+            notify("error", self.win, "Автозапуск не изменился", str(e))
+        self._show_autostart()
+
+    def set_autostart_hidden(self, on):
+        self.win.settings["autostart_hidden"] = on
+        core.save_settings(autostart_hidden=on)
+        core.log.info("Запуск с Windows: %s", "сразу в трей" if on else "с окном")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._show_autostart()
 
     def export_for_phone(self):
         folder = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation) or core.BASE_DIR
@@ -11928,7 +11990,7 @@ def offers_word(count):
     return f"{number_text(count)} {word}"
 
 
-# --- Страница «Игры Native Port's» ------------------------------------------
+# --- Страница «Нативные ИИ порты» -------------------------------------------
 def _port_fingerprints(items):
     """Отпечатки файлов запуска для новых портов: [отпечаток или {"error": текст}]. В фоновом потоке."""
     result = []
@@ -13393,7 +13455,7 @@ class PlayTracker(QObject):
 
 
 class NativePortsPage(QWidget):
-    """Вкладка «Игры Native Port's»: порты и другие игры, которые уже стоят на ПК и запускаются своим .exe.
+    """Вкладка «Нативные ИИ порты»: порты и другие игры, которые уже стоят на ПК и запускаются своим .exe.
 
     Добавить — папкой, где у каждого порта своя папка, или по одному. Плитка с обложками, правый клик, двойной
     клик — запуск. Страница порта — по клику «Открыть страницу». Обновления проверяются на GitHub сами.
@@ -13405,7 +13467,7 @@ class NativePortsPage(QWidget):
     ROOT_SETTING = "ports_root"
     GITHUB = True
     T = {
-        "title": "Игры Native Port's",
+        "title": "Нативные ИИ порты",
         "empty_title": "Порты и игры, которые уже стоят на ПК",
         "empty_text": "Фанатские порты (Ship of Harkinian, OpenMW и другие) и любые игры, которые запускаются своим "
                       ".exe. Укажите папку, в которой у каждой игры своя папка, — программа найдёт файлы запуска. "
@@ -15469,10 +15531,17 @@ class MainWindow(FluentWindow):
     collectionsChanged = Signal()  # коллекцию создали, переименовали, удалили или поменяли в ней игры
     rouletteChanged = Signal()  # игру убрали из рулетки или сменили фильтры рулетки
 
-    def __init__(self, startup=None, updated_from=""):
+    def __init__(self, startup=None, updated_from="", start_hidden=False):
         super().__init__()
         startup = startup or Timing("окно")
         self.updated_from = updated_from  # программу только что обновили кнопкой «Обновить» — с этой версии
+        # Запуск с Windows сразу в трей: окно не показывается, а музыка и мастер Steam ждут первого показа
+        self.start_hidden = start_hidden
+        self._deferred = []
+        self.tray = None  # значок у часов — пока окно спрятано или крестик сворачивает в трей
+        self._tray_menu = None
+        self._quitting = False  # выходим по-настоящему: крестик больше не прячет окно
+        self._user_close = False  # окно закрывает крестик в заголовке, а не выход из программы
         if QWebEngineView:
             # Встроенный браузер переводит окно на отрисовку через видеокарту, и тогда прозрачные места
             # под эффектом Mica становятся чёрными: в светлой теме чернеют меню и фон страниц.
@@ -15520,7 +15589,7 @@ class MainWindow(FluentWindow):
         self.addSubInterface(self.home_page, FIF.GAME, "Рулетка")
         self.addSubInterface(self.library_page, FIF.LIBRARY, "Игры Steam")
         self.addSubInterface(self.cards_page, PolaroidIcon(), "Значки и карточки Steam")
-        self.addSubInterface(self.native_page, FIF.APPLICATION, "Игры Native Port's")
+        self.addSubInterface(self.native_page, FIF.APPLICATION, "Нативные ИИ порты")
         self.addSubInterface(self.disc_page, DISC_ICON, "Дисковые игры")
         self.addSubInterface(self.collections_page, COLLECTION_ICON, "Коллекции")
         self.addSubInterface(self.music_page, FIF.MUSIC, "Саундтреки")
@@ -15553,6 +15622,7 @@ class MainWindow(FluentWindow):
         self.setMinimumSize(780, 640)
         screen = QApplication.primaryScreen().availableGeometry()
         self.move(screen.center().x() - self.width() // 2, screen.center().y() - self.height() // 2)
+        self._hook_close_button()
 
         # Если обложки скачаны не все — сначала экран загрузки, барабан потом
         if self.covers.enqueue(self.all_games()):
@@ -15572,7 +15642,7 @@ class MainWindow(FluentWindow):
 
     def _fit_navigation(self):
         """Боковое меню — полоской значков; при наведении раскрывается поверх страницы (NavHover). Ширина
-        раскрытого меню — по самой длинной подписи, чтобы «Игры Native Port's» помещались в одну строку."""
+        раскрытого меню — по самой длинной подписи, чтобы «Найти игры на Plati.Market» помещалась в одну строку."""
         nav = self.navigationInterface
         panel = getattr(nav, "panel", None)
         if panel is None or NavigationDisplayMode is None:
@@ -15659,7 +15729,13 @@ class MainWindow(FluentWindow):
             notify("warning", self, "Список рулетки", self.roulette_message, duration=8000)
         # Жанры, годы и отзывы, которые не успели собрать в прошлый раз, — когда окно уже открылось и обложки пошли
         self.meta.schedule(8000)
-        self.set_music_enabled(bool(self.settings["music_enabled"]), save=False)
+        start_music = lambda: self.set_music_enabled(bool(self.settings["music_enabled"]), save=False)  # noqa: E731
+        if self.start_hidden:
+            self._deferred.append(start_music)  # запустились в трей — музыка с первым показом окна, не при входе
+        else:
+            start_music()
+        if self.settings.get("close_to_tray"):
+            self._ensure_tray()
         if self.home_page.stack.currentWidget() is self.home_page.reel_view:
             self.home_page.reel.play_intro()
         if core.griddb_key():
@@ -15672,7 +15748,111 @@ class MainWindow(FluentWindow):
                    f"Было: {self.updated_from}. Что нового — на странице релиза («Настройки» → «Обновление "
                    "программы»).", 8000)
         if self.needs_steam_setup():
-            QTimer.singleShot(400, self.run_steam_setup)
+            if self.start_hidden:
+                self._deferred.append(self.run_steam_setup)
+            else:
+                QTimer.singleShot(400, self.run_steam_setup)
+
+    # --- Трей и крестик ---
+    def _hook_close_button(self):
+        """Крестик в заголовке закрывает окно так же, как выход из программы (close()). Чтобы отличить нажатие
+        крестика — его можно свернуть в трей, — он сначала ставит отметку «закрывает пользователь»."""
+        button = getattr(getattr(self, "titleBar", None), "closeBtn", None)
+        if button is None:
+            return
+        try:
+            button.clicked.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        button.clicked.connect(self._close_by_user)
+
+    def _close_by_user(self):
+        self._user_close = True
+        self.close()
+
+    def _ensure_tray(self):
+        """Значок у часов: щелчок — открыть окно, правый клик — меню с «Выход». None — трея в системе нет."""
+        if self.tray is None:
+            icon = self.windowIcon()
+            if icon.isNull() or not QSystemTrayIcon.isSystemTrayAvailable():
+                return None  # без значка в трее спрятанное окно было бы не вернуть
+            tray = QSystemTrayIcon(icon, self)
+            tray.setToolTip(APP_NAME)
+            menu = QMenu()
+            menu.addAction("Открыть Backlog Roulette").triggered.connect(self.restore_from_tray)
+            menu.addSeparator()
+            menu.addAction("Выход").triggered.connect(self.quit_app)
+            tray.setContextMenu(menu)
+            tray.activated.connect(self._on_tray_activated)
+            self.tray, self._tray_menu = tray, menu  # меню держим сами: без родителя его удалил бы Python
+        self.tray.show()
+        return self.tray
+
+    def _on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.restore_from_tray()
+
+    def set_close_to_tray(self, enabled):
+        self.settings["close_to_tray"] = enabled
+        core.save_settings(close_to_tray=enabled)
+        core.log.info("Крестик: %s", "сворачивает в трей" if enabled else "закрывает программу")
+        if enabled:
+            self._ensure_tray()
+        elif self.tray is not None and self.isVisible():
+            self.tray.hide()
+
+    def hide_to_tray(self):
+        game_page = self.home_page.game_page
+        if game_page.isVisible():
+            game_page.stop_video()  # трейлер в спрятанном окне не нужен; фоновая музыка играет дальше
+        self.hide()
+        core.log.info("Окно спрятано в трей")
+        if not self.settings.get("tray_hint_shown"):
+            self.settings["tray_hint_shown"] = True
+            core.save_settings(tray_hint_shown=True)
+            self.tray.showMessage(APP_NAME, "Программа работает в трее. Открыть — щелчок по значку, выйти — "
+                                            "правый клик по нему → «Выход».",
+                                  QSystemTrayIcon.MessageIcon.Information, 6000)
+
+    def restore_from_tray(self):
+        """Окно — снова на экран: из трея, свёрнутое на панели задач или по второму запуску программы."""
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+        if self.tray is not None and not self.settings.get("close_to_tray"):
+            self.tray.hide()  # значок был нужен, только пока окно пряталось
+        if self.start_hidden:
+            self.start_hidden = False
+            core.log.info("Окно показано после запуска в трей")
+        deferred, self._deferred = self._deferred, []
+        for action in deferred:
+            QTimer.singleShot(400, action)
+
+    def quit_app(self):
+        """«Выход» в меню трея — программа закрывается совсем."""
+        self._quitting = True
+        if self.tray is not None:
+            self.tray.hide()
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        by_user = self._user_close or event.spontaneous()  # крестик, Alt+F4, «Закрыть окно» на панели задач
+        self._user_close = False
+        if by_user and not self._quitting and self.settings.get("close_to_tray") and self._ensure_tray():
+            event.ignore()
+            self.hide_to_tray()
+            return
+        self._quitting = True
+        super().closeEvent(event)
+        if event.isAccepted():
+            if self.tray is not None:
+                self.tray.hide()
+            # Программа не выходит сама, когда закрылось последнее окно (иначе спрятанное в трей окно её бы
+            # закрыло), — выходим явно
+            QTimer.singleShot(0, QApplication.quit)
 
     @staticmethod
     def needs_steam_setup():
@@ -16054,6 +16234,60 @@ class MainWindow(FluentWindow):
         self.music.set_repeat_one(repeat_one)
 
 
+class SingleInstance(QObject):
+    """Одна копия программы на папку: вторая (ярлык, когда первая в трее, или автозапуск) не открывается, а
+    показывает окно первой — две копии писали бы в одни и те же файлы. Связь — локальный канал Windows, доступный
+    только этой учётной записи; принимается одно слово «show», больше по нему ничего не передаётся."""
+
+    activated = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        owner = f"{os.environ.get('USERNAME', '')}|{os.path.normcase(core.BASE_DIR)}"
+        self.name = "BacklogRoulette-" + hashlib.sha1(owner.encode("utf-8")).hexdigest()[:16]
+        self.server = None
+
+    def forward(self):
+        """Уже открыта — попросить её показать окно. True — попросили, этой копии запускаться не нужно."""
+        socket = QLocalSocket(self)
+        socket.connectToServer(self.name)
+        if not socket.waitForConnected(500):
+            return False
+        if sys.platform == "win32":
+            try:  # запустили мы — разрешаем первой копии вывести окно поверх остальных
+                import ctypes
+                ctypes.windll.user32.AllowSetForegroundWindow(-1)
+            except (AttributeError, OSError):
+                pass
+        socket.write(b"show\n")
+        socket.waitForBytesWritten(500)
+        socket.disconnectFromServer()
+        return True
+
+    def listen(self):
+        server = QLocalServer(self)
+        server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+        if not server.listen(self.name):
+            QLocalServer.removeServer(self.name)  # остался от копии, которая закрылась аварийно
+            if not server.listen(self.name):
+                core.log.warning("Вторая копия программы не будет отдавать окно первой: %s", server.errorString())
+                return
+        server.newConnection.connect(self._on_connection)
+        self.server = server
+
+    def _on_connection(self):
+        while self.server.hasPendingConnections():
+            socket = self.server.nextPendingConnection()
+            socket.readyRead.connect(lambda s=socket: self._on_read(s))
+            socket.disconnected.connect(socket.deleteLater)
+
+    def _on_read(self, socket):
+        if bytes(socket.readAll()).strip()[:16] == b"show":
+            core.log.info("Программу запустили ещё раз — показываю окно этой копии")
+            self.activated.emit()
+        socket.disconnectFromServer()
+
+
 def install_error_hooks(window):
     """Любая непойманная ошибка пишется в лог, а пользователь видит уведомление вместо молчаливого сбоя.
 
@@ -16130,17 +16364,34 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
     app.setOrganizationName(AUTHOR)
+    instance = SingleInstance(app)
+    if instance.forward():
+        core.log.info("Программа уже открыта — показал её окно, вторая копия не запускается")
+        return
+    instance.listen()
+    # Окно может прятаться в трей — тогда закрытие последнего окна не значит выход; выходит MainWindow сама
+    app.setQuitOnLastWindowClosed(False)
     install_hang_watchdog(app)
     icon = core.find_resource(core.ICON_NAME)
     if icon:
         app.setWindowIcon(QIcon(icon))  # для главного окна и всех диалогов
     setTheme(THEMES.get(core.load_settings()["theme"], Theme.AUTO))
     startup.mark("Qt")
-    window = MainWindow(startup, updated_from)
+    autostarted = core.AUTOSTART_ARG in sys.argv[1:]
+    hidden = autostarted and bool(core.load_settings().get("autostart_hidden", True))
+    if autostarted:
+        core.log.info("Запуск вместе с Windows%s", " — сразу в трей" if hidden else "")
+    window = MainWindow(startup, updated_from, start_hidden=hidden)
     install_error_hooks(window)
+    instance.activated.connect(window.restore_from_tray)
+    app.commitDataRequest.connect(lambda *_: setattr(window, "_quitting", True))  # выход из Windows — не в трей
     app.aboutToQuit.connect(window.play_tracker.flush)  # игра ещё идёт — время до закрытия программы засчитывается
-    window.show()
-    QTimer.singleShot(0, lambda: startup.done("окно на экране"))  # сработает, когда окно уже нарисовано
+    if hidden and window._ensure_tray():
+        QTimer.singleShot(0, lambda: startup.done("в трее"))
+    else:
+        window.start_hidden = False  # трея нет — без окна программу было бы не открыть
+        window.show()
+        QTimer.singleShot(0, lambda: startup.done("окно на экране"))  # сработает, когда окно уже нарисовано
     sys.exit(app.exec())
 
 
