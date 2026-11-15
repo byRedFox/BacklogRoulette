@@ -4890,18 +4890,21 @@ def track_game_processes(folder, exe, processes, tracked):
     """Процессы игры для подсчёта времени: обновляет и возвращает tracked {номер процесса: имя файла}.
 
     Процесс игры — программа из папки игры, а ещё (если Windows не отдаёт её путь) программа с тем же именем, что
-    файл запуска, или запущенная уже найденным процессом игры. Найденный процесс считается, пока он жив — под тем
-    же номером и с тем же именем, — даже если Windows вдруг перестала отдавать его путь. Программа с тем же
-    именем, но из другой папки игрой считается, только если это тот же самый файл (другой путь к той же папке)."""
+    файл запуска. Найденный процесс считается, пока он жив — под тем же номером и с тем же именем, — даже если
+    Windows вдруг перестала отдавать его путь. Программа с тем же именем, но из другой папки игрой считается,
+    только если это тот же самый файл (другой путь к той же папке). По номеру родителя не ищем: Windows его не
+    обновляет, и давно запущенная программа, чей родитель закрылся, «становилась» ребёнком игры, получившей
+    тот же номер (так в игру попадали python.exe и сама эта программа). Себя не считаем никогда."""
     prefix = os.path.normcase(os.path.normpath(folder)).rstrip(os.sep) + os.sep
     alive = {pid: name for pid, _, name, _ in processes}
+    own = os.getpid()
     for pid, name in list(tracked.items()):
         if alive.get(pid) != name:  # закрылся (номер мог достаться другой программе — сверяем и имя)
             del tracked[pid]
     exe_name = os.path.basename(exe or "").lower()
     exe_path = os.path.join(folder, exe or "")
-    for pid, ppid, name, path in processes:
-        if pid in tracked or not pid:
+    for pid, _, name, path in processes:
+        if pid in tracked or not pid or pid == own:
             continue
         if path:
             if path.startswith(prefix):
@@ -4912,7 +4915,7 @@ def track_game_processes(folder, exe, processes, tracked):
                         tracked[pid] = name
                 except OSError:
                     pass
-        elif (exe_name and name == exe_name) or ppid in tracked:
+        elif exe_name and name == exe_name:
             tracked[pid] = name
     return tracked
 
@@ -5391,6 +5394,9 @@ def foreground_fullscreen():
     screen = info.rcMonitor
     return (rect.left <= screen.left and rect.top <= screen.top and rect.right >= screen.right
             and rect.bottom >= screen.bottom)
+
+
+def _grab(api, screen, width, height, draw):
     """Нарисовать кадр функцией draw(контекст) в картинку width×height и забрать её пиксели (BGRA сверху вниз)."""
     ctypes, gdi32 = api["ctypes"], api["gdi32"]
     memory = gdi32.CreateCompatibleDC(screen)

@@ -151,7 +151,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.6.3"
+__version__ = "2.6.4"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -5747,7 +5747,7 @@ class NotesDialog(MessageBoxBase):
             tools.addWidget(button)
         tools.addStretch(1)
         self.editor = TextEdit(self)
-        self.editor.setMinimumHeight(max(240, min(460, parent.height() - 380)))
+        self._fit_editor(False)
         self.editor.textChanged.connect(self._on_changed)
         for keys, handler in (("Ctrl+B", self._bold), ("Ctrl+I", self._italic)):
             shortcut = QShortcut(QKeySequence(keys), self.editor)
@@ -5866,6 +5866,14 @@ class NotesDialog(MessageBoxBase):
         self._show_shots(entry)
 
     # --- Снимки записи ---
+    SHOTS_RESERVE = ShotThumb.SIZE.height() + 18 + 40  # лента снимков, её заголовок и отступы
+
+    def _fit_editor(self, with_shots):
+        """Высота редактора — чтобы окно целиком влезало в программу. Есть снимки — редактор ниже на высоту их
+        ленты: иначе окну не хватает места, и лента наезжает на поле ввода."""
+        room = self.win.height() - 380 - (self.SHOTS_RESERVE if with_shots else 0)
+        self.editor.setMinimumHeight(max(140, min(460, room)))
+
     def _show_shots(self, entry):
         while self.shots_layout.count() > 1:  # последней стоит растяжка
             widget = self.shots_layout.takeAt(0).widget()
@@ -5874,6 +5882,7 @@ class NotesDialog(MessageBoxBase):
         images = (entry or {}).get("images") or []
         for widget in (self.shots_title, self.shots_folder, self.shots_scroll):
             widget.setVisible(bool(images))
+        self._fit_editor(bool(images))
         self._shot_queue = []
         if not images:
             return
