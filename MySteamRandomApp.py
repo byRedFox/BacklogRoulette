@@ -151,7 +151,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.6.2"
+__version__ = "2.6.3"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -394,13 +394,31 @@ def arrange_notices(host):
         top += notice.height() - overlap
 
 
+NOTICE_QUEUE = 5  # сколько уведомлений ждут, пока окно в трее
+
+
 def notify(kind, window, title, text="", duration=3500, action=None):
     """Уведомление по центру окна, в общем стиле программы: kind = success | info | warning | error.
     action = (подпись, функция) — кнопка в уведомлении.
 
     Открыто окно поверх программы («Добавить игру», вопрос) — уведомление встаёт поверх него, а не прячется сзади.
+
+    Окно спрятано в трей — уведомление никто не увидит, а стекло и карточка на спрятанном окне могут мигнуть
+    поверх игры. Поэтому ошибки и предупреждения ждут, пока окно откроют (не больше NOTICE_QUEUE), остальное — в лог.
     """
     host = window.window() if window is not None else None
+    if host is not None and not host.isVisible():
+        deferred = getattr(host, "_deferred", None)
+        waiting = [a for a in deferred or [] if getattr(a, "is_notice", False)]
+        later = kind in ("warning", "error") and isinstance(deferred, list) and len(waiting) < NOTICE_QUEUE
+        core.log.info("Уведомление «%s»: окно спрятано — %s", title,
+                      "покажу, когда его откроют" if later else "только в логе")
+        if later:
+            def show_later():
+                notify(kind, host, title, text, duration, action)
+            show_later.is_notice = True
+            deferred.append(show_later)
+        return
     modal = QApplication.activeModalWidget()
     if modal is not None and modal.isVisible() and modal.parentWidget() is not None \
             and modal.parentWidget().window() is host:
@@ -437,11 +455,14 @@ class FrostedGlass(QWidget):
     TINT_DARK, TINT_LIGHT = QColor(14, 14, 18, 120), QColor(250, 250, 252, 130)
 
     def __init__(self, host):
+        # Снимок — до того, как стекло появилось: иначе оно попало бы в собственный снимок. Спрятанное окно (в трее)
+        # не снимаем вовсе — его снимок рисует и ещё не готовое стекло, на этом программа падала
+        snapshot = frosted_snapshot(host) if host.isVisible() else QPixmap()
         super().__init__(host)
         self.host = host
         self.opacity = 0.0
         self.closing = False
-        self.snapshot = frosted_snapshot(host)  # до показа стекла — иначе оно попало бы в собственный снимок
+        self.snapshot = snapshot
         self.setAttribute(Qt.WA_NoMousePropagation)
         self.setGeometry(host.rect())
         self.fade = QVariantAnimation(self)
@@ -10782,16 +10803,21 @@ class SettingsPage(QWidget):
         self.tray_box = CheckBox("Крестик сворачивает программу в трей, а не закрывает её", self)
         self.tray_box.setChecked(bool(settings.get("close_to_tray", True)))
         self.tray_box.toggled.connect(self.win.set_close_to_tray)
+        self.game_tray_box = CheckBox("Пока идёт порт или дисковая игра — окно в трее, после игры — обратно", self)
+        self.game_tray_box.setChecked(bool(settings.get("hide_while_playing", True)))
+        self.game_tray_box.toggled.connect(self.set_hide_while_playing)
         startup_hint = CaptionLabel(
             "Автозапуск — запись в автозагрузке Windows только для вашей учётной записи, прав администратора не "
             "нужно; выключить можно здесь или в «Диспетчере задач» → «Автозагрузка приложений». В трее программа "
             "работает дальше: музыка играет, время в портах считается. Открыть — щелчок по значку у часов, выйти — "
-            "правый клик по нему → «Выход».", self)
+            "правый клик по нему → «Выход». Окно, спрятанное на время игры, вернётся, когда игра закроется, и "
+            "покажет, сколько наиграно; поверх игры во весь экран оно не выскакивает — ждёт, пока вы с неё уйдёте.",
+            self)
         if sys.platform != "win32":
             self.autostart_box.setEnabled(False)
             startup_hint.setText("Автозапуск есть только в Windows.")
         if not tray_ok:
-            for box in (self.tray_box, self.autostart_hidden_box):
+            for box in (self.tray_box, self.autostart_hidden_box, self.game_tray_box):
                 box.setEnabled(False)
                 box.setToolTip("В этой системе нет области уведомлений (трея)")
         self._show_autostart()
@@ -10831,7 +10857,7 @@ class SettingsPage(QWidget):
         for item in (appearance, selection_row, selection_hint):
             look.add(item)
         startup = SettingsSection(fluent_icon("POWER_BUTTON", FIF.SETTING), "Настройки запуска", content)
-        for box in (self.autostart_box, self.autostart_hidden_box, self.tray_box):
+        for box in (self.autostart_box, self.autostart_hidden_box, self.tray_box, self.game_tray_box):
             startup.add(box, 0, Qt.AlignLeft)
         startup.add(startup_hint)
         translate = SettingsSection(fluent_icon("LANGUAGE", FIF.GLOBE), "Перевод описаний", content)
@@ -10884,6 +10910,11 @@ class SettingsPage(QWidget):
         self.win.settings["autostart_hidden"] = on
         core.save_settings(autostart_hidden=on)
         core.log.info("Запуск с Windows: %s", "сразу в трей" if on else "с окном")
+
+    def set_hide_while_playing(self, on):
+        self.win.settings["hide_while_playing"] = on
+        core.save_settings(hide_while_playing=on)
+        core.log.info("На время игры: %s", "окно уходит в трей" if on else "окно остаётся")
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -13352,7 +13383,9 @@ class Screenshots(QObject):
 class PlayTracker(QObject):
     """Время в портах и дисковых играх: после запуска программа раз в несколько секунд смотрит, работает ли
     что-нибудь из папки игры. Так считается и игра, которую запустил её лаунчер (Call of Duty: Launcher.exe →
-    CoDSP.exe), и запущенная с правами администратора. Закрылась — время сессии прибавляется к игре.
+    CoDSP.exe), и запущенная с правами администратора. Найденный процесс игры программа помнит по номеру и
+    считает, пока он жив, — даже если Windows на время перестала отдавать его путь. Закрылась — время сессии
+    прибавляется к игре.
 
     Программа только читает список запущенных программ Windows — ничего в них не трогает."""
 
@@ -13390,36 +13423,55 @@ class PlayTracker(QObject):
         if self._polling or not self.sessions:
             return
         self._polling = True
-        worker = Worker(core.running_programs, parent=self)
+        worker = Worker(core.running_processes, parent=self)
         worker.finished.connect(self._on_programs)
         worker.failed.connect(self._on_failed)
         worker.start()
 
     def _on_failed(self, message):
         self._polling = False
+        # Сессии не закрываем: игра, скорее всего, идёт — просто в этот раз список не прочитался
         core.log.warning("Время в игре: список запущенных программ не прочитался: %s", message)
+        for session in self.sessions.values():
+            if session["seen"]:
+                session["last_seen"] = time.time()
 
     def _on_programs(self, programs):
         self._polling = False
         now, changed = time.time(), False
         for port_id, session in list(self.sessions.items()):
-            if core.folder_running(session["port"]["folder"], programs):
+            port = session["port"]
+            name = port["name"]
+            tracked = core.track_game_processes(port["folder"], port.get("exe"), programs,
+                                                session.setdefault("pids", {}))
+            running = sorted(set(tracked.values()))
+            if running:
                 if not session["seen"]:
                     session["seen"], session["started"] = True, now
                     changed = True  # на плитке и странице — «играете сейчас»
-                    core.log.info("Время в «%s»: игра запущена — считаю", session["port"]["name"])
+                    core.log.info("Время в «%s»: игра запущена — считаю (%s)", name, ", ".join(running))
+                    self.win.hide_for_game(name)
+                elif running != session.get("running"):
+                    # Лаунчер передал запуск игре и т. п. — по журналу видно, что программа считала игрой
+                    core.log.info("Время в «%s»: процессы игры — %s", name, ", ".join(running))
+                session["running"] = running
                 session["last_seen"] = now
             elif session["seen"] and now - session["last_seen"] > self.GAP:
+                core.log.info("Время в «%s»: процессов игры нет уже %d с (были: %s)", name,
+                              int(now - session["last_seen"]), ", ".join(session.get("running") or []) or "—")
                 self._finish(port_id)
             elif not session["seen"] and now - session["launched"] > self.START_WAIT:
                 del self.sessions[port_id]
                 core.log.info("Время в «%s» не считается: игра так и не появилась среди запущенных программ "
-                              "(возможно, её лаунчер запускает программу из другой папки)", session["port"]["name"])
+                              "(возможно, её лаунчер запускает программу из другой папки)", name)
         if not self.sessions:
             self.timer.stop()
             self.shots.sync()  # игр не идёт — клавиша снимка снова свободна для других программ
         if changed:
             self.win.portsChanged.emit()
+
+    def any_playing(self):
+        return any(session["seen"] for session in self.sessions.values())
 
     def _finish(self, port_id, closing=False):
         session = self.sessions.pop(port_id)
@@ -13430,6 +13482,8 @@ class PlayTracker(QObject):
                           port["name"], int(seconds))
             if not closing:
                 self.win.portsChanged.emit()
+                self.win.return_after_game("Игра закрылась сразу",
+                                           f"«{port['name']}» проработала {int(seconds)} с — время не засчитано.")
             return
         port["playtime"] = int((port.get("playtime") or 0) + seconds)
         port["last_played"] = int(session["started"])
@@ -13439,8 +13493,11 @@ class PlayTracker(QObject):
                       core.playtime_text(port["playtime"]))
         if not closing:
             self.win.portsChanged.emit()
-            notify("info", self.win, "Игра закрыта", f"«{port['name']}»: сыграно {core.playtime_text(seconds)}. "
-                                                     f"Всего — {core.playtime_text(port['playtime'])}.", 5000)
+            title = "Игра закрыта"
+            text = (f"«{port['name']}»: сыграно {core.playtime_text(seconds)}. "
+                    f"Всего — {core.playtime_text(port['playtime'])}.")
+            if not self.win.return_after_game(title, text):
+                notify("info", self.win, title, text, 5000)
 
     def flush(self):
         """Программу закрывают, а игра ещё идёт — время до этой минуты всё равно засчитывается."""
@@ -15542,6 +15599,13 @@ class MainWindow(FluentWindow):
         self._tray_menu = None
         self._quitting = False  # выходим по-настоящему: крестик больше не прячет окно
         self._user_close = False  # окно закрывает крестик в заголовке, а не выход из программы
+        # Окно спрятала запущенная игра (а не вы): когда игры закроются, оно вернётся само
+        self._hidden_for_game = False
+        self._game_notice = None  # что показать, когда окно вернётся: (заголовок, текст)
+        self._return_timer = QTimer(self)
+        self._return_timer.setSingleShot(True)
+        self._return_timer.setInterval(5000)
+        self._return_timer.timeout.connect(self._try_return)
         if QWebEngineView:
             # Встроенный браузер переводит окно на отрисовку через видеокарту, и тогда прозрачные места
             # под эффектом Mica становятся чёрными: в светлой теме чернеют меню и фон страниц.
@@ -15801,12 +15865,12 @@ class MainWindow(FluentWindow):
         elif self.tray is not None and self.isVisible():
             self.tray.hide()
 
-    def hide_to_tray(self):
+    def hide_to_tray(self, reason=""):
         game_page = self.home_page.game_page
         if game_page.isVisible():
             game_page.stop_video()  # трейлер в спрятанном окне не нужен; фоновая музыка играет дальше
         self.hide()
-        core.log.info("Окно спрятано в трей")
+        core.log.info("Окно спрятано в трей%s", f" — {reason}" if reason else "")
         if not self.settings.get("tray_hint_shown"):
             self.settings["tray_hint_shown"] = True
             core.save_settings(tray_hint_shown=True)
@@ -15816,6 +15880,8 @@ class MainWindow(FluentWindow):
 
     def restore_from_tray(self):
         """Окно — снова на экран: из трея, свёрнутое на панели задач или по второму запуску программы."""
+        self._hidden_for_game = False  # открыли сами — после игры возвращать уже нечего
+        self._return_timer.stop()
         if self.isMinimized():
             self.showNormal()
         else:
@@ -15830,6 +15896,62 @@ class MainWindow(FluentWindow):
         deferred, self._deferred = self._deferred, []
         for action in deferred:
             QTimer.singleShot(400, action)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._hidden_for_game = False
+        self._return_timer.stop()
+        if self._game_notice:  # сколько наиграно — как бы окно ни открыли: само после игры или щелчком по значку
+            title, text = self._game_notice
+            self._game_notice = None
+            QTimer.singleShot(600, lambda: notify("success", self, title, text, 10000))
+        # Ошибки и предупреждения, пришедшие, пока окно было спрятано, — как только оно на экране, как бы его ни открыли
+        notices = [a for a in self._deferred if getattr(a, "is_notice", False)]
+        if notices:
+            self._deferred = [a for a in self._deferred if not getattr(a, "is_notice", False)]
+            for action in notices:
+                QTimer.singleShot(400, action)
+
+    # --- Окно на время игры ---
+    def hide_for_game(self, name):
+        """Порт или дисковая игра запустилась: окно уходит в трей, пока она идёт (галочка в «Настройках запуска»).
+        Окно уже спрятано или открыт вопрос поверх него — ничего не делаем."""
+        if not self.settings.get("hide_while_playing", True) or not self.isVisible() \
+                or QApplication.activeModalWidget() is not None or self._ensure_tray() is None:
+            return
+        self.hide_to_tray(f"пока идёт «{name}»")
+        self._hidden_for_game = True
+
+    def return_after_game(self, title, text):
+        """Игра закрылась. Окно прятали на время игры — оно вернётся и покажет title/text (True); иначе False —
+        уведомление показывает сам вызвавший, как обычно."""
+        if not self._hidden_for_game:
+            return False
+        if self._game_notice:  # закрылись две игры подряд — в уведомлении обе
+            title, text = "Игры закрыты", f"{self._game_notice[1]}\n{text}"
+        self._game_notice = (title, text)
+        self._try_return()
+        return True
+
+    def _try_return(self):
+        """Вернуть окно после игры. Идёт ещё одна игра — ждём её. Впереди окно во весь экран (игра ещё идёт,
+        фильм) — проверяем раз в несколько секунд: выскакивать поверх него нельзя."""
+        if not self._hidden_for_game or self.isVisible():
+            return
+        if self.play_tracker.any_playing():
+            return  # вернёмся, когда закроется и эта игра
+        try:
+            busy = core.foreground_fullscreen()
+        except (OSError, AttributeError, ValueError) as e:
+            core.log.warning("Окно после игры: не узнать, что впереди (%s) — возвращаю", e)
+            busy = False
+        if busy:
+            if not self._return_timer.isActive():
+                core.log.info("Окно после игры: впереди окно во весь экран — вернусь, когда его уберут")
+                self._return_timer.start()
+            return
+        core.log.info("Игры закрыты — окно снова на экране")
+        self.restore_from_tray()  # сколько наиграно — покажет showEvent
 
     def quit_app(self):
         """«Выход» в меню трея — программа закрывается совсем."""

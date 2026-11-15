@@ -140,6 +140,8 @@ DEFAULT_SETTINGS = {
     "close_to_tray": True,
     "autostart_hidden": True,
     "tray_hint_shown": False,  # подсказка «программа работает в трее» — один раз
+    # Порт или дисковая игра запустилась — окно уходит в трей, закрылась — возвращается и показывает, сколько наиграно
+    "hide_while_playing": True,
 }
 
 
@@ -4804,8 +4806,122 @@ def running_programs():
 
 def folder_running(folder, programs):
     """Запущена ли какая-нибудь программа из папки игры (сама игра, её лаунчер или то, что он запустил)."""
+    return bool(folder_programs(folder, programs))
+
+
+_PROC_API = None
+
+
+def _proc_api():
+    """Функции Windows для списка процессов — в своей копии kernel32, чтобы не задеть настройки ctypes
+    в остальной программе."""
+    global _PROC_API
+    if _PROC_API is not None:
+        return _PROC_API
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG), ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", wintypes.WCHAR * 260)]
+
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    HANDLE, DWORD, BOOL = wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL
+    entry_ptr = ctypes.POINTER(PROCESSENTRY32W)
+    for func, args, res in ((k.CreateToolhelp32Snapshot, [DWORD, DWORD], HANDLE),
+                            (k.Process32FirstW, [HANDLE, entry_ptr], BOOL),
+                            (k.Process32NextW, [HANDLE, entry_ptr], BOOL),
+                            (k.OpenProcess, [DWORD, BOOL, DWORD], HANDLE),
+                            (k.QueryFullProcessImageNameW, [HANDLE, DWORD, wintypes.LPWSTR, ctypes.POINTER(DWORD)],
+                             BOOL),
+                            (k.CloseHandle, [HANDLE], BOOL)):
+        func.argtypes, func.restype = args, res
+    _PROC_API = {"ctypes": ctypes, "wintypes": wintypes, "kernel32": k, "PROCESSENTRY32W": PROCESSENTRY32W}
+    return _PROC_API
+
+
+def running_processes():
+    """Все запущенные процессы: [(номер, номер родителя, имя файла, полный путь или "")] — имя и путь в нижнем
+    регистре. Чтобы считать время в портах и дисковых играх.
+
+    Список — снимок Windows (CreateToolhelp32Snapshot): в нём есть все процессы, даже те, чей путь Windows не
+    отдаёт, — у них путь "". Только читает сведения: ничего не открывает на запись и ничем не управляет.
+    Список не прочитался — OSError (а не пустой список: по пустому все игры сочлись бы закрытыми)."""
+    if sys.platform != "win32":
+        return []
+    api = _proc_api()
+    ctypes, wintypes, kernel32 = api["ctypes"], api["wintypes"], api["kernel32"]
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    if not snapshot or snapshot == wintypes.HANDLE(-1).value:
+        raise OSError(f"Windows не отдала список процессов (код {ctypes.get_last_error()})")
+    entries = []
+    try:
+        entry = api["PROCESSENTRY32W"]()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            entries.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID), entry.szExeFile.lower()))
+            ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    if not entries:
+        raise OSError("Windows отдала пустой список процессов")
+    query_limited = 0x1000  # PROCESS_QUERY_LIMITED_INFORMATION: только сведения, без доступа к памяти процесса
+    buffer = ctypes.create_unicode_buffer(32768)
+    result = []
+    for pid, ppid, name in entries:
+        path = ""
+        handle = kernel32.OpenProcess(query_limited, False, pid) if pid else None
+        if handle:
+            try:
+                size = wintypes.DWORD(len(buffer))
+                if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                    path = os.path.normcase(buffer.value[:size.value])
+            finally:
+                kernel32.CloseHandle(handle)
+        result.append((pid, ppid, name, path))
+    return result
+
+
+def track_game_processes(folder, exe, processes, tracked):
+    """Процессы игры для подсчёта времени: обновляет и возвращает tracked {номер процесса: имя файла}.
+
+    Процесс игры — программа из папки игры, а ещё (если Windows не отдаёт её путь) программа с тем же именем, что
+    файл запуска, или запущенная уже найденным процессом игры. Найденный процесс считается, пока он жив — под тем
+    же номером и с тем же именем, — даже если Windows вдруг перестала отдавать его путь. Программа с тем же
+    именем, но из другой папки игрой считается, только если это тот же самый файл (другой путь к той же папке)."""
     prefix = os.path.normcase(os.path.normpath(folder)).rstrip(os.sep) + os.sep
-    return any(path.startswith(prefix) for path in programs)
+    alive = {pid: name for pid, _, name, _ in processes}
+    for pid, name in list(tracked.items()):
+        if alive.get(pid) != name:  # закрылся (номер мог достаться другой программе — сверяем и имя)
+            del tracked[pid]
+    exe_name = os.path.basename(exe or "").lower()
+    exe_path = os.path.join(folder, exe or "")
+    for pid, ppid, name, path in processes:
+        if pid in tracked or not pid:
+            continue
+        if path:
+            if path.startswith(prefix):
+                tracked[pid] = name
+            elif exe_name and name == exe_name:
+                try:
+                    if os.path.samefile(path, exe_path):
+                        tracked[pid] = name
+                except OSError:
+                    pass
+        elif (exe_name and name == exe_name) or ppid in tracked:
+            tracked[pid] = name
+    return tracked
+
+
+def folder_programs(folder, programs):
+    """Имена запущенных программ из папки игры (только имена файлов, без пути с именем пользователя) — для журнала:
+    по ним видно, что именно программа считала игрой."""
+    prefix = os.path.normcase(os.path.normpath(folder)).rstrip(os.sep) + os.sep
+    return sorted({os.path.basename(path) for path in programs if path.startswith(prefix)})
 
 
 def playtime_text(seconds):
@@ -5174,6 +5290,10 @@ def _win_api():
             (user32.GetWindowThreadProcessId, [HWND, ctypes.POINTER(DWORD)], DWORD),
             (user32.IsIconic, [HWND], BOOL),
             (user32.GetClientRect, [HWND, ctypes.POINTER(wintypes.RECT)], BOOL),
+            (user32.GetWindowRect, [HWND, ctypes.POINTER(wintypes.RECT)], BOOL),
+            (user32.GetClassNameW, [HWND, wintypes.LPWSTR, INT], INT),
+            (user32.MonitorFromWindow, [HWND, DWORD], wintypes.HMONITOR),
+            (user32.GetMonitorInfoW, [wintypes.HMONITOR, ctypes.c_void_p], BOOL),
             (user32.ClientToScreen, [HWND, ctypes.POINTER(wintypes.POINT)], BOOL),
             (user32.GetDC, [HWND], HDC),
             (user32.ReleaseDC, [HWND, HDC], INT),
@@ -5199,8 +5319,11 @@ def _win_api():
                     ("biSizeImage", DWORD), ("biXPelsPerMeter", wintypes.LONG), ("biYPelsPerMeter", wintypes.LONG),
                     ("biClrUsed", DWORD), ("biClrImportant", DWORD), ("bmiColors", DWORD * 4)]
 
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT), ("dwFlags", DWORD)]
+
     _WIN_API = {"ctypes": ctypes, "wintypes": wintypes, "user32": user32, "gdi32": gdi32, "kernel32": kernel32,
-                "BITMAPINFO": BITMAPINFO}
+                "BITMAPINFO": BITMAPINFO, "MONITORINFO": MONITORINFO}
     return _WIN_API
 
 
@@ -5241,7 +5364,33 @@ def foreground_window():
         kernel32.CloseHandle(handle)
 
 
-def _grab(api, screen, width, height, draw):
+def foreground_fullscreen():
+    """Впереди окно другой программы во весь экран — игра в полноэкранном или «безрамочном» режиме, фильм. Тогда
+    окно программы не выскакивает поверх. Только читает у Windows размер окна и экрана; рабочий стол не считается."""
+    if sys.platform != "win32":
+        return False
+    api = _win_api()
+    ctypes, wintypes, user32 = api["ctypes"], api["wintypes"], api["user32"]
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return False
+    name = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, name, 64)
+    if name.value in ("Progman", "WorkerW", "Shell_TrayWnd"):
+        return False  # рабочий стол и панель задач
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if pid.value == os.getpid():
+        return False
+    rect, info = wintypes.RECT(), api["MONITORINFO"]()
+    info.cbSize = ctypes.sizeof(info)
+    monitor = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)) or not monitor \
+            or not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        return False
+    screen = info.rcMonitor
+    return (rect.left <= screen.left and rect.top <= screen.top and rect.right >= screen.right
+            and rect.bottom >= screen.bottom)
     """Нарисовать кадр функцией draw(контекст) в картинку width×height и забрать её пиксели (BGRA сверху вниз)."""
     ctypes, gdi32 = api["ctypes"], api["gdi32"]
     memory = gdi32.CreateCompatibleDC(screen)
