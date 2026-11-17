@@ -98,13 +98,16 @@ DEFAULT_SETTINGS = {
     # Перевод описаний и отзывов: auto — Google, а когда он не отвечает — модулем на этом ПК;
     # local — только модулем на ПК (текст не уходит в интернет); off — не переводить
     "translate_mode": "auto",
-    # Что крутит рулетка: источники через «+» — steam, ports, discs («steam+ports», «discs»…)
+    # Что крутит рулетка: источники через «+» — steam, ports, discs, emus, xbox («steam+ports», «discs»…),
+    # all — все, где есть игры
     "roulette_pool": "steam",
     "ports_root": "", "discs_root": "",  # папки, в которых у каждой игры своя папка: туда смотрит «Найти новые»
+    "emus_root": "",  # папка с образами игр для эмулятора — откуда в прошлый раз добавляли
     # Порядок игр на вкладках: name — по алфавиту, name_desc — с конца алфавита, new — сначала добавленные
     # последними, old — сначала давние; у портов и дисковых ещё played — больше наиграно, recent — недавно запускали
-    "library_sort": "name", "ports_sort": "name", "discs_sort": "name",
-    "ports_view": "grid", "discs_view": "grid",  # вид на вкладках портов и дисковых игр: list | grid
+    "library_sort": "name", "ports_sort": "name", "discs_sort": "name", "emus_sort": "name", "xbox_sort": "name",
+    # вид на вкладках портов, дисковых игр, эмуляторов и XBOX: list | grid
+    "ports_view": "grid", "discs_view": "grid", "emus_view": "grid", "xbox_view": "grid",
     # Фон рулетки: film — ленты из обложек едут, still — те же ленты стоят, custom — своя картинка
     "roulette_backdrop": "film",
     "selection_backdrop": True,  # выделили игры — за списком их обложки под матовым стеклом
@@ -2845,13 +2848,14 @@ def collection_cover(paths):
 # она та же. Убрали игру из списка — из коллекции она пропадает, а вернули — снова на месте.
 COLLECTIONS_FILE = os.path.join(BASE_DIR, "collections.json")
 COLLECTION_NAME_MAX = 60
-COLLECTION_KINDS = ("steam", "port", "disc")
+COLLECTION_KINDS = ("steam", "port", "disc", "emu", "xbox")
 
 
 def collection_ref(game):
     """Ссылка на игру для коллекции."""
     if is_port(game):
-        return {"kind": "disc" if is_disc(game) else "port", "id": game["id"]}
+        kind = game.get("kind")
+        return {"kind": kind if kind in OWN_KINDS else "port", "id": game["id"]}
     if game.get("appid"):
         return {"kind": "steam", "appid": int(game["appid"])}
     return {"kind": "steam", "name": game["name"]}
@@ -3014,6 +3018,12 @@ class RouletteList:
 # только читаются: повреждённый не откладывается в сторону, а просто пропускается.
 PHONE_EXPORT_FORMAT = "backlog-roulette-export"
 PHONE_EXPORT_VERSION = 1
+# Игр для эмуляторов и XBOX приложение на телефоне пока не знает — в файл они (и ссылки на них) не попадают
+PHONE_KINDS = ("steam", "port", "disc")
+
+
+def _phone_ref(ref):
+    return CollectionLibrary._valid_ref(ref) and ref["kind"] in PHONE_KINDS
 
 
 def _read_json_file(path, default):
@@ -3053,10 +3063,13 @@ def phone_export(app_version=""):
     for item in _read_json_file(COLLECTIONS_FILE, {}).get("collections") or []:
         if isinstance(item, dict) and isinstance(item.get("id"), str) and isinstance(item.get("name"), str):
             collections.append({"id": item["id"], "name": item["name"][:COLLECTION_NAME_MAX],
-                                "items": [r for r in item.get("items") or [] if CollectionLibrary._valid_ref(r)],
+                                "items": [r for r in item.get("items") or [] if _phone_ref(r)],
                                 "created": _plain_int(item.get("created"))})
-    removed = [r for r in _read_json_file(ROULETTE_FILE, {}).get("removed") or [] if CollectionLibrary._valid_ref(r)]
+    removed = [r for r in _read_json_file(ROULETTE_FILE, {}).get("removed") or [] if _phone_ref(r)]
     settings = load_settings()
+    pool = str(settings.get("roulette_pool") or "steam")
+    if not pool.startswith("col:"):  # «все» и эмуляторы с XBOX телефон не знает — там крутится то, что он знает
+        pool = "+".join(s for s in pool.split("+") if s in ("steam", "ports", "discs")) or "steam+ports+discs"
     meta, steam_meta = {}, load_steam_meta()
     for game in games:
         entry = steam_meta.get(str(game["appid"])) if game["appid"] else None
@@ -3065,7 +3078,7 @@ def phone_export(app_version=""):
                                         "percent": entry.get("percent")}
     return {"format": PHONE_EXPORT_FORMAT, "version": PHONE_EXPORT_VERSION, "app": app_version,
             "exported": int(time.time()), "games": games, "ports": ports, "collections": collections,
-            "roulette": {"removed": removed, "pool": str(settings.get("roulette_pool") or "steam"),
+            "roulette": {"removed": removed, "pool": pool,
                          "filters": settings.get("roulette_filters") or {}},
             "meta": meta}
 
@@ -4200,6 +4213,10 @@ PORTS_FILE = os.path.join(BASE_DIR, "ports.json")
 # «Дисковые игры» — игры с дисков (и любые другие), установленные в свою папку. Устроены как порты, только без
 # GitHub: список в discs.json, запуск — тот же, с той же проверкой файла.
 DISCS_FILE = os.path.join(BASE_DIR, "discs.json")
+# «Эмуляторы» — игры для консолей, которые запускает эмулятор на этом ПК, сразу в игру (см. EMULATORS ниже).
+# «Игры XBOX» — купленные на консоли: на ПК их не запустить, список — для рулетки, коллекций и заметок
+EMULATORS_FILE = os.path.join(BASE_DIR, "emulators.json")
+XBOX_FILE = os.path.join(BASE_DIR, "xbox.json")
 PORT_SCAN_DEPTH = 2  # насколько глубоко в папке порта искать .exe: сама папка, bin\, build\Release\
 PORT_SCAN_FILES = 20000  # больше файлов в одной папке не просматриваем — это уже не папка порта
 PORT_EXES_LIMIT = 15
@@ -4726,12 +4743,18 @@ def check_port_exe(port):
 
 def launch_port(port):
     """Запустить порт или дисковую игру: выбранный .exe из её папки, без параметров и без командной строки
-    Windows. Просит игра права администратора — Windows спросит пользователя, как при обычном запуске."""
+    Windows. Просит игра права администратора — Windows спросит пользователя, как при обычном запуске.
+
+    Игра для эмулятора — тот же запуск эмулятора, только с параметрами: образ игры и ключи «сразу в игру»
+    (emulator_args). Параметры передаются самой программе списком, без командной строки Windows: никакая
+    строка в них не станет второй командой."""
     import subprocess
 
     path = port_exe_path(port)
     if not os.path.isfile(path):
-        raise OSError("файла запуска больше нет — порт перенесли или удалили")
+        raise OSError("файла запуска больше нет — порт перенесли или удалили" if not is_emu(port) else
+                      "эмулятора больше нет на месте — его перенесли или удалили. Укажите новый: «Изменить…»")
+    args = emulator_args(port) if is_emu(port) else []
     env = dict(os.environ)
     for name in list(env):  # настройки Qt и сборки программы порту не нужны — у него могут быть свои
         if name.startswith(("QT_", "QML", "_PYI", "_MEI", "PYTHON")):
@@ -4750,20 +4773,553 @@ def launch_port(port):
         kernel32.SetDllDirectoryW(None)
     elevated = False
     try:
-        subprocess.Popen([path], cwd=os.path.dirname(path), env=env, close_fds=True,
+        subprocess.Popen([path] + args, cwd=os.path.dirname(path), env=env, close_fds=True,
                          creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
     except OSError as e:
         if getattr(e, "winerror", None) != ERROR_ELEVATION_REQUIRED:
             raise
         # Игре нужны права администратора (так часто у старых игр с дисков) — просим их у Windows: она сама
-        # покажет окно подтверждения, и без «Да» пользователя ничего не запустится. Без параметров, как и обычно.
-        os.startfile(path, "runas", cwd=os.path.dirname(path))
+        # покажет окно подтверждения, и без «Да» пользователя ничего не запустится. Параметры — те же
+        os.startfile(path, "runas", subprocess.list2cmdline(args), os.path.dirname(path))
         elevated = True
     finally:
         if kernel32 is not None:
             kernel32.SetDllDirectoryW(old_dir)
+    if is_emu(port):  # полный путь с именем пользователя — нет, только имена файлов
+        discs = game_discs(port)
+        disc = next((f", диск {i} из {len(discs)}" for i, d in enumerate(discs, 1)
+                     if len(discs) > 1 and same_path(d, port.get("rom"))), "")
+        log.info("Запуск «%s»: %s, образ %s%s%s", port["name"], os.path.basename(path),
+                 os.path.basename(port.get("rom") or ""), disc, " — с правами администратора" if elevated else "")
+        return
     log.info("Запуск «%s»: %s%s", port["name"], os.path.basename(path),  # полный путь с именем пользователя — нет
              " — с правами администратора, по запросу самой игры" if elevated else "")
+
+
+# --- Эмуляторы ------------------------------------------------------------------------
+# Игра для эмулятора — это эмулятор (его .exe из его папки, с отпечатком SHA-256, как у портов) и образ игры.
+# Эмулятор запускается с параметрами «сразу в игру, без своего меню»: у каждого известного эмулятора они свои
+# (EMULATORS), {rom} в них — путь к образу. Параметры видно и можно поправить в «Изменить…».
+# Образ — только файл игры: программы, ярлыки и скрипты образом не принимаются (EMU_BAD_ROM_EXTENSIONS).
+# Консоль игры — по эмулятору, а у эмуляторов многих консолей — по расширению образа (EMU_SYSTEMS).
+# Ключ консоли → (название на рамке обложки, цвет рамки, расширения образов)
+EMU_SYSTEMS = {
+    "nes": ("Nintendo NES", "#C4161C", (".nes", ".fds", ".unf", ".unif")),
+    "snes": ("SNES", "#5B4A9E", (".sfc", ".smc", ".fig", ".swc", ".bs")),
+    "n64": ("Nintendo 64", "#1C8A3C", (".z64", ".n64", ".v64")),
+    "gb": ("Game Boy", "#7A8450", (".gb",)),
+    "gbc": ("Game Boy Color", "#6C3FA0", (".gbc",)),
+    "gba": ("Game Boy Advance", "#3E3FA6", (".gba",)),
+    "nds": ("Nintendo DS", "#6E6E78", (".nds", ".dsi")),
+    "3ds": ("Nintendo 3DS", "#CE181E", (".3ds", ".cci", ".cxi", ".cia", ".3dsx")),
+    "gc": ("Nintendo GameCube", "#524193", (".gcm", ".gcz", ".rvz", ".ciso", ".dol", ".iso")),
+    "wii": ("Nintendo Wii", "#2D9FD8", (".wbfs", ".wad", ".rvz", ".iso")),
+    "wiiu": ("Nintendo Wii U", "#009AC7", (".wud", ".wux", ".wua", ".rpx")),
+    "switch": ("Nintendo Switch", "#E60012", (".nsp", ".xci", ".nsz", ".xcz", ".nro")),
+    "ps1": ("Sony PlayStation", "#2F5DA8", (".cue", ".chd", ".pbp", ".ecm", ".m3u", ".bin", ".img", ".ccd", ".mds",
+                                             ".iso")),
+    "ps2": ("Sony PlayStation 2", "#1F3F99", (".iso", ".chd", ".cso", ".zso", ".gz", ".bin", ".cue", ".mdf")),
+    "ps3": ("Sony PlayStation 3", "#3A3A42", (".bin", ".iso", ".pkg", ".self", ".elf")),
+    "psp": ("Sony PSP", "#2B2B33", (".iso", ".cso", ".pbp", ".chd", ".elf")),
+    "genesis": ("Sega Mega Drive", "#17569B", (".md", ".gen", ".smd", ".bin", ".68k")),
+    "sms": ("Sega Master System", "#D2262C", (".sms",)),
+    "gg": ("Sega Game Gear", "#33333B", (".gg",)),
+    "saturn": ("Sega Saturn", "#3A3F9A", (".cue", ".chd", ".iso", ".mds", ".ccd", ".m3u")),
+    "dreamcast": ("Sega Dreamcast", "#E8632B", (".gdi", ".cdi", ".chd", ".cue")),
+    "pce": ("PC Engine", "#C8501E", (".pce", ".sgx", ".cue", ".chd")),
+    "xbox": ("Xbox", "#107C10", (".iso", ".xiso")),
+    "x360": ("Xbox 360", "#5DC21E", (".iso", ".xex", ".zar", ".god")),
+    "arcade": ("Аркада", "#C7961A", (".zip", ".7z")),
+    "atari2600": ("Atari 2600", "#9C5A2E", (".a26",)),
+    "other": ("Другая консоль", "#5A5A64", ()),
+}
+# Известные эмуляторы: ключ → название, начала имени .exe (в нижнем регистре), консоли, параметры «сразу в игру»
+# и сайт. Параметры — те, что эмулятор понимает из командной строки; {rom} — образ, {rom_dir} и {rom_stem} — его
+# папка и имя без расширения (для MAME). Неизвестный эмулятор получает просто образ — так открывают игру почти все
+EMULATORS = {
+    "duckstation": ("DuckStation", ("duckstation",), ("ps1",), ["-batch", "-fullscreen", "--", "{rom}"],
+                    "https://www.duckstation.org"),
+    "pcsx2": ("PCSX2", ("pcsx2",), ("ps2",), ["-batch", "-nogui", "-fullscreen", "--", "{rom}"], "https://pcsx2.net"),
+    "rpcs3": ("RPCS3", ("rpcs3",), ("ps3",), ["--no-gui", "{rom}"], "https://rpcs3.net"),
+    "ppsspp": ("PPSSPP", ("ppsspp",), ("psp",), ["--fullscreen", "{rom}"], "https://www.ppsspp.org"),
+    "dolphin": ("Dolphin", ("dolphin",), ("gc", "wii"), ["-b", "-e", "{rom}"], "https://dolphin-emu.org"),
+    "cemu": ("Cemu", ("cemu",), ("wiiu",), ["-f", "-g", "{rom}"], "https://cemu.info"),
+    "ryujinx": ("Ryujinx", ("ryujinx",), ("switch",), ["--fullscreen", "{rom}"], "https://ryujinx.app"),
+    "yuzu": ("yuzu и его продолжения", ("yuzu", "suyu", "sudachi", "citron", "eden"), ("switch",),
+             ["-f", "-g", "{rom}"], "https://github.com/topics/switch-emulator"),
+    "azahar": ("Azahar", ("azahar",), ("3ds",), ["{rom}"], "https://azahar-emu.org"),
+    "citra": ("Citra и Lime3DS", ("citra", "lime3ds", "lime", "mandarine"), ("3ds",), ["{rom}"],
+              "https://azahar-emu.org"),
+    "melonds": ("melonDS", ("melonds",), ("nds",), ["{rom}"], "https://melonds.kuribo64.net"),
+    "desmume": ("DeSmuME", ("desmume",), ("nds",), ["{rom}"], "https://desmume.org"),
+    "mgba": ("mGBA", ("mgba",), ("gba", "gbc", "gb"), ["-f", "{rom}"], "https://mgba.io"),
+    "sameboy": ("SameBoy", ("sameboy",), ("gbc", "gb"), ["{rom}"], "https://sameboy.github.io"),
+    "snes9x": ("Snes9x", ("snes9x",), ("snes",), ["{rom}"], "https://www.snes9x.com"),
+    "bsnes": ("bsnes", ("bsnes",), ("snes",), ["--fullscreen", "{rom}"], "https://github.com/bsnes-emu/bsnes"),
+    "mesen": ("Mesen", ("mesen",), ("nes", "snes", "gb", "gbc", "gba", "pce", "sms", "gg"), ["{rom}"],
+              "https://www.mesen.ca"),
+    "fceux": ("FCEUX", ("fceux",), ("nes",), ["{rom}"], "https://fceux.com"),
+    "nestopia": ("Nestopia", ("nestopia",), ("nes",), ["{rom}"], "https://github.com/0ldsk00l/nestopia"),
+    "project64": ("Project64", ("project64",), ("n64",), ["{rom}"], "https://www.pj64-emu.com"),
+    "rmg": ("Rosalie's Mupen GUI", ("rmg",), ("n64",), ["{rom}"], "https://github.com/Rosalie241/RMG"),
+    "simple64": ("simple64", ("simple64",), ("n64",), ["{rom}"], "https://simple64.github.io"),
+    "mupen64": ("Mupen64Plus", ("mupen64plus",), ("n64",), ["{rom}"], "https://mupen64plus.org"),
+    "flycast": ("Flycast", ("flycast",), ("dreamcast",), ["{rom}"], "https://github.com/flyinghead/flycast"),
+    "redream": ("Redream", ("redream",), ("dreamcast",), ["{rom}"], "https://redream.io"),
+    "mednafen": ("Mednafen", ("mednafen",), ("ps1", "saturn", "pce", "nes", "snes", "gb", "gbc", "gba", "genesis",
+                                            "sms", "gg"), ["{rom}"], "https://mednafen.github.io"),
+    "kronos": ("Kronos", ("kronos",), ("saturn",), ["-a", "-i", "{rom}"], "https://github.com/FCare/Kronos"),
+    "yabause": ("Yabause", ("yabause",), ("saturn",), ["-a", "-i", "{rom}"], "https://github.com/Yabause/yabause"),
+    "ymir": ("Ymir", ("ymir",), ("saturn",), ["-f", "{rom}"], "https://github.com/ymir-emu/Ymir"),
+    "blastem": ("BlastEm", ("blastem",), ("genesis",), ["{rom}"], "https://www.retrodev.com/blastem"),
+    "fusion": ("Kega Fusion", ("fusion",), ("genesis", "sms", "gg"), ["{rom}"], "https://www.carpeludum.com/kega-fusion"),
+    "xemu": ("xemu", ("xemu",), ("xbox",), ["-dvd_path", "{rom}"], "https://xemu.app"),
+    "xenia": ("Xenia", ("xenia",), ("x360",), ["--fullscreen", "{rom}"], "https://xenia.jp"),
+    "stella": ("Stella", ("stella",), ("atari2600",), ["{rom}"], "https://stella-emu.github.io"),
+    "ares": ("ares", ("ares",), ("n64", "snes", "nes", "genesis", "sms", "gg", "pce", "gb", "gbc", "gba", "ps1"),
+             ["--fullscreen", "{rom}"], "https://ares-emu.net"),
+    "bizhawk": ("BizHawk", ("emuhawk",), ("nes", "snes", "n64", "gb", "gbc", "gba", "genesis", "sms", "gg", "ps1",
+                                          "saturn", "pce", "nds", "atari2600"), ["{rom}"], "https://tasvideos.org/BizHawk"),
+    "mame": ("MAME", ("mame",), ("arcade",), ["-rompath", "{rom_dir}", "{rom_stem}"], "https://www.mamedev.org"),
+    # Ядро RetroArch — по консоли (RETROARCH_CORES); не то ядро — поправить в «Изменить…» → «Параметры»
+    "retroarch": ("RetroArch", ("retroarch",), tuple(k for k in EMU_SYSTEMS if k not in ("x360", "wiiu", "switch",
+                                                                                         "ps3", "xbox", "other")),
+                  ["-f", "-L", "{core}", "{rom}"], "https://www.retroarch.com"),
+}
+RETROARCH_CORES = {"nes": "mesen", "snes": "snes9x", "n64": "mupen64plus_next", "gb": "gambatte", "gbc": "gambatte",
+                   "gba": "mgba", "nds": "melonds", "3ds": "citra", "gc": "dolphin", "wii": "dolphin",
+                   "ps1": "swanstation", "ps2": "pcsx2", "psp": "ppsspp", "genesis": "genesis_plus_gx",
+                   "sms": "genesis_plus_gx", "gg": "genesis_plus_gx", "saturn": "mednafen_saturn",
+                   "dreamcast": "flycast", "pce": "mednafen_pce_fast", "arcade": "mame", "atari2600": "stella"}
+EMU_GENERIC_ARGS = ["{rom}"]
+EMU_BAD_ROM_EXTENSIONS = (".exe", ".bat", ".cmd", ".com", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh",
+                          ".lnk", ".url", ".msi", ".msc", ".scr", ".pif", ".hta", ".cpl", ".dll", ".sys", ".reg")
+EMU_ARG_MAX = 20  # параметров больше — это уже не «сразу в игру»
+EMU_ROM_EXTENSIONS = tuple(sorted({ext for _, _, exts in EMU_SYSTEMS.values() for ext in exts}))
+# Игры, добавленные с прежними параметрами по умолчанию, — на новые: (были, стали). Ymir без -f открывал игру в окне
+EMU_ARGS_UPGRADES = {"ymir": (["{rom}"], ["-f", "{rom}"])}
+# Игра на нескольких дисках: номер диска в имени файла — «… (Disc 2)», «… [CD2]», «… Disk 1 of 3», «… (Диск 2)»
+DISC_TAG_RE = re.compile(r"[\s_.-]*[\[(]?\s*(?<![A-Za-zА-Яа-яЁё])(?:disc|disk|cd|диск)[\s_.-]*(\d{1,2})"
+                         r"(?:\s*(?:of|из)\s*\d{1,2})?\s*[\])]?", re.IGNORECASE)
+EMU_DISCS_MAX = 10
+
+
+def emu_system_title(key):
+    return EMU_SYSTEMS.get(key, EMU_SYSTEMS["other"])[0]
+
+
+def emu_system_color(key):
+    return EMU_SYSTEMS.get(key, EMU_SYSTEMS["other"])[1]
+
+
+def detect_emulator(exe_path):
+    """Какой это эмулятор — по имени его .exe: ключ EMULATORS или "" (неизвестный)."""
+    stem = os.path.splitext(os.path.basename(exe_path or ""))[0].casefold()
+    best, length = "", 0
+    for key, (_title, prefixes, _systems, _args, _site) in EMULATORS.items():
+        for prefix in prefixes:
+            if stem.startswith(prefix) and len(prefix) > length:  # «lime3ds» вернее, чем «lime»
+                best, length = key, len(prefix)
+    return best
+
+
+def emulator_title(key, exe=""):
+    if key in EMULATORS:
+        return EMULATORS[key][0]
+    return os.path.splitext(os.path.basename(exe or ""))[0] or "Эмулятор"
+
+
+def emulator_site(key):
+    """Сайт эмулятора — вместо ссылки на GitHub у портов. Только https."""
+    site = EMULATORS[key][4] if key in EMULATORS else ""
+    return site if site.startswith("https://") else ""
+
+
+def emulator_systems(key):
+    """Консоли эмулятора; неизвестный эмулятор — любые."""
+    return list(EMULATORS[key][2]) if key in EMULATORS else [k for k in EMU_SYSTEMS if k != "other"]
+
+
+def guess_system(emulator, rom):
+    """Консоль игры: у эмулятора одной консоли — она, у многих — по расширению образа (первое совпадение
+    в порядке консолей эмулятора), не угадали — первая консоль эмулятора."""
+    systems = emulator_systems(emulator)
+    ext = os.path.splitext(rom or "")[1].casefold()
+    if ext:
+        unique = [s for s in systems if ext in EMU_SYSTEMS[s][2]]
+        if unique:
+            return unique[0]
+    return systems[0] if systems and emulator in EMULATORS else "other"
+
+
+def default_emulator_args(emulator, system):
+    if emulator != "retroarch":
+        return list(EMULATORS[emulator][3]) if emulator in EMULATORS else list(EMU_GENERIC_ARGS)
+    core_name = RETROARCH_CORES.get(system, "")
+    if not core_name:  # ядро для этой консоли не знаем — RetroArch откроет игру тем, что выбрано у него
+        return ["-f", "{rom}"]
+    return ["-f", "-L", os.path.join("cores", f"{core_name}_libretro.dll"), "{rom}"]
+
+
+def rom_problem(rom):
+    """Почему файл нельзя взять образом игры, или "" — можно."""
+    if not rom or not os.path.isabs(rom):
+        return "выберите файл игры (образ или ROM)"
+    if os.path.splitext(rom)[1].casefold() in EMU_BAD_ROM_EXTENSIONS:
+        return "это программа, ярлык или скрипт, а не образ игры — такой файл программа эмулятору не передаёт"
+    if not os.path.exists(rom):
+        return "файла игры нет на месте — его перенесли или удалили"
+    return ""
+
+
+def emulator_args(port):
+    """Параметры запуска эмулятора: образ подставлен в {rom}. OSError — с образом или параметрами что-то не так
+    (тогда не запускаем). Только список строк — без командной строки Windows."""
+    rom = os.path.normpath(port.get("rom") or "")
+    problem = rom_problem(rom)
+    if problem:
+        raise OSError(problem[:1].upper() + problem[1:])
+    discs = port.get("discs")
+    if isinstance(discs, list) and len(discs) > 1 and not any(same_path(rom, d) for d in discs):
+        raise OSError("Этого диска нет среди дисков игры — выберите диск ещё раз")
+    template = port.get("args")
+    if not isinstance(template, list) or not template or len(template) > EMU_ARG_MAX \
+            or not all(isinstance(a, str) and a and "\x00" not in a and "\n" not in a for a in template):
+        template = default_emulator_args(port.get("emulator") or "", port.get("system") or "")
+    if not any("{rom" in a for a in template):
+        template = template + ["{rom}"]  # без образа эмулятор открыл бы своё меню
+    values = {"{rom}": rom, "{rom_dir}": os.path.dirname(rom), "{rom_stem}": os.path.splitext(os.path.basename(rom))[0]}
+    result = []
+    for arg in template:
+        for key, value in values.items():
+            arg = arg.replace(key, value)
+        result.append(arg)
+    return result
+
+
+def split_emulator_args(text):
+    """Строка параметров из окна «Изменить…» → список. Через пробел; "в кавычках" — один параметр (обратная
+    косая черта — просто часть пути Windows)."""
+    if "\x00" in (text or "") or "\n" in (text or ""):
+        raise ValueError("в параметрах лишние знаки")
+    parts = [quoted or plain for quoted, plain in re.findall(r'"([^"]*)"|([^\s"]+)', text or "")]
+    parts = [p for p in parts if p]
+    if len(parts) > EMU_ARG_MAX:
+        raise ValueError(f"параметров больше {EMU_ARG_MAX}")
+    return parts
+
+
+def join_emulator_args(args):
+    return " ".join(f'"{a}"' if (" " in a and '"' not in a) else a for a in args or [])
+
+
+def rom_name(rom):
+    """Название игры из имени образа: «Final Fantasy VII (USA) (Disc 1) [!].chd» → «Final Fantasy VII»."""
+    stem = os.path.splitext(os.path.basename(rom or ""))[0]
+    stem = re.sub(r"\s*[\[(][^\])]*[\])]", " ", stem)  # (USA), (Disc 1), [!], [SLUS-00892]
+    stem = DISC_TAG_RE.sub(" ", stem)  # «Disc 1» без скобок
+    stem = re.sub(r"[_.]+", " ", stem)
+    return clean_name(re.sub(r"\s+", " ", stem).strip()) or clean_name(os.path.splitext(os.path.basename(rom or ""))[0])
+
+
+def disc_number(rom):
+    """Номер диска из имени файла игры или None — номера в имени нет."""
+    match = DISC_TAG_RE.search(os.path.splitext(os.path.basename(rom or ""))[0])
+    return int(match.group(1)) if match else None
+
+
+def _disc_set_key(path):
+    """Имя файла без номера диска и расширение — у всех дисков одной игры они одинаковые."""
+    stem, ext = os.path.splitext(os.path.basename(path))
+    return re.sub(r"\s+", " ", DISC_TAG_RE.sub(" ", stem)).strip().casefold(), ext.casefold()
+
+
+def find_disc_set(rom):
+    """Все диски игры рядом с выбранным: файлы в той же папке с тем же именем и расширением, которые отличаются
+    только номером диска, — по порядку номеров. Диск один (или .m3u — список дисков уже внутри) — [rom]."""
+    if not rom or disc_number(rom) is None or rom.casefold().endswith(".m3u"):
+        return [rom] if rom else []
+    folder, key = os.path.dirname(rom), _disc_set_key(rom)
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return [rom]
+    found = {}
+    for name in sorted(names, key=natural_key):
+        number = disc_number(name)
+        path = os.path.join(folder, name)
+        if number is not None and _disc_set_key(name) == key and os.path.isfile(path):
+            found.setdefault(number, path)
+    discs = [found[n] for n in sorted(found)][:EMU_DISCS_MAX]
+    if len(discs) < 2 or not any(same_path(rom, d) for d in discs):
+        return [rom]
+    return discs
+
+
+def game_discs(game):
+    """Диски игры для эмулятора по порядку; у игры на одном диске — только её образ."""
+    discs = game.get("discs")
+    if isinstance(discs, list) and len(discs) > 1 and all(isinstance(d, str) and d for d in discs):
+        return discs
+    return [game["rom"]] if game.get("rom") else []
+
+
+def sort_discs(paths):
+    """Диски, выбранные вручную, — по номеру в имени файла, без номера — по имени."""
+    return sorted(paths, key=lambda p: (disc_number(p) or 0, natural_key(os.path.basename(p))))
+
+
+def _clean_emu_game(game):
+    """Игра для эмулятора из emulators.json: диски — только полные пути к файлам игр (не программам), не больше
+    EMU_DISCS_MAX; прежние параметры по умолчанию — на новые (EMU_ARGS_UPGRADES)."""
+    discs = game.get("discs")
+    if discs is not None:
+        clean = [os.path.normpath(d) for d in discs if isinstance(d, str) and os.path.isabs(d)
+                 and os.path.splitext(d)[1].casefold() not in EMU_BAD_ROM_EXTENSIONS] if isinstance(discs, list) else []
+        if len(clean) > 1:
+            game["discs"] = clean[:EMU_DISCS_MAX]
+        else:
+            game.pop("discs", None)
+    upgrade = EMU_ARGS_UPGRADES.get(game.get("emulator"))
+    if upgrade and game.get("args") == upgrade[0]:
+        game["args"] = list(upgrade[1])
+
+
+EMU_SCAN_DEPTH = 3
+EMU_SCAN_FILES = 20000
+_CUE_FILE_RE = re.compile(r'^\s*FILE\s+(?:"([^"]+)"|(\S+))', re.IGNORECASE | re.MULTILINE)
+
+
+def _disc_parts(folder, name):
+    """Файлы, из которых состоит диск-описание (.cue, .gdi, .m3u), — имена в нижнем регистре."""
+    ext = os.path.splitext(name)[1].casefold()
+    text = _read_small_text(os.path.join(folder, name))
+    if ext == ".cue":
+        names = [a or b for a, b in _CUE_FILE_RE.findall(text)]
+    elif ext == ".gdi":  # «1 0 4 2352 "track01.bin" 0» — имя дорожки пятым полем
+        names = []
+        for line in text.splitlines()[1:]:
+            match = re.match(r'\s*\d+\s+\d+\s+\d+\s+\d+\s+(?:"([^"]+)"|(\S+))', line)
+            if match:
+                names.append(match.group(1) or match.group(2))
+    else:  # .m3u — по диску в строке
+        names = [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    return {os.path.basename(n.replace("\\", "/")).casefold() for n in names}
+
+
+def scan_roms(root, emulator, known=()):
+    """Образы игр в папке для эмулятора: {"found": [{"name", "rom", "system", "discs" (если их несколько)}],
+    "known": сколько уже в списке}. Части одного диска (дорожки .bin из .cue и .gdi, .img при .ccd, .mdf при .mds,
+    диски из .m3u) — одной игрой, и диски одной игры («(Disc 1)», «(Disc 2)») — тоже. Ничего не запускается."""
+    allowed = {ext for s in emulator_systems(emulator) for ext in EMU_SYSTEMS[s][2]} or set(EMU_ROM_EXTENSIONS)
+    known = {os.path.normcase(os.path.normpath(p)) for p in known if p}
+    found, already, seen = [], 0, 0
+    for folder, dirs, names in os.walk(root):
+        rel = os.path.relpath(folder, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        dirs[:] = [] if depth >= EMU_SCAN_DEPTH else sorted((d for d in dirs if not d.startswith(".")), key=natural_key)
+        seen += len(names)
+        parts = set()
+        for name in names:
+            stem, ext = os.path.splitext(name)
+            ext = ext.casefold()
+            if ext in (".cue", ".gdi", ".m3u"):
+                parts |= _disc_parts(folder, name) - {name.casefold()}
+            elif ext == ".ccd":
+                parts |= {(stem + e).casefold() for e in (".img", ".sub")}
+            elif ext == ".mds":
+                parts.add((stem + ".mdf").casefold())
+        games, sets = [], {}
+        for name in sorted(names, key=natural_key):
+            ext = os.path.splitext(name)[1].casefold()
+            if ext not in allowed or name.casefold() in parts:
+                continue
+            path = os.path.join(folder, name)
+            if disc_number(name) is not None and ext != ".m3u":
+                sets.setdefault(_disc_set_key(name), []).append(path)
+            else:
+                games.append([path])
+        for paths in sets.values():
+            games.append(sorted(paths, key=disc_number)[:EMU_DISCS_MAX])
+        for paths in sorted(games, key=lambda ps: natural_key(os.path.basename(ps[0]))):
+            if any(os.path.normcase(p) in known for p in paths):
+                already += 1
+                continue
+            game = {"name": rom_name(paths[0]), "rom": paths[0], "system": guess_system(emulator, paths[0])}
+            if len(paths) > 1:
+                game["discs"] = paths
+            found.append(game)
+        if seen > EMU_SCAN_FILES:
+            break
+    log.info("Папка с играми для эмулятора: найдено %d (из них на нескольких дисках %d), уже в списке %d",
+             len(found), sum("discs" in g for g in found), already)
+    return {"found": found, "known": already}
+
+
+# --- Что за игра в образе -------------------------------------------------------------
+# Название и код игры — из самого образа, без запуска: у PlayStation 1 и 2 код диска (SLUS-20312 и т. п.) записан
+# в файле SYSTEM.CNF, у PSP — в UMD_DATA.BIN, у Sega Saturn и Dreamcast, GameCube и Wii в заголовке диска есть и код,
+# и название. По коду название ищется в базе игр, которую эмулятор держит в своей папке (у PCSX2 —
+# resources\GameIndex.yaml). Читается только начало файла игры; сжатые образы (.chd, .cso, .rvz) не разбираются.
+DISC_READ_MAX = 16 * 1024 * 1024
+DISC_DB_FILES = (("resources", "GameIndex.yaml"), ("resources", "gamedb.yaml"), ("database", "gamedb.yaml"))
+DISC_DB_MAX = 64 * 1024 * 1024
+DISC_IMAGES = (".iso", ".bin", ".img", ".mdf", ".gcm")  # несжатые образы — их начало можно прочитать
+_PS_BOOT_RE = re.compile(rb"BOOT(2?)\s*=\s*cdrom0?:\\?([A-Za-z]{4})[_-](\d{3})\.(\d{2})")
+_PS_FILE_RE = re.compile(rb"(S[CL][AEKPU][ACDJMNPSUX]|PAPX|PBPX)_(\d{3})\.(\d{2});1")
+_PSP_RE = re.compile(rb"(U[CL][AEJKU][SMBTDX])-(\d{5})\|")
+
+
+def _disc_image(rom, depth=0):
+    """Файл с данными диска: у .cue и .gdi — дорожка с данными, у .m3u — первый диск, у .ccd и .mds — образ рядом.
+    None — образ сжатый или его не найти."""
+    folder, name = os.path.dirname(rom), os.path.basename(rom)
+    stem, ext = os.path.splitext(name)
+    ext = ext.casefold()
+    entries = []
+    if ext == ".m3u" and depth == 0:
+        entries = [line.strip() for line in _read_small_text(rom).splitlines()
+                   if line.strip() and not line.lstrip().startswith("#")]
+        return _disc_image(os.path.join(folder, os.path.basename(entries[0].replace("\\", "/"))), 1) if entries else None
+    if ext == ".cue":
+        entries = [a or b for a, b in _CUE_FILE_RE.findall(_read_small_text(rom))]
+    elif ext == ".gdi":  # у Dreamcast заголовок диска — на третьей дорожке
+        for line in _read_small_text(rom).splitlines()[1:]:
+            match = re.match(r'\s*\d+\s+\d+\s+\d+\s+\d+\s+(?:"([^"]+)"|(\S+))', line)
+            if match:
+                entries.append(match.group(1) or match.group(2))
+        entries = entries[2:3] or entries[:1]
+    elif ext == ".ccd":
+        entries = [stem + ".img"]
+    elif ext == ".mds":
+        entries = [stem + ".mdf"]
+    elif ext in DISC_IMAGES:
+        return rom
+    if not entries:
+        return None
+    path = os.path.join(folder, os.path.basename(entries[0].replace("\\", "/")))
+    return path if os.path.splitext(path)[1].casefold() in DISC_IMAGES else None
+
+
+def _header_title(raw, keep_case=False):
+    """Строка из заголовка диска: только печатные латинские знаки; НАЗВАНИЕ ЗАГЛАВНЫМИ — как обычное название
+    (римские цифры и слова с цифрами остаются как есть)."""
+    text = re.sub(r"[^\x20-\x7e]+", " ", raw.split(b"\x00", 1)[0].decode("latin-1"))
+    text = re.sub(r"\s+", " ", text).strip()[:120]
+    if keep_case or not text.isupper():
+        return text
+    return " ".join(w if re.fullmatch(r"[IVX]+|\S*\d\S*", w) else w.capitalize() for w in text.split())
+
+
+def _disc_header(data):
+    """Код, название и консоль из начала образа: {"serial", "title", "system"} или {} — не узнать."""
+    if len(data) >= 0x400:
+        wii, gc = data[0x18:0x1C] == b"\x5D\x1C\x9E\xA3", data[0x1C:0x20] == b"\xC2\x33\x9F\x3D"
+        if wii or gc:
+            return {"serial": _header_title(data[0:6], keep_case=True), "title": _header_title(data[0x20:0x400]),
+                    "system": "wii" if wii else "gc"}
+    head = data[:0x10000]  # у образа .bin с сырыми секторами заголовок не в самом начале
+    for magic, system, serial_at, title_at, title_len in ((b"SEGA SEGASATURN ", "saturn", 0x20, 0x60, 0x70),
+                                                          (b"SEGA SEGAKATANA ", "dreamcast", 0x40, 0x80, 0x80)):
+        at = head.find(magic)
+        if at >= 0:
+            return {"serial": _header_title(data[at + serial_at:at + serial_at + 10], keep_case=True),
+                    "title": _header_title(data[at + title_at:at + title_at + title_len]), "system": system}
+    boot = _PS_BOOT_RE.search(data)
+    if boot:
+        serial = f"{boot.group(2).decode().upper()}-{boot.group(3).decode()}{boot.group(4).decode()}"
+        return {"serial": serial, "title": "", "system": "ps2" if boot.group(1) else "ps1"}
+    psp = _PSP_RE.search(data)
+    if psp:
+        return {"serial": f"{psp.group(1).decode()}-{psp.group(2).decode()}", "title": "", "system": "psp"}
+    named = _PS_FILE_RE.search(data)
+    if named:
+        return {"serial": f"{named.group(1).decode()}-{named.group(2).decode()}{named.group(3).decode()}",
+                "title": "", "system": ""}
+    return {}
+
+
+def _title_without_tags(text):
+    """«Final Fantasy VII (USA) (Disc 1)» → «Final Fantasy VII» — название из базы эмулятора без пометок."""
+    text = re.sub(r"\s*[\[(][^\])]*[\])]", " ", text.replace('\\"', '"'))
+    return title_name(re.sub(r"\s+", " ", DISC_TAG_RE.sub(" ", text)).strip())
+
+
+def emulator_game_name(serial, emulator_folder):
+    """Название игры по коду диска из базы игр в папке эмулятора (у PCSX2 — resources\\GameIndex.yaml) или ""."""
+    if not re.fullmatch(r"[A-Z0-9]{4,6}-?\d{0,5}", serial or "") or not emulator_folder:
+        return ""
+    for parts in DISC_DB_FILES:
+        path = os.path.join(emulator_folder, *parts)
+        try:
+            if not os.path.isfile(path) or os.path.getsize(path) > DISC_DB_MAX:
+                continue
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        except OSError:
+            continue
+        match = re.search(rf'^"?{re.escape(serial)}"?:[ \t]*\r?\n((?:[ \t]+[^\n]*\n?){{1,40}})', text, re.MULTILINE)
+        if not match:
+            continue
+        for key in ("name-en", "name"):  # у японских игр name — по-японски, а name-en — по-английски
+            found = re.search(rf'^[ \t]+{key}:[ \t]*"?(.*?)"?[ \t]*\r?$', match.group(1), re.MULTILINE)
+            name = _title_without_tags(found.group(1)) if found else ""
+            if name:
+                return name
+    return ""
+
+
+def identify_rom(rom, emulator_folder=""):
+    """Что за игра в образе: {"serial" (код диска), "title" (из заголовка диска), "name" (из базы эмулятора),
+    "system"} — что удалось узнать, остальное пустое. Только чтение начала файла игры. В фоновом потоке."""
+    result = {"serial": "", "title": "", "name": "", "system": ""}
+    path = _disc_image(rom) if rom else None
+    if not path or not os.path.isfile(path):
+        return result
+    try:
+        with open(path, "rb") as f:
+            data = f.read(DISC_READ_MAX)
+    except OSError as e:
+        log.info("Образ %s не прочитался: %s", os.path.basename(path), type(e).__name__)
+        return result
+    result.update(_disc_header(data))
+    if result["serial"]:
+        result["name"] = emulator_game_name(result["serial"], emulator_folder)
+    log.info("Образ %s: код %s, в заголовке «%s», в базе эмулятора «%s»", os.path.basename(rom),
+             result["serial"] or "—", result["title"] or "—", result["name"] or "—")
+    return result
+
+
+def griddb_suggestions(term, api_key):
+    """Живой поиск названия в SteamGridDB (там есть и консольные игры): [{"name", "year"}]. Сайт не ответил — пусто."""
+    term = re.sub(r"\s+", " ", term or "").strip()[:100]
+    if len(term) < 2 or not api_key:
+        return []
+    try:
+        data = fetch(f"{STEAMGRIDDB_API_URL}/search/autocomplete/{quote(term, safe='')}",
+                     headers={"Authorization": f"Bearer {api_key}"}).json()
+    except (requests.RequestException, ValueError) as e:
+        log.info("Подсказки названий из SteamGridDB не пришли: %s", type(e).__name__)
+        return []
+    found = []
+    for item in (data or {}).get("data") or []:
+        name = title_name(item.get("name") or "") if isinstance(item, dict) else ""
+        stamp = item.get("release_date") if name else None
+        if name:
+            year = time.gmtime(stamp).tm_year if isinstance(stamp, (int, float)) and stamp > 0 else None
+            found.append({"name": name, "year": year})
+    return found[:8]
+
+
+def store_suggestions(term):
+    """Живой поиск в окне добавления игры: игры магазина Steam по первым буквам. Steam не ответил — пусто."""
+    if len((term or "").strip()) < 2:
+        return []
+    try:
+        return search_store(term)[:8]
+    except (requests.RequestException, ValueError) as e:
+        log.info("Живой поиск в Steam не ответил: %s", type(e).__name__)
+        return []
 
 
 def running_programs():
@@ -4937,9 +5493,13 @@ def playtime_text(seconds):
 
 
 class PortLibrary:
-    """Порты в ports.json (или дисковые игры в discs.json): [{"id", "name", "folder", "exe" (путь относительно
-    папки), "repo" («автор/проект» или ""), "fingerprint", "installed_tag", "latest", "checked", "about",
-    "added", "kind" (port | disc)}, ...]"""
+    """Порты в ports.json (или дисковые игры в discs.json, игры для эмуляторов в emulators.json, игры XBOX
+    в xbox.json): [{"id", "name", "folder", "exe" (путь относительно папки), "repo" («автор/проект» или ""),
+    "fingerprint", "installed_tag", "latest", "checked", "about", "added", "kind" (port | disc | emu | xbox)}, ...]
+
+    У игры для эмулятора folder и exe — папка и файл запуска эмулятора, а ещё "rom" (образ игры), "args"
+    (параметры запуска, {rom} — место образа), "system" и "emulator" (ключи EMU_SYSTEMS и EMULATORS).
+    У игры XBOX запускать на ПК нечего: folder и exe пустые, зато есть "game_pass"."""
 
     def __init__(self, path=PORTS_FILE, kind="port"):
         self.path = path
@@ -4961,10 +5521,15 @@ class PortLibrary:
             except OSError:
                 pass
             return f"Файл {name} повреждён ({e}). Он сохранён как {os.path.basename(broken)}, список начат заново."
+        launchable = self.kind != "xbox"
         self.ports = [p for p in data if isinstance(p, dict) and p.get("id") and p.get("name")
-                      and p.get("folder") and p.get("exe")] if isinstance(data, list) else []
+                      and (not launchable or (p.get("folder") and p.get("exe")))] if isinstance(data, list) else []
         for port in self.ports:
             port["kind"] = self.kind  # по kind рулетка знает, на какой вкладке открыть выпавшую игру
+            if not launchable:
+                port["folder"], port["exe"] = "", ""  # у игры XBOX нечего запускать на ПК — и чужое не запустится
+            elif self.kind == "emu":
+                _clean_emu_game(port)
         return None
 
     def save(self):
@@ -4987,10 +5552,13 @@ class PortLibrary:
     def folders(self):
         return [p["folder"] for p in self.ports]
 
-    def add(self, name, folder, exe, repo="", fingerprint=None):
-        port = {"id": secrets.token_hex(8), "name": self.unique_name(name), "folder": os.path.normpath(folder),
+    def add(self, name, folder, exe, repo="", fingerprint=None, **extra):
+        """extra — поля игры для эмулятора (rom, args, system, emulator) или XBOX (game_pass, appid)."""
+        port = {"id": secrets.token_hex(8), "name": self.unique_name(name),
+                "folder": os.path.normpath(folder) if folder else "",
                 "exe": exe, "repo": repo or "", "fingerprint": fingerprint or {}, "installed_tag": "",
                 "latest": None, "checked": 0, "about": None, "added": int(time.time()), "kind": self.kind}
+        port.update(extra)
         self.ports.append(port)
         return port
 
@@ -4998,14 +5566,28 @@ class PortLibrary:
         self.ports.remove(port)
 
 
+OWN_KINDS = ("port", "disc", "emu", "xbox")  # свои списки игр — не из Steam
+
+
 def is_port(game):
-    """Игра из «Native Port's» или «Дисковых игр» — запускается своим .exe (у игр Steam файла запуска нет)."""
+    """Игра из своих списков — «Нативные ИИ порты», «Дисковые игры», «Эмуляторы», «Игры XBOX» (у игр Steam поля
+    exe нет; у игр XBOX оно пустое: запускать на ПК нечего)."""
     return bool(game) and "exe" in game
 
 
 def is_disc(game):
     """Игра из «Дисковых игр»."""
     return is_port(game) and game.get("kind") == "disc"
+
+
+def is_emu(game):
+    """Игра из «Эмуляторов»: запускается эмулятором, сразу в игру."""
+    return is_port(game) and game.get("kind") == "emu"
+
+
+def is_xbox(game):
+    """Игра из «Игр XBOX»: куплена на консоли, на ПК её не запустить."""
+    return is_port(game) and game.get("kind") == "xbox"
 
 
 # --- Свои заметки -------------------------------------------------------------
@@ -5015,7 +5597,7 @@ def is_disc(game):
 # список картинок — снимки экрана из портов и дисковых игр (папка screenshots, см. ниже).
 NOTES_DIR = os.path.join(BASE_DIR, "notes")
 NOTES_VERSION = 1
-NOTE_KINDS = ("port", "disc")
+NOTE_KINDS = OWN_KINDS
 _NOTE_ID_RE = re.compile(r"[0-9a-f]{1,32}")
 _NOTE_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 MONTHS_GENITIVE = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября",
