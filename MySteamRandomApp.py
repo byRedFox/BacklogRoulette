@@ -151,7 +151,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.6.4"
+__version__ = "2.7"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -2595,7 +2595,7 @@ class AddGameDialog(MessageBoxBase):
     ICON = QSize(120, 45)  # картинки поиска Steam — 231×87
     SEARCH_DELAY = 500  # мс: ищем, когда перестали печатать
 
-    def __init__(self, parent, game=None, term="", synced=False, for_disc=False):
+    def __init__(self, parent, game=None, term="", synced=False, for_disc=False, disc_hint=""):
         super().__init__(parent)
         self.win = parent
         self.game = game
@@ -2613,11 +2613,12 @@ class AddGameDialog(MessageBoxBase):
         self.listed = set() if for_disc else {g["appid"] for g in parent.library.games if g.get("appid")}
 
         self.viewLayout.addWidget(SubtitleLabel(f"Найти в Steam: «{game['name']}»" if game else "Добавить игру", self))
-        hint = CaptionLabel("Программа найдёт игру в магазине Steam и возьмёт оттуда описание, оценки, отзывы и "
+        hint = CaptionLabel(disc_hint or (
+                            "Программа найдёт игру в магазине Steam и возьмёт оттуда описание, оценки, отзывы и "
                             "картинки. Запускаться игра будет по-прежнему своим файлом из её папки. Ключ и вход "
                             "для поиска не нужны." if for_disc else
                             "Программа найдёт игру в магазине Steam — у неё будут описание, скриншоты, трейлеры, "
-                            "обложки и кнопка «Установить». Для поиска не нужны ни ключ, ни вход.", self)
+                            "обложки и кнопка «Установить». Для поиска не нужны ни ключ, ни вход."), self)
         hint.setWordWrap(True)
         self.viewLayout.addWidget(hint)
         if synced:  # вернулись сюда после «Показать, что есть на моём аккаунте» — итог прямо в этом окне
@@ -7892,9 +7893,9 @@ class HomePage(QWidget):
         self.spin_button.clicked.connect(self.spin)
         # Что крутить — видно, когда кроме игр Steam есть порты или дисковые игры; варианты — из того, что есть
         self.pool_box = ComboBox(view)
-        self.pool_box.setToolTip("Что крутит рулетка: игры Steam, порты, дисковые игры — отдельно или вместе, "
-                                 "или одну из ваших коллекций")
-        self._pool_keys, self._pool_labels, self._pool_titles = [], [], {}
+        self.pool_box.setToolTip("Что крутит рулетка: игры Steam, порты, дисковые игры, игры для эмуляторов и XBOX — "
+                                 "отдельно или вместе, или одну из ваших коллекций")
+        self._pool_keys, self._pool_labels, self._pool_titles, self._pool_stored = [], [], {}, {}
         self.pool_box.currentIndexChanged.connect(self._on_pool_changed)
         # Фильтры по жанру, году и отзывам — только когда крутятся игры Steam
         self.filter_button = TransparentPushButton("Фильтры", view, FIF.FILTER)
@@ -7924,11 +7925,12 @@ class HomePage(QWidget):
         layout.addStretch(1)
         return view
 
-    # Варианты в порядке показа; показываются те, для которых все источники не пусты
-    POOLS = (("steam", "Игры Steam"), ("steam+ports+discs", "Все игры"), ("steam+ports", "Steam и порты"),
+    # Варианты в порядке показа; показываются те, для которых все источники не пусты. «Все игры» — все источники,
+    # где есть игры (ключ all), пары — как раньше, и каждый свой список отдельно
+    POOLS = (("steam", "Игры Steam"), ("all", "Все игры"), ("steam+ports", "Steam и порты"),
              ("steam+discs", "Steam и дисковые"), ("ports+discs", "Порты и дисковые"), ("ports", "Только порты"),
-             ("discs", "Только дисковые"))
-    POOL_NAMES = {"steam": "игры Steam", "ports": "порты", "discs": "дисковые"}
+             ("discs", "Только дисковые"), ("emus", "Только эмуляторы"), ("xbox", "Только XBOX"))
+    POOL_NAMES = {"steam": "игры Steam", "ports": "порты", "discs": "дисковые", "emus": "эмуляторы", "xbox": "XBOX"}
 
     def _on_pool_changed(self, index):
         if not 0 <= index < len(self._pool_keys):
@@ -7936,13 +7938,14 @@ class HomePage(QWidget):
         pool = self._pool_keys[index]
         if pool == self.win.roulette_pool():
             return
-        self.win.settings["roulette_pool"] = pool
-        core.save_settings(roulette_pool=pool)
+        stored = self._pool_stored.get(pool, pool)
+        self.win.settings["roulette_pool"] = stored
+        core.save_settings(roulette_pool=stored)
         core.log.info("Рулетка крутит: %s", self._pool_titles.get(pool, pool))
         self.current = None
         self.name_label.setText("")
         self.on_library_changed()
-        for page in (self.win.native_page, self.win.disc_page):
+        for page in self.win.own_pages():
             page.page.refresh()  # кнопка «Крутить ещё» на странице игры
 
     # --- Фон рулетки ---
@@ -8084,7 +8087,7 @@ class HomePage(QWidget):
             self.current = game
             self.reel.show_idle(self.win.roulette_games(), center=game)
             self.show_name(game["name"])
-            page = self.win.disc_page if core.is_disc(game) else self.win.native_page
+            page = self.win.page_for(game)
             self.win.switchTo(page)
             page.open_port(game)
             return
@@ -8119,7 +8122,7 @@ class HomePage(QWidget):
     def update_count(self):
         pool = self.win.roulette_pool()
         removed = self.win.roulette.has
-        lists = {"steam": self.win.library.games, "ports": self.win.ports.ports, "discs": self.win.discs.ports}
+        lists = self.win.pool_lists()
         counts = {key: sum(1 for g in games if not removed(g)) for key, games in lists.items()}
         sources = pool.split("+")
         filtered = self.win.filters_on()
@@ -8140,16 +8143,25 @@ class HomePage(QWidget):
         self._update_filter_button(pool, filtered)
         # Выбор «что крутить» — из тех вариантов, для которых есть игры, и коллекции, в которых есть игры.
         # Кроме Steam ничего нет — не показываем
-        available = set(self.win.pool_sources())
-        keys = [key for key, _ in self.POOLS if set(key.split("+")) <= available]
-        titles = dict(self.POOLS)
+        available = self.win.pool_sources()
+        everything = "+".join(available)
+        keys, titles, stored = [], {}, {}
+        for key, title in self.POOLS:
+            sources = available if key == "all" else key.split("+")
+            real = everything if key == "all" else key
+            if key == "all" and len(available) < 2 or not set(sources) <= set(available) or real in keys:
+                continue  # «Все игры» — только когда источников больше одного; пара, совпавшая со «всеми», не нужна
+            keys.append(real)
+            titles[real] = title
+            if key == "all":
+                stored[real] = "all"  # появятся новые списки — «Все игры» возьмут и их
         for collection in self.win.collections.collections:
             if self.win.collection_games(collection):
                 key = f"col:{collection['id']}"
                 keys.append(key)
                 titles[key] = f"Коллекция «{collection['name']}»"
         labels = [titles[key] for key in keys]
-        self._pool_titles = titles
+        self._pool_titles, self._pool_stored = titles, stored
         if keys != self._pool_keys or labels != self._pool_labels:
             self._pool_keys, self._pool_labels = keys, labels
             self.pool_box.blockSignals(True)
@@ -8285,7 +8297,8 @@ class HomePage(QWidget):
             self.win.game_origin = None  # выпала на рулетке — «назад» к рулетке, а не в коллекцию
             self.open_game(game)
 
-    SECTION_NAMES = {"steam": "«Игры Steam»", "port": "«Игры Native Port's»", "disc": "«Дисковые игры»"}
+    SECTION_NAMES = {"steam": "«Игры Steam»", "port": "«Игры Native Port's»", "disc": "«Дисковые игры»",
+                     "emu": "«Эмуляторы»", "xbox": "«Игры XBOX»"}
 
     def remove_from_roulette(self, game):
         """«Убрать из рулетки»: игра больше не выпадает на барабане, но остаётся в своём разделе и в коллекциях.
@@ -8431,11 +8444,16 @@ class GridFit(QObject):
 
 
 class CoverTileDelegate(QStyledItemDelegate):
-    """Плитка игры: обложка со скруглёнными углами и название под ней. Выбранные — в рамке цвета темы."""
+    """Плитка игры: обложка со скруглёнными углами и название под ней. Выбранные — в рамке цвета темы.
+
+    У игр для эмулятора и игр Game Pass обложка — в своей рамке с плашкой (FRAME_ROLE: (надпись, цвет, сверху ли)):
+    снизу — для какой консоли игра, сверху — «GAME PASS»."""
 
     COVER = QSize(132, 198)
     PAD = 8
     TEXT_H = 38  # две строки названия
+    FRAME_ROLE = Qt.UserRole + 20
+    FRAME_BAND = 20  # высота плашки с надписью
 
     def __init__(self, thumbs, parent=None):
         super().__init__(parent)
@@ -8477,12 +8495,15 @@ class CoverTileDelegate(QStyledItemDelegate):
                 font.setBold(True)
                 painter.setFont(font)
                 painter.drawText(cover.adjusted(10, 10, -10, -10), Qt.AlignCenter | Qt.TextWordWrap, name)
+        frame = index.data(self.FRAME_ROLE)
+        if frame:
+            self._paint_frame(painter, option, cover, frame)
         painter.restore()
         painter.setBrush(Qt.NoBrush)
         if selected:
             painter.setPen(QPen(themeColor(), 3))
             painter.drawRoundedRect(cover.adjusted(-1.5, -1.5, 1.5, 1.5), 9, 9)
-        else:
+        elif not frame:
             painter.setPen(QPen(QColor(255, 255, 255, 40) if dark else QColor(0, 0, 0, 30), 1))
             painter.drawPath(path)
 
@@ -8493,6 +8514,39 @@ class CoverTileDelegate(QStyledItemDelegate):
         painter.drawText(text_rect, Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap,
                          two_lines(name, QFontMetrics(option.font), round(text_rect.width())))
         painter.restore()
+
+    def _paint_frame(self, painter, option, cover, frame):
+        """Своя рамка обложки цвета консоли (или Game Pass) и плашка с надписью — снизу или сверху. Рисуется
+        внутри обложки (painter уже обрезан по её скруглению), поэтому плитка не меняет размер."""
+        label, color, top = frame
+        color = QColor(color)
+        band = QRectF(cover.x(), cover.top() if top else cover.bottom() - self.FRAME_BAND, cover.width(),
+                      self.FRAME_BAND)
+        painter.fillRect(band, color)
+        painter.setPen(QPen(color, 4))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(cover.adjusted(1, 1, -1, -1), 7, 7)
+        font = QFont(option.font)
+        font.setPixelSize(11)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(WHITE)
+        text = QFontMetrics(font).elidedText(label, Qt.ElideRight, round(band.width() - 12))
+        painter.drawText(band, Qt.AlignCenter, text)
+
+
+def cover_frame(game):
+    """Рамка обложки игры для FRAME_ROLE: игра для эмулятора — консоль снизу, Game Pass — «GAME PASS» сверху.
+    У остальных игр рамки нет (None)."""
+    if core.is_emu(game):
+        system = game.get("system") or "other"
+        return core.emu_system_title(system), core.emu_system_color(system), False
+    if core.is_xbox(game) and game.get("game_pass"):
+        return "GAME PASS", GAME_PASS_COLOR, True
+    return None
+
+
+GAME_PASS_COLOR = "#107C10"  # зелёный Xbox
 
 
 def two_lines(text, metrics, width):
@@ -8816,8 +8870,7 @@ class LibraryPage(QWidget):
         self.grid.viewport().update()
         self.backdrop.refresh(name)
         self.win.home_page.reel.refresh_cover(name)
-        for page in (getattr(self.win, "native_page", None), getattr(self.win, "disc_page", None),
-                     getattr(self.win, "collections_page", None)):
+        for page in list(getattr(self.win, "own_pages", lambda: [])()) + [getattr(self.win, "collections_page", None)]:
             if page is not None:  # «Своя обложка» и SteamGridDB для них — те же, что у игр Steam
                 page.cover_changed(name)
 
@@ -10789,7 +10842,8 @@ class SettingsPage(QWidget):
         shot_sound_row.addWidget(listen)
         shot_sound_row.addStretch(1)
         shots_hint = CaptionLabel(
-            "Работает, пока идёт порт или дисковая игра, запущенная из программы: снимается окно игры (без рамки), "
+            "Работает, пока идёт порт, дисковая игра или игра в эмуляторе, запущенная из программы: снимается окно "
+            "игры (без рамки), "
             "если оно сейчас впереди. Снимок — PNG в папке screenshots рядом с программой и в запись этой сессии "
             "в «Своих заметках». Поверх игры ничего не появляется — только щелчок затвора; не получилось — два "
             "низких «бип». Клавиша нужна программе только на время игры: потом она снова свободна. Чёрные снимки — "
@@ -10812,7 +10866,8 @@ class SettingsPage(QWidget):
         self.tray_box = CheckBox("Крестик сворачивает программу в трей, а не закрывает её", self)
         self.tray_box.setChecked(bool(settings.get("close_to_tray", True)))
         self.tray_box.toggled.connect(self.win.set_close_to_tray)
-        self.game_tray_box = CheckBox("Пока идёт порт или дисковая игра — окно в трее, после игры — обратно", self)
+        self.game_tray_box = CheckBox("Пока идёт порт, дисковая игра или эмулятор — окно в трее, после игры — обратно",
+                                      self)
         self.game_tray_box.setChecked(bool(settings.get("hide_while_playing", True)))
         self.game_tray_box.toggled.connect(self.set_hide_while_playing)
         startup_hint = CaptionLabel(
@@ -10883,7 +10938,8 @@ class SettingsPage(QWidget):
         phone_hint = CaptionLabel("Игры, порты и дисковые игры, коллекции и список рулетки — одним файлом для "
                                   "Backlog Roulette на Android. Перенесите его на телефон (Telegram, облако, кабель) "
                                   "и откройте в приложении: «Настройки» → «Импорт с ПК». Ключей, SteamID и путей к "
-                                  "папкам в файле нет.", self)
+                                  "папкам в файле нет. Игр для эмуляторов и XBOX приложение пока не знает — их в файле "
+                                  "тоже нет.", self)
         phone_hint.setWordWrap(True)
         # Раздел — на будущее: пока здесь только экспорт, потом появятся и другие настройки для телефона
         phone = SettingsSection(fluent_icon("PHONE", FIF.SHARE), "Мобильное приложение", content)
@@ -12032,13 +12088,17 @@ def offers_word(count):
 
 # --- Страница «Нативные ИИ порты» -------------------------------------------
 def _port_fingerprints(items):
-    """Отпечатки файлов запуска для новых портов: [отпечаток или {"error": текст}]. В фоновом потоке."""
-    result = []
+    """Отпечатки файлов запуска для новых портов: [отпечаток или {"error": текст}]. В фоновом потоке.
+    У игр для эмулятора файл запуска — один эмулятор на всех: он считается один раз."""
+    result, done = [], {}
     for item in items:
-        try:
-            result.append(core.port_fingerprint(item))
-        except OSError as e:
-            result.append({"error": str(e)})
+        key = os.path.normcase(os.path.join(item.get("folder") or "", item.get("exe") or ""))
+        if key not in done:
+            try:
+                done[key] = core.port_fingerprint(item)
+            except OSError as e:
+                done[key] = {"error": str(e)}
+        result.append(dict(done[key]))
     return result
 
 
@@ -12539,7 +12599,9 @@ class PortPage(QWidget):
     в последнем релизе на GitHub.
 
     У дисковой игры вместо GitHub — описание: из магазина Steam, если игру связали с ним («Найти в Steam»; там же
-    оценки, отзывы и обзоры изданий), а если её в Steam нет — начало статьи из Википедии."""
+    оценки, отзывы, обзоры изданий, скриншоты и трейлер), а если её в Steam нет — начало статьи из Википедии.
+    Игра для эмулятора — так же, плюс консоль, эмулятор и ссылка на его сайт. Игра XBOX — так же, только без
+    «Играть»: на ПК её не запустить."""
 
     SIDE_MARGIN, CONTENT_WIDTH, TEXT_WIDTH = GamePage.SIDE_MARGIN, GamePage.CONTENT_WIDTH, GamePage.TEXT_WIDTH
     ABOUT_TTL = 7 * 24 * 3600  # описание проекта с GitHub — раз в неделю
@@ -12557,6 +12619,13 @@ class PortPage(QWidget):
         self.store, self.store_reviews = None, None
         self._store_translating = self._wiki_loading = False
         self.press_links = []
+        # Скриншоты и трейлеры из магазина Steam — как на странице игры Steam
+        self.media, self.thumbs, self.trailer_sources = [], [], []
+        self.pixmaps = {}
+        self._wanted = None
+        self.overlay = None
+        self.loader = ImageLoader(self)
+        self.loader.loaded.connect(self._on_image)
         self.backdrop = None
         self.backdrop_opacity = 0.0
         self.backdrop_anim = QVariantAnimation(self)
@@ -12568,6 +12637,7 @@ class PortPage(QWidget):
 
         self.header = HeroHeader(self)
         self.header.artRequested.connect(lambda kind, step: self.port and step_art(self, self.port, kind, step))
+        self.header.playClicked.connect(self.play_trailer)
         self.play_button = PrimaryPushButton("Играть", self, FIF.PLAY)
         self.play_button.clicked.connect(lambda: self.ports_page.launch(self.port))
         # Прошли игру и удалили с диска — она остаётся здесь с наигранным временем и заметками, но запускать
@@ -12608,6 +12678,12 @@ class PortPage(QWidget):
         self.steam_button.setToolTip("Найдите игру в магазине Steam — здесь появятся её описание, оценки и отзывы. "
                                      "Запускаться она будет по-прежнему своим файлом")
         self.steam_button.clicked.connect(lambda: self.ports_page.link_steam(self.port))
+        # Игра для эмулятора: вместо проекта на GitHub — сайт эмулятора (только https, во внешнем браузере)
+        self.site_button = PushButton("Сайт эмулятора", self, FIF.GLOBE)
+        self.site_button.clicked.connect(self._open_site)
+        # Игра XBOX: отметка Game Pass — на обложке появляется зелёная рамка «GAME PASS»
+        self.gamepass_button = PushButton("Game Pass", self, fluent_icon("TAG", FIF.ACCEPT))
+        self.gamepass_button.clicked.connect(lambda: self.ports_page.toggle_game_pass(self.port))
         back_button = TransparentPushButton(ports_page.T["back"], self, FIF.LEFT_ARROW)
         back_button.clicked.connect(self.ports_page.show_list)
         # Открыли из коллекции — можно вернуться и туда
@@ -12617,10 +12693,29 @@ class PortPage(QWidget):
         buttons_box = QWidget(self)
         self.buttons = CenteredFlowLayout(buttons_box, spacing=12)
         for button in (self.play_button, self.update_button, self.updated_button, self.notes_button, self.repo_button,
-                       self.steam_button, self.folder_button, self.edit_button, self.cover_button, self.spin_button,
-                       self.roulette_button, self.complete_button, self.replay_button, self.collection_button,
-                       back_button):
+                       self.site_button, self.steam_button, self.gamepass_button, self.folder_button, self.edit_button,
+                       self.cover_button, self.spin_button, self.roulette_button, self.complete_button,
+                       self.replay_button, self.collection_button, back_button):
             self.buttons.addWidget(button)
+
+        # Скриншот на всю ширину колонки и лента превью — как на странице игры Steam; трейлер — ▶ в шапке
+        self.media_view = MediaView(self)
+        self.media_view.setMinimumHeight(200)
+        self.media_view.hide()
+        self.strip = QWidget()
+        self.strip_layout = QHBoxLayout(self.strip)
+        self.strip_layout.setContentsMargins(0, 0, 0, 0)
+        self.strip_layout.setSpacing(6)
+        self.strip_layout.addStretch(1)
+        self.strip_layout.addStretch(1)  # превью встают между двумя растяжками
+        self.strip_scroll = ScrollArea(self)
+        self.strip_scroll.setWidget(self.strip)
+        self.strip_scroll.setWidgetResizable(True)
+        self.strip_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.strip_scroll.setFixedHeight(Thumb.H + 6 + 14)
+        self.strip_scroll.setStyleSheet(
+            "QScrollArea, QScrollArea > QWidget > QWidget {background: transparent; border: none}")
+        self.strip_scroll.hide()
 
         self.chips_box = QWidget(self)
         self.chips = CenteredFlowLayout(self.chips_box, spacing=10)
@@ -12674,6 +12769,8 @@ class PortPage(QWidget):
         inner.setContentsMargins(0, 0, 0, 0)
         inner.setSpacing(16)
         inner.addWidget(buttons_box)
+        inner.addWidget(self.media_view)
+        inner.addWidget(self.strip_scroll)
         inner.addWidget(self.chips_box)
         inner.addSpacing(8)
         inner.addLayout(centered(self.about_box, self.TEXT_WIDTH))
@@ -12720,6 +12817,7 @@ class PortPage(QWidget):
                                                     port["name"], message))
         self.store, self.store_reviews, self.press_links = None, None, []
         self._store_translating = self._wiki_loading = False
+        self._reset_media()
         clear_layout(self.players_box)
         self.players_title.hide()
         if not self.ports_page.GITHUB:
@@ -12765,6 +12863,7 @@ class PortPage(QWidget):
             core.log.warning("Страница Steam для «%s» не загрузилась: %s", self.port["name"], error)
         self.store = details or {}
         if details:
+            self._show_media(details)
             name = self.port["name"]
             self.press_links = [(title, f"https://www.google.com/search?q={quote_plus(f'site:{site} {name} обзор')}")
                                 for title, site in REVIEW_SITES]
@@ -12832,11 +12931,13 @@ class PortPage(QWidget):
         if port is None:
             return
         disc = not self.ports_page.GITHUB
+        kind, launch = self.ports_page.KIND, self.ports_page.LAUNCH
         latest = port.get("latest") or {}
         completed = bool(port.get("completed_at"))
         update = core.port_has_update(port) and not completed  # пройденную обновлять незачем
         self.update_button.setVisible(update)
         self.updated_button.setVisible(update)
+        self.play_button.setVisible(launch)  # игру XBOX на ПК не запустить
         self.play_button.setEnabled(not completed)
         self.play_button.setText("Пройдена" if completed else "Играть")
         self.play_button.setIcon(trophy_icon() if completed else FIF.PLAY)
@@ -12846,6 +12947,16 @@ class PortPage(QWidget):
         self.complete_button.setVisible(not completed)
         self.replay_button.setVisible(completed)
         self.repo_button.setVisible(bool(port.get("repo")))
+        self.folder_button.setVisible(launch)
+        self.folder_button.setText("Папка с игрой" if kind == "emu" else "Открыть папку")
+        site = core.emulator_site(port.get("emulator")) if kind == "emu" else ""
+        self.site_button.setVisible(bool(site))
+        if site:
+            self.site_button.setToolTip(f"{core.emulator_title(port.get('emulator'))} — {site}")
+        self.gamepass_button.setVisible(kind == "xbox")
+        if kind == "xbox":
+            self.gamepass_button.setText("Убрать Game Pass" if port.get("game_pass") else "Отметить Game Pass")
+            self.gamepass_button.setToolTip("Игра из подписки Game Pass — на обложке зелёная рамка «GAME PASS»")
         self.steam_button.setVisible(disc and not port.get("appid"))
         origin = self.origin
         self.collection_button.setVisible(origin is not None)
@@ -12863,7 +12974,23 @@ class PortPage(QWidget):
             (port.get("appid") and self.store is None) or self._wiki_loading))
 
         clear_layout(self.chips)
-        chips = [InfoChip("Запуск", os.path.basename(port["exe"]), None, self.chips_box)]
+        if kind == "emu":
+            system = port.get("system") or "other"
+            chips = [InfoChip("Консоль", core.emu_system_title(system), None, self.chips_box),
+                     InfoChip("Эмулятор", core.emulator_title(port.get("emulator"), port["exe"]), site or None,
+                              self.chips_box),
+                     InfoChip("Образ", os.path.basename(port.get("rom") or "") or "не выбран", None, self.chips_box)]
+            discs = core.game_discs(port)
+            if len(discs) > 1:
+                number = next((i for i, d in enumerate(discs, 1) if core.same_path(d, port.get("rom"))), 1)
+                chips.append(InfoChip("Диски", f"{len(discs)} · сейчас диск {number}", None, self.chips_box))
+                if not completed:
+                    self.play_button.setToolTip(f"Дисков у игры: {len(discs)} — программа спросит, какой вставить")
+        elif kind == "xbox":
+            chips = [InfoChip("Платформа", "Xbox · Game Pass" if port.get("game_pass") else "Xbox", None,
+                              self.chips_box)]
+        else:
+            chips = [InfoChip("Запуск", os.path.basename(port["exe"]), None, self.chips_box)]
         if self.win.play_tracker.playing(port):
             chips.append(InfoChip("Наиграно", "играете сейчас", None, self.chips_box))
         elif port.get("playtime"):
@@ -12901,7 +13028,7 @@ class PortPage(QWidget):
             for title, url in self.press_links:
                 chips.append(InfoChip("Обзор", title, url, self.chips_box))
         chips.append(InfoChip("How Long To Beat", "Сколько проходить", hltb_url(port["name"]), self.chips_box))
-        if disc:  # как запустить старую игру на современной системе
+        if kind == "disc":  # как запустить старую игру на современной системе
             chips.append(InfoChip("PCGamingWiki", "Исправления и улучшения", pcgamingwiki_url(port["name"]),
                                   self.chips_box))
         if wiki:
@@ -12998,6 +13125,96 @@ class PortPage(QWidget):
     def _spin_again(self):
         self.win.switchTo(self.win.home_page)
         self.win.home_page.spin_again()
+
+    def _open_site(self):
+        site = core.emulator_site((self.port or {}).get("emulator"))
+        if site:  # только https из таблицы эмуляторов — не из файла списка
+            QDesktopServices.openUrl(QUrl(site))
+
+    # --- Скриншоты и трейлер из магазина Steam ---
+    def _reset_media(self):
+        self.stop_video()
+        self.media, self._wanted = [], None
+        self.pixmaps.clear()
+        self.loader.clear()
+        for thumb in self.thumbs:
+            self.strip_layout.removeWidget(thumb)  # сразу, иначе новые превью встанут вперемешку со старыми
+            thumb.deleteLater()
+        self.thumbs, self.trailer_sources = [], []
+        self.header.set_trailer(False)
+        self.media_view.hide()
+        self.strip_scroll.hide()
+
+    def _show_media(self, details):
+        """Игра связана со Steam — её скриншоты лентой и трейлер (▶ в шапке), как на странице игры Steam."""
+        self.trailer_sources = [url for movie in details.get("movies") or []
+                                for url in (movie.get("sources") or [movie.get("url")]) if url]
+        self.header.set_trailer(bool(self.trailer_sources))
+        self.media = [{"thumb": s["thumb"], "full": s["full"]} for s in details.get("screenshots") or []]
+        for i, item in enumerate(self.media):
+            thumb = Thumb(False, self.strip)
+            thumb.clicked.connect(lambda i=i: self.select(i))
+            self.strip_layout.insertWidget(i + 1, thumb)  # после левой растяжки
+            self.thumbs.append(thumb)
+            if item["thumb"]:
+                self.loader.request(item["thumb"])
+        self.media_view.setVisible(bool(self.media))
+        self.strip_scroll.setVisible(len(self.media) > 1)
+        if self.media:
+            self.select(0)
+            QTimer.singleShot(0, self._fit_media)
+
+    def select(self, index):
+        item = self.media[index]
+        for i, thumb in enumerate(self.thumbs):
+            thumb.set_selected(i == index)
+        self._wanted = item["full"]
+        if item["full"] in self.pixmaps:
+            self.media_view.show_pixmap(self.pixmaps[item["full"]])
+            return
+        preview = self.pixmaps.get(item["thumb"])
+        if preview:
+            self.media_view.show_pixmap(preview)
+        else:
+            self.media_view.show_text("Загружаю…")
+        self.loader.request(item["full"], front=True)
+
+    def _on_image(self, url, content):
+        pixmap = QPixmap()
+        if not content or not pixmap.loadFromData(content):
+            return
+        self.pixmaps[url] = pixmap
+        for item, thumb in zip(self.media, self.thumbs):
+            if item["thumb"] == url:
+                thumb.set_pixmap(pixmap)
+        if url == self._wanted:
+            self.media_view.show_pixmap(pixmap)
+
+    def play_trailer(self):
+        if not self.trailer_sources or self.port is None:
+            return
+        if self.overlay is None:
+            self.overlay = VideoOverlay(self.win)
+            self.overlay.failed.connect(lambda: notify(
+                "warning", self.win, "Трейлер не воспроизводится",
+                "Проигрыватель не открыл видео из Steam. Трейлер можно посмотреть в магазине Steam."))
+            self.overlay.closed.connect(lambda: self.header.hold_movie(False))
+        self.header.hold_movie(True)
+        self.overlay.play(self.trailer_sources, self.port["name"], self.backdrop)
+
+    def stop_video(self):
+        if self.overlay:
+            self.overlay.close_video()
+
+    def _fit_media(self):
+        # 16:9 по ширине страницы, но не выше ~60% окна — как на странице игры Steam
+        width = self.media_view.width()
+        limit = max(220, round(self.scroll.viewport().height() * 0.6))
+        self.media_view.setFixedHeight(max(220, min(round(width * 9 / 16), limit)))
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.stop_video()
 
     # --- Перевод ---
     # Переводы хранятся в порте ("translations": {ключ текста: перевод}): второй раз страница открывается
@@ -13120,6 +13337,8 @@ class PortPage(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         QTimer.singleShot(0, lambda: self.header.fit_width(self.scroll.viewport().width()))
+        if self.media:
+            QTimer.singleShot(0, self._fit_media)
 
 
 class HotkeyButton(PushButton):
@@ -13532,6 +13751,9 @@ class NativePortsPage(QWidget):
     LIBRARY = "ports"  # список на главном окне: win.ports
     ROOT_SETTING = "ports_root"
     GITHUB = True
+    KIND = "port"  # вид игр в списке (core.OWN_KINDS)
+    LAUNCH = True  # игры запускаются на этом ПК (у игр XBOX — нет)
+    EXTRA_FIELDS = ()  # поля новой игры сверх папки и файла запуска (у игр для эмулятора — образ и консоль)
     T = {
         "title": "Нативные ИИ порты",
         "empty_title": "Порты и игры, которые уже стоят на ПК",
@@ -13754,6 +13976,10 @@ class NativePortsPage(QWidget):
                 continue
             update = core.port_has_update(port) and not port.get("completed_at")
             details = []
+            if self.KIND == "emu":
+                details.append(core.emu_system_title(port.get("system") or "other"))
+            elif self.KIND == "xbox" and port.get("game_pass"):
+                details.append("Game Pass")
             if tracker.playing(port):
                 details.append("играете сейчас")
             elif port.get("playtime"):
@@ -13771,6 +13997,7 @@ class NativePortsPage(QWidget):
                 if view is self.grid:
                     item.setData(PortTileDelegate.UPDATE_ROLE, update)
                     item.setData(PortTileDelegate.COMPLETED_ROLE, bool(port.get("completed_at")))
+                    item.setData(CoverTileDelegate.FRAME_ROLE, cover_frame(port))
                     item.setSizeHint(QSize(tile.width() + 2 * CoverTileDelegate.PAD,
                                            tile.height() + CoverTileDelegate.TEXT_H + 2 * CoverTileDelegate.PAD))
                 view.addItem(item)
@@ -13839,9 +14066,12 @@ class NativePortsPage(QWidget):
         play.triggered.connect(lambda: self.launch(port))
         page = Action(FIF.GAME, "Открыть страницу", menu)
         page.triggered.connect(lambda: self.open_from_list(port))
-        folder = Action(FIF.FOLDER, "Открыть папку", menu)
+        folder = Action(FIF.FOLDER, "Папка с игрой" if self.KIND == "emu" else "Открыть папку", menu)
         folder.triggered.connect(lambda: self.open_folder(port))
-        menu.addActions([page, folder] if completed else [play, page, folder])
+        if not self.LAUNCH:
+            menu.addAction(page)
+        else:
+            menu.addActions([page, folder] if completed else [play, page, folder])
         if core.port_has_update(port) and not completed:
             release = Action(FIF.DOWNLOAD, f"Скачать обновление {port['latest']['tag']}", menu)
             release.triggered.connect(lambda: self.open_release(port))
@@ -13863,6 +14093,11 @@ class NativePortsPage(QWidget):
         own_cover = Action(FIF.PHOTO, "Своя обложка…", menu)
         own_cover.triggered.connect(lambda: self.win.library_page.choose_cover(port))
         menu.addActions([edit, own_cover])
+        if self.KIND == "xbox":
+            game_pass = Action(fluent_icon("TAG", FIF.ACCEPT),
+                               "Убрать Game Pass" if port.get("game_pass") else "Отметить Game Pass", menu)
+            game_pass.triggered.connect(lambda: self.toggle_game_pass(port))
+            menu.addAction(game_pass)
         if not self.GITHUB:  # дисковая игра: описание, оценки и отзывы — из её страницы в Steam
             link = Action(FIF.SEARCH, "Связать с другой игрой Steam…" if port.get("appid") else "Найти в Steam…", menu)
             link.triggered.connect(lambda: self.link_steam(port))
@@ -14001,7 +14236,7 @@ class NativePortsPage(QWidget):
                 failed.append(f"«{item['name']}»: {fingerprint['error']}")
                 continue
             added.append(self.lib.add(item["name"], item["folder"], item["exe"], item.get("repo") or "",
-                                      fingerprint))
+                                      fingerprint, **{k: item[k] for k in self.EXTRA_FIELDS if k in item}))
         if added and not self.save():
             return
         for port in added:
@@ -14062,8 +14297,8 @@ class NativePortsPage(QWidget):
         меняется: игра по-прежнему запускается своим файлом из своей папки, Steam для этого не нужен."""
         if not port:
             return
-        dialog = AddGameDialog(self.win, port, for_disc=True)
-        core.log.info("Открыто окно «Найти в Steam» для дисковой игры «%s»", port["name"])
+        dialog = AddGameDialog(self.win, port, for_disc=True, disc_hint=self.T.get("steam_hint", ""))
+        core.log.info("Открыто окно «Найти в Steam» для «%s» (%s)", port["name"], self.T["title"])
         accepted = dialog.exec()
         choice = dialog.choice
         dialog.deleteLater()
@@ -14074,14 +14309,16 @@ class NativePortsPage(QWidget):
         if not self.save():
             port["appid"] = old
             return
-        core.log.info("Дисковая игра «%s» связана со Steam: «%s» (%s)", port["name"], choice["name"], choice["appid"])
+        core.log.info("«%s» (%s) связана со Steam: «%s» (%s)", port["name"], self.T["title"], choice["name"],
+                      choice["appid"])
         self.win.covers.forget(port["name"])  # с номером в Steam найдутся и картинки Steam
         self.win.portsChanged.emit()
         if self.page.port is port:
             self.page.show_port(port, keep_origin=True)
         notify("success", self.win, "Игра связана со Steam",
-               f"«{port['name']}» → «{choice['name']}». Описание, оценки и отзывы — оттуда; запускается игра "
-               "по-прежнему своим файлом.", 7000)
+               f"«{port['name']}» → «{choice['name']}». " + self.T.get(
+                   "steam_linked", "Описание, оценки и отзывы — оттуда; запускается игра по-прежнему своим файлом."),
+               7000)
 
     def unlink_steam(self, port):
         if not port or not port.get("appid"):
@@ -14090,7 +14327,7 @@ class NativePortsPage(QWidget):
         if not self.save():
             port["appid"] = old
             return
-        core.log.info("Дисковая игра «%s» отвязана от Steam", port["name"])
+        core.log.info("«%s» (%s) отвязана от Steam", port["name"], self.T["title"])
         self.win.portsChanged.emit()
         if self.page.port is port:
             self.page.show_port(port, keep_origin=True)
@@ -14131,6 +14368,10 @@ class NativePortsPage(QWidget):
     def launch(self, port):
         if not port:
             return
+        if not self.LAUNCH:  # из рулетки или коллекции: игру XBOX на ПК не запустить
+            notify("info", self.win, "Запускается на консоли",
+                   f"«{port['name']}» — игра XBOX: включите её на консоли. Приятной игры 🎮", 5000)
+            return
         if port.get("completed_at"):  # кнопка «Пройдена» выключена, но запуск мог прийти и из рулетки или коллекции
             notify("info", self.win, "Игра пройдена",
                    f"«{port['name']}»: {completed_text(port)}. Снова играть — «Вернуть в игру» на её странице.")
@@ -14157,10 +14398,12 @@ class NativePortsPage(QWidget):
             port["fingerprint"] = result["fingerprint"]
             if update:
                 port["installed_tag"] = latest  # файл новый — значит, обновили до последней версии
+            self._share_fingerprint(port)
             self.save()
             self.win.portsChanged.emit()
         elif result["fingerprint"] != port.get("fingerprint"):
             port["fingerprint"] = result["fingerprint"]  # тот же файл, просто сменилось время — запоминаем
+            self._share_fingerprint(port)
             self.save()
         try:
             core.launch_port(port)
@@ -14172,6 +14415,15 @@ class NativePortsPage(QWidget):
         notify("success", self.win, "Запускаю", f"«{port['name']}». Приятной игры 🎮", 3000)
 
     # --- Обновления ---
+    def _share_fingerprint(self, port):
+        """Эмулятор обновили и запуск подтвердили — новый отпечаток у всех его игр: спрашивать про каждую незачем."""
+        if self.KIND != "emu":
+            return
+        path = os.path.normcase(os.path.join(port["folder"], port["exe"]))
+        for game in self.lib.ports:
+            if game is not port and os.path.normcase(os.path.join(game["folder"], game["exe"])) == path:
+                game["fingerprint"] = dict(port["fingerprint"])
+
     def open_release(self, port):
         url = (port.get("latest") or {}).get("url") if port else None
         if url:
@@ -14294,6 +14546,7 @@ class DiscGamesPage(NativePortsPage):
     LIBRARY = "discs"
     ROOT_SETTING = "discs_root"
     GITHUB = False
+    KIND = "disc"
     T = {
         "title": "Дисковые игры",
         "empty_title": "Игры с дисков, которые уже стоят на ПК",
@@ -14333,9 +14586,983 @@ class DiscGamesPage(NativePortsPage):
     }
 
 
+# --- Живой поиск названия ---------------------------------------------------------------
+class LiveSuggestions(QWidget):
+    """Подсказки под полем названия: пока пишете, ниже появляются подходящие игры (из Steam или SteamGridDB).
+    Ищет после паузы в наборе; ответ на устаревший запрос не показывает. Выбрали строку — сигнал picked.
+    Строки set_fixed (например, название, прочитанное с диска игры) стоят первыми всегда."""
+
+    picked = Signal(object)
+    DELAY = 450  # мс после последней буквы
+    MIN_CHARS = 2
+    ROWS = 5
+
+    def __init__(self, parent, edit, search, host, label):
+        super().__init__(parent)
+        self.edit, self.search, self.host, self.label = edit, search, host, label
+        self._token = 0
+        self._fixed, self._found, self._rows = [], [], []
+        self._searched = False
+        self.status = plain_label("", self, caption=True)
+        self.status.hide()
+        self.list = ListWidget(self)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.list.itemClicked.connect(self._on_click)
+        self.list.hide()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(self.list)
+        layout.addWidget(self.status)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(self.DELAY)
+        self.timer.timeout.connect(self._search)
+        edit.textEdited.connect(lambda _text: self.timer.start())
+
+    def set_fixed(self, items):
+        self._fixed = list(items)
+        self._fill()
+
+    def clear_found(self):
+        """Выбрали строку — подсказки по набранному больше не нужны (пока снова не начнут писать)."""
+        self.timer.stop()
+        self._token += 1
+        self._found, self._searched = [], False
+        self._fill()
+
+    def _search(self):
+        term = self.edit.text().strip()
+        self._token += 1
+        if len(term) < self.MIN_CHARS:
+            self._found, self._searched = [], False
+            self._fill()
+            return
+        token = self._token
+        self.status.setText("Ищу…")
+        self.status.show()
+        # Фон — от окна программы: окно с подсказками могут закрыть раньше, чем придёт ответ
+        worker = Worker(self.search, term, parent=self.host)
+        worker.finished.connect(lambda found: self._deliver(token, found))
+        worker.failed.connect(lambda _message: self._deliver(token, []))
+        worker.start()
+
+    def _deliver(self, token, found):
+        try:
+            if token != self._token:
+                return
+            self._found, self._searched = list(found or []), True
+            self._fill()
+        except RuntimeError:
+            pass  # окно уже закрыли
+
+    def _fill(self):
+        self.list.clear()
+        self._rows = self._fixed + [item for item in self._found
+                                    if all(item.get("name") != f.get("name") for f in self._fixed)]
+        for item in self._rows:
+            self.list.addItem(QListWidgetItem(self.label(item)))
+        if self._rows:
+            row = self.list.sizeHintForRow(0) if self.list.count() else 36
+            self.list.setFixedHeight(max(row, 30) * min(len(self._rows), self.ROWS) + 6)
+        self.list.setVisible(bool(self._rows))
+        nothing = self._searched and not self._found
+        self.status.setText("Ничего не нашлось — можно оставить своё название." if nothing else "")
+        self.status.setVisible(nothing)
+
+    def _on_click(self, item):
+        row = self.list.row(item)
+        if 0 <= row < len(self._rows):
+            self.picked.emit(self._rows[row])
+
+
+# --- Вкладка «Эмуляторы» ------------------------------------------------------------
+def known_emulators(lib):
+    """Эмуляторы, которыми уже запускаются игры из списка: [{"folder", "exe", "emulator"}] без повторов."""
+    seen, result = set(), []
+    for game in lib.ports:
+        key = os.path.normcase(os.path.join(game["folder"], game["exe"]))
+        if key not in seen:
+            seen.add(key)
+            result.append({"folder": game["folder"], "exe": game["exe"],
+                           "emulator": game.get("emulator") or core.detect_emulator(game["exe"])})
+    return result
+
+
+class EmulatorPicker(QWidget):
+    """Выбор эмулятора: те, что уже знакомы программе по списку «Эмуляторы», и «Другой эмулятор…» — его .exe.
+    Какой это эмулятор и для каких он консолей, программа узнаёт по имени файла (core.EMULATORS)."""
+
+    changed = Signal()
+
+    def __init__(self, parent, known, current=None):
+        super().__init__(parent)
+        self.items = [dict(item) for item in known]
+        if current and current.get("exe"):
+            index = self._find(current["folder"], current["exe"])
+            if index < 0:
+                self.items.insert(0, dict(current))
+        self.box = ComboBox(self)
+        self.box.setMinimumWidth(300)
+        self.button = TransparentPushButton("Другой эмулятор…", self, FIF.APPLICATION)
+        self.button.setToolTip("Файл запуска эмулятора (.exe). Программа его не запускает — только запоминает "
+                               "и сверяет контрольную сумму перед каждым запуском игры")
+        self.button.clicked.connect(self._choose)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(self.box, 1)
+        layout.addWidget(self.button)
+        self._fill()
+        if current and current.get("exe"):
+            self.box.setCurrentIndex(self._find(current["folder"], current["exe"]))
+        self.box.currentIndexChanged.connect(lambda *_: self.changed.emit())
+
+    def _find(self, folder, exe):
+        path = os.path.normcase(os.path.join(folder, exe))
+        return next((i for i, item in enumerate(self.items)
+                     if os.path.normcase(os.path.join(item["folder"], item["exe"])) == path), -1)
+
+    @staticmethod
+    def _label(item):
+        return f"{core.emulator_title(item['emulator'], item['exe'])} — {os.path.basename(item['folder'])}"
+
+    def _fill(self):
+        self.box.blockSignals(True)
+        self.box.clear()
+        self.box.addItems([self._label(item) for item in self.items] or ["Эмулятор не выбран"])
+        self.box.setEnabled(bool(self.items))
+        self.box.blockSignals(False)
+
+    def current(self):
+        index = self.box.currentIndex()
+        return self.items[index] if self.items and 0 <= index < len(self.items) else None
+
+    def _choose(self):
+        start = (self.current() or {}).get("folder") or ""
+        path, _ = QFileDialog.getOpenFileName(self, "Файл запуска эмулятора", start, "Программы (*.exe)")
+        if not path:
+            return
+        path = os.path.normpath(path)
+        folder, exe = os.path.dirname(path), os.path.basename(path)
+        index = self._find(folder, exe)
+        if index < 0:
+            self.items.insert(0, {"folder": folder, "exe": exe, "emulator": core.detect_emulator(exe)})
+            self._fill()
+            index = 0
+        self.box.setCurrentIndex(index)
+        self.changed.emit()
+
+
+def rom_filter(emulator):
+    """Фильтр окна выбора файла: образы консолей этого эмулятора и «все файлы»."""
+    exts = sorted({ext for s in core.emulator_systems(emulator) for ext in core.EMU_SYSTEMS[s][2]}) \
+        or list(core.EMU_ROM_EXTENSIONS)
+    return f"Образы игр ({' '.join('*' + e for e in exts)});;Все файлы (*)"
+
+
+class EmuEditDialog(MessageBoxBase):
+    """Игра для эмулятора: название, эмулятор, файл игры (образ или ROM), консоль и параметры запуска.
+
+    Консоль и параметры «сразу в игру» программа подставляет сама — по эмулятору и расширению образа; их видно
+    и можно поправить. Сохранить нельзя без эмулятора и без файла игры, а программу или ярлык образом не взять.
+
+    Название: подставляется из имени файла, а потом — из самого диска (код диска и база игр эмулятора, заголовок
+    диска); пока пишете своё, ниже подсказки из SteamGridDB. Игра на нескольких дисках — все её диски («Диски…»
+    или сами, если они лежат рядом и отличаются только номером диска)."""
+
+    def __init__(self, parent, game, title, known):
+        super().__init__(parent)
+        self.win = parent
+        self.result_game = None
+        self.rom = game.get("rom") or ""
+        self.discs = list(core.game_discs(game))
+        self._custom_args = bool(game.get("args"))  # параметры поправлены вручную — смена консоли их не сбрасывает
+        self._auto_name = not game.get("name")  # название подставила программа — его можно заменить найденным на диске
+        self._custom_system = bool(game.get("system"))
+        self._identify_token = 0
+        self.disc_info = {}
+        self.viewLayout.addWidget(SubtitleLabel(title, self))
+
+        self.name_edit = LineEdit(self)
+        self.name_edit.setText(game.get("name") or "")
+        self.name_edit.setPlaceholderText("Подставится из имени файла игры — или начните писать")
+        self.name_edit.textEdited.connect(lambda _text: setattr(self, "_auto_name", False))
+        key = core.griddb_key()
+        # Подсказки по набранному — из SteamGridDB (там есть и консольные игры); без ключа — только с диска
+        self.suggestions = LiveSuggestions(self, self.name_edit,
+                                           (lambda term: core.griddb_suggestions(term, key)) if key else (lambda term: []),
+                                           parent, self._suggestion_label)
+        self.suggestions.picked.connect(self._on_suggestion)
+        current = {"folder": game["folder"], "exe": game["exe"], "emulator": game.get("emulator") or ""} \
+            if game.get("exe") else None
+        self.picker = EmulatorPicker(self, known, current)
+        self.picker.changed.connect(self._on_emulator)
+        self.rom_label = plain_label(self.rom or "Файл игры не выбран", self, caption=True)
+        rom_button = TransparentPushButton("Выбрать файл игры…", self, FIF.FOLDER)
+        rom_button.setToolTip("Образ диска или ROM: .cue, .chd, .iso, .sfc и т. п. Программа его не запускает — "
+                              "только читает начало, чтобы узнать название, и передаёт эмулятору")
+        rom_button.clicked.connect(self._choose_rom)
+        self.discs_label = plain_label("", self, caption=True)
+        discs_button = TransparentPushButton("Диски…", self, fluent_icon("ALBUM", FIF.FOLDER))
+        discs_button.setToolTip("Игра на нескольких дисках: выберите сразу все её диски (Ctrl — несколько файлов). "
+                                "При запуске программа спросит, с какого диска начать")
+        discs_button.clicked.connect(self._choose_discs)
+        self.system_box = ComboBox(self)
+        self.system_box.setMinimumWidth(240)
+        self.system_box.currentIndexChanged.connect(self._on_system)
+        self.args_edit = LineEdit(self)
+        self.args_edit.setPlaceholderText("{rom} — место файла игры")
+        self.args_edit.textEdited.connect(lambda _text: setattr(self, "_custom_args", True))
+        args_reset = TransparentPushButton("По умолчанию", self, FIF.CANCEL)
+        args_reset.setToolTip("Параметры «сразу в игру» для этого эмулятора")
+        args_reset.clicked.connect(self._reset_args)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+        form.addWidget(BodyLabel("Эмулятор", self), 0, 0)
+        form.addWidget(self.picker, 0, 1, 1, 2)
+        form.addWidget(BodyLabel("Игра", self), 1, 0)
+        form.addWidget(self.rom_label, 1, 1)
+        form.addWidget(rom_button, 1, 2)
+        form.addWidget(BodyLabel("Диски", self), 2, 0)
+        form.addWidget(self.discs_label, 2, 1)
+        form.addWidget(discs_button, 2, 2)
+        form.addWidget(BodyLabel("Название", self), 3, 0)
+        form.addWidget(self.name_edit, 3, 1, 1, 2)
+        form.addWidget(self.suggestions, 4, 1, 1, 2)
+        form.addWidget(BodyLabel("Консоль", self), 5, 0)
+        form.addWidget(self.system_box, 5, 1, 1, 2, Qt.AlignLeft)
+        form.addWidget(BodyLabel("Параметры", self), 6, 0)
+        form.addWidget(self.args_edit, 6, 1)
+        form.addWidget(args_reset, 6, 2)
+        form.setColumnStretch(1, 1)
+        self.viewLayout.addLayout(form)
+        self.about = plain_label("", self, caption=True)
+        self.viewLayout.addWidget(self.about)
+        self.status = plain_label("", self, caption=True)
+        self.status.setTextColor(*WARNING_TEXT)
+        self.status.hide()
+        self.viewLayout.addWidget(self.status)
+
+        self.widget.setMinimumWidth(680)
+        self.widget.setMaximumWidth(680)
+        self.yesButton.setText("Сохранить")
+        self.yesButton.clicked.disconnect()
+        self.yesButton.clicked.connect(self._save)
+        self.cancelButton.setText("Отмена")
+        self._fill_systems(game.get("system") or "")
+        if game.get("args"):
+            self.args_edit.setText(core.join_emulator_args(game["args"]))
+        else:
+            self._reset_args()
+        self._update_discs()
+        self._update_about()
+        if self.rom:
+            self._identify()
+
+    def _emulator_key(self):
+        item = self.picker.current()
+        return (item or {}).get("emulator") or ""
+
+    def _fill_systems(self, wanted=""):
+        key = self._emulator_key()
+        systems = core.emulator_systems(key) + ["other"]
+        if wanted and wanted not in systems:
+            systems.insert(0, wanted)
+        if not wanted:
+            wanted = core.guess_system(key, self.rom) if self.rom else systems[0]
+        self._systems = systems
+        self.system_box.blockSignals(True)
+        self.system_box.clear()
+        self.system_box.addItems([core.emu_system_title(s) for s in systems])
+        self.system_box.setCurrentIndex(systems.index(wanted) if wanted in systems else 0)
+        self.system_box.blockSignals(False)
+
+    def _system(self):
+        index = self.system_box.currentIndex()
+        return self._systems[index] if 0 <= index < len(self._systems) else "other"
+
+    def _reset_args(self):
+        self._custom_args = False
+        self.args_edit.setText(core.join_emulator_args(core.default_emulator_args(self._emulator_key(), self._system())))
+
+    def _on_emulator(self):
+        self._fill_systems()
+        self._reset_args()
+        self._update_about()
+        if self.rom:
+            self._identify()  # база игр — в папке эмулятора: у другого эмулятора она своя
+
+    def _on_system(self, *_):
+        self._custom_system = True  # консоль выбрали вручную — прочитанная с диска её не заменит
+        if not self._custom_args:
+            self._reset_args()  # у RetroArch от консоли зависит ядро
+        self._update_about()
+
+    def _update_about(self):
+        item = self.picker.current()
+        if not item:
+            text = "Выберите эмулятор — его файл запуска (.exe). Игры запускаются в нём сразу, без его меню."
+        elif item["emulator"]:
+            site = core.emulator_site(item["emulator"])
+            text = (f"{core.emulator_title(item['emulator'])} — эмулятор: "
+                    f"{', '.join(core.emu_system_title(s) for s in core.emulator_systems(item['emulator']))}."
+                    + (f" Сайт: {site}." if site else "") +
+                    " Параметры подставлены — с ними игра откроется сразу, без меню эмулятора.")
+        else:
+            text = ("Этот эмулятор программе не знаком — игра откроется параметром «файл игры». Если эмулятор "
+                    "при этом показывает своё меню, впишите его параметры «сразу в игру» — они есть в его справке.")
+        if self.disc_info.get("serial"):
+            text += f" Код диска: {self.disc_info['serial']}."
+        self.about.setText(text + " Описание, скриншоты и трейлер — из Steam («Найти в Steam»), если игра там "
+                                  "есть, или из Википедии; обложки — из SteamGridDB.")
+
+    # --- Название: с диска и подсказки ---
+    @staticmethod
+    def _suggestion_label(item):
+        if item.get("detail"):
+            return f"{item['name']}   ·   {item['detail']}"
+        return f"{item['name']} ({item['year']})" if item.get("year") else item["name"]
+
+    def _on_suggestion(self, item):
+        self.name_edit.setText(item["name"])
+        self._auto_name = False
+        self.suggestions.clear_found()
+
+    def _identify(self):
+        """Прочитать начало образа: код диска, название из заголовка и из базы эмулятора — в фоне."""
+        self._identify_token += 1
+        token = self._identify_token
+        self.disc_info = {}
+        self.suggestions.set_fixed([])
+        folder = (self.picker.current() or {}).get("folder") or ""
+        worker = Worker(core.identify_rom, self.rom, folder, parent=self.win)
+        worker.finished.connect(lambda info: self._on_identified(token, info))
+        worker.start()
+
+    def _on_identified(self, token, info):
+        try:
+            if token != self._identify_token:
+                return
+            self.disc_info = info or {}
+            serial = self.disc_info.get("serial") or ""
+            fixed = []
+            if self.disc_info.get("name"):
+                fixed.append({"name": self.disc_info["name"], "detail": f"по коду диска {serial}"})
+            if self.disc_info.get("title") and self.disc_info["title"] != self.disc_info.get("name"):
+                fixed.append({"name": self.disc_info["title"], "detail": "из заголовка диска"})
+            self.suggestions.set_fixed(fixed)
+            if fixed and self._auto_name:  # название из имени файла — заменяем найденным на диске
+                self.name_edit.setText(fixed[0]["name"])
+            system = self.disc_info.get("system")
+            if system and not self._custom_system and system in self._systems and system != self._system():
+                self._fill_systems(system)
+                if not self._custom_args:
+                    self._reset_args()
+            self._update_about()
+        except RuntimeError:
+            pass  # окно уже закрыли
+
+    # --- Файл игры и диски ---
+    def _update_discs(self):
+        if len(self.discs) > 1:
+            current = next((i for i, d in enumerate(self.discs, 1) if core.same_path(d, self.rom)), 1)
+            text = f"Дисков: {len(self.discs)} — " + ", ".join(
+                f"{i}: {os.path.basename(d)}" for i, d in enumerate(self.discs, 1))
+            text += f". Сейчас — диск {current}; при запуске программа спросит, какой вставить."
+        else:
+            text = "Один диск. У игры их несколько — «Диски…», выберите все сразу."
+        self.discs_label.setText(text)
+
+    def _set_rom(self, path, discs):
+        self.rom = path
+        self.discs = discs
+        self.rom_label.setText(path)
+        if not self.name_edit.text().strip() or self._auto_name:
+            self.name_edit.setText(core.rom_name(path))
+            self._auto_name = True
+        self._custom_system = False  # другой файл — консоль снова по нему
+        self._fill_systems(core.guess_system(self._emulator_key(), path))
+        if not self._custom_args:
+            self._reset_args()
+        self._update_discs()
+        self.status.hide()
+        self._identify()
+
+    def _choose_rom(self):
+        start = os.path.dirname(self.rom) if self.rom else (core.load_settings().get("emus_root") or "")
+        path, _ = QFileDialog.getOpenFileName(self, "Файл игры", start, rom_filter(self._emulator_key()))
+        if not path:
+            return
+        path = os.path.normpath(path)
+        problem = core.rom_problem(path)
+        if problem:
+            self._warn(problem[:1].upper() + problem[1:] + ".")
+            return
+        # Остальные диски этой игры, если они лежат рядом: «… (Disc 1)», «… (Disc 2)»
+        self._set_rom(path, core.find_disc_set(path))
+
+    def _choose_discs(self):
+        start = os.path.dirname(self.rom) if self.rom else (core.load_settings().get("emus_root") or "")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Все диски игры", start, rom_filter(self._emulator_key()))
+        if not paths:
+            return
+        paths = [os.path.normpath(p) for p in paths]
+        for path in paths:
+            problem = core.rom_problem(path)
+            if problem:
+                self._warn(f"{os.path.basename(path)}: {problem}.")
+                return
+        if len(paths) > core.EMU_DISCS_MAX:
+            self._warn(f"Дисков больше {core.EMU_DISCS_MAX} — выберите только диски этой игры.")
+            return
+        discs = core.sort_discs(paths)
+        keep = next((d for d in discs if core.same_path(d, self.rom)), None)
+        self._set_rom(keep or discs[0], discs if len(discs) > 1 else [discs[0]])
+
+    def _warn(self, text):
+        self.status.setText(text)
+        self.status.show()
+
+    def _save(self):
+        item = self.picker.current()
+        name = core.title_name(self.name_edit.text() or core.rom_name(self.rom))
+        problem = core.rom_problem(self.rom)
+        try:
+            args = core.split_emulator_args(self.args_edit.text())
+        except ValueError as e:
+            self._warn(f"Параметры: {e}.")
+            return
+        if not item:
+            self._warn("Выберите эмулятор.")
+        elif problem:
+            self._warn(problem[:1].upper() + problem[1:] + ".")
+        elif not name:
+            self._warn("Впишите название игры.")
+        elif not any("{rom" in a for a in args):
+            self._warn("В параметрах нет {rom} — эмулятор не узнает, какую игру открыть. Нажмите «По умолчанию».")
+        else:
+            self.result_game = {"name": name, "folder": item["folder"], "exe": item["exe"],
+                                "emulator": item["emulator"], "rom": self.rom, "system": self._system(),
+                                "args": args}
+            if len(self.discs) > 1 and any(core.same_path(d, self.rom) for d in self.discs):
+                self.result_game["discs"] = list(self.discs)
+            self.accept()
+
+
+class EmuScanDialog(MessageBoxBase):
+    """Игры, найденные в папке для эмулятора: какие добавить. Консоль у каждой угадана по расширению файла."""
+
+    WIDTH = 620
+
+    def __init__(self, parent, scan, emulator):
+        super().__init__(parent)
+        self.rows = []
+        found = scan["found"]
+        self.viewLayout.addWidget(SubtitleLabel("Найдены игры", self))
+        parts = [f"Найдено: {len(found)}"] + ([f"уже в списке: {scan['known']}"] if scan["known"] else [])
+        self.viewLayout.addWidget(plain_label(
+            " · ".join(parts) + f". Запускаться будут в {core.emulator_title(emulator['emulator'], emulator['exe'])}. "
+            "Программа ничего не запускала — только посмотрела, какие файлы лежат в папке.", self, caption=True))
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(0, 0, 14, 0)
+        layout.setSpacing(4)
+        for game in found:
+            box = CheckBox(game["name"], body)
+            box.setChecked(True)
+            box.stateChanged.connect(self._update)
+            layout.addWidget(box)
+            caption = plain_label(f"{core.emu_system_title(game['system'])} · {os.path.basename(game['rom'])}"
+                                  + (f" · дисков: {len(game['discs'])}" if game.get("discs") else ""), body,
+                                  caption=True)
+            caption.setContentsMargins(28, 0, 0, 8)
+            layout.addWidget(caption)
+            self.rows.append((game, box))
+        layout.addStretch(1)
+        scroll = ScrollArea(self)
+        scroll.setWidget(body)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget {background: transparent; border: none}")
+        scroll.setFixedHeight(min(layout.totalHeightForWidth(self.WIDTH) + 8, max(240, parent.height() - 320)))
+        self.viewLayout.addWidget(scroll)
+        self.viewLayout.addWidget(plain_label("Консоль, название и параметры запуска можно поправить потом: правый "
+                                              "клик по игре → «Изменить…».", self, caption=True))
+        self.widget.setMinimumWidth(self.WIDTH + 48)
+        self.widget.setMaximumWidth(self.WIDTH + 48)
+        self.cancelButton.setText("Отмена")
+        self._update()
+
+    def _update(self, *_):
+        count = len(self.selected())
+        self.yesButton.setText(f"Добавить ({count})" if count else "Добавить")
+        self.yesButton.setEnabled(bool(count))
+
+    def selected(self):
+        return [game for game, box in self.rows if box.isChecked()]
+
+
+class EmuFolderDialog(MessageBoxBase):
+    """«Добавить папку с играми»: каким эмулятором их запускать и в какой папке лежат образы."""
+
+    def __init__(self, parent, known, folder=""):
+        super().__init__(parent)
+        self.folder = folder
+        self.viewLayout.addWidget(SubtitleLabel("Папка с играми для эмулятора", self))
+        self.viewLayout.addWidget(plain_label(
+            "Программа найдёт в папке (и в подпапках) образы игр для консолей этого эмулятора — .cue, .chd, .iso, "
+            ".sfc и т. п. Дорожки одного диска (.bin при .cue) и диски из .m3u станут одной игрой, как и диски одной "
+            "игры: «(Disc 1)», «(Disc 2)».", self,
+            caption=True))
+        self.picker = EmulatorPicker(self, known, known[0] if known else None)
+        self.folder_label = plain_label(folder or "Папка не выбрана", self, caption=True)
+        folder_button = TransparentPushButton("Выбрать папку…", self, FIF.FOLDER)
+        folder_button.clicked.connect(self._choose_folder)
+        form = QGridLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+        form.addWidget(BodyLabel("Эмулятор", self), 0, 0)
+        form.addWidget(self.picker, 0, 1, 1, 2)
+        form.addWidget(BodyLabel("Папка", self), 1, 0)
+        form.addWidget(self.folder_label, 1, 1)
+        form.addWidget(folder_button, 1, 2)
+        form.setColumnStretch(1, 1)
+        self.viewLayout.addLayout(form)
+        self.status = plain_label("", self, caption=True)
+        self.status.setTextColor(*WARNING_TEXT)
+        self.status.hide()
+        self.viewLayout.addWidget(self.status)
+        self.widget.setMinimumWidth(640)
+        self.widget.setMaximumWidth(640)
+        self.yesButton.setText("Найти игры")
+        self.yesButton.clicked.disconnect()
+        self.yesButton.clicked.connect(self._go)
+        self.cancelButton.setText("Отмена")
+
+    def _choose_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Папка с играми для эмулятора", self.folder)
+        if folder:
+            self.folder = os.path.normpath(folder)
+            self.folder_label.setText(self.folder)
+            self.status.hide()
+
+    def _go(self):
+        if not self.picker.current():
+            self.status.setText("Выберите эмулятор — его файл запуска (.exe).")
+        elif not self.folder or not os.path.isdir(self.folder):
+            self.status.setText("Выберите папку, в которой лежат игры.")
+        else:
+            self.accept()
+            return
+        self.status.show()
+
+
+class EmuGamesPage(NativePortsPage):
+    """Вкладка «Эмуляторы»: игры для консолей, которые запускает эмулятор на этом ПК, — сразу в игру, без меню
+    эмулятора. Добавить — по одной (эмулятор и файл игры) или папкой с образами. Какой это эмулятор и для какой
+    консоли игра, программа узнаёт сама; на обложке — рамка с названием консоли.
+
+    Страница игры — как у дисковых: описание из Steam или Википедии, скриншоты, заметки, обложки из SteamGridDB.
+    Вместо GitHub — сайт эмулятора; версий и обновлений нет. Время в игре и снимки экрана — как у портов: по
+    программе эмулятора. Свой список — emulators.json."""
+
+    OBJECT_NAME = "emuGamesPage"
+    LIBRARY = "emus"
+    ROOT_SETTING = "emus_root"
+    GITHUB = False
+    KIND = "emu"
+    EXTRA_FIELDS = ("rom", "args", "system", "emulator", "discs")
+    T = {
+        "title": "Эмуляторы",
+        "empty_title": "Игры для консолей — в эмуляторе на ПК",
+        "empty_text": "PlayStation, SNES, Sega Saturn и другие консоли: укажите эмулятор (DuckStation, PCSX2, Dolphin, "
+                      "RetroArch…) и файл игры — программа сама узнает эмулятор и консоль и будет запускать игру "
+                      "сразу, без меню эмулятора. На обложке — рамка с названием консоли. Описание — из Steam или "
+                      "Википедии, обложки — из SteamGridDB.",
+        "root_button": "Добавить папку с играми",
+        "add_button": "Добавить игру",
+        "add_title": "Добавить игру для эмулятора",
+        "count": "Игр: {n}",
+        "none": "Игр пока нет",
+        "scan_busy": "Ищу игры…",
+        "nothing_new": "Новых игр не нашлось",
+        "all_known": "Все игры из этой папки уже в списке ({n}).",
+        "add_busy": "Добавляю игры…",
+        "added": "Добавлено игр: {n}",
+        "not_added": "Игры не добавлены",
+        "already": "Эта игра уже в списке",
+        "no_folder": "Папки с игрой нет",
+        "no_folder_text": "Файл игры перенесли или удалили. Укажите новый: «Изменить…».",
+        "root_missing": "Папки с играми нет",
+        "root_missing_text": "Выберите её заново: «Добавить папку с играми».",
+        "saved": "Игра сохранена",
+        "removed": "Убрано игр: {n}",
+        "remove_confirm": "{names} — игр: {n}. Файлы игр и эмулятор на диске останутся, программа их не трогает.",
+        "remove_tip": "Файл игры и эмулятор на диске останутся",
+        "edit_tip": "Название, эмулятор, файл игры, консоль и параметры запуска",
+        "exe_missing": "«{name}»: эмулятор {exe} не найден — его перенесли или удалили. Укажите новый: «Изменить…».",
+        "exe_changed": "«{name}»: {exe} — уже не тот файл эмулятора, что был при добавлении игры. Если вы обновили "
+                       "эмулятор — всё в порядке. Если нет — файл мог заменить кто-то другой, и запускать его не "
+                       "стоит.\n\nЗапустить?",
+        "not_launched": "Игра не запустилась",
+        "back": "К эмуляторам",
+        "steam_hint": "Программа найдёт игру в магазине Steam (если она там есть — например, переиздание) и возьмёт "
+                      "оттуда описание, оценки, скриншоты и трейлер. Запускаться игра будет по-прежнему в эмуляторе. "
+                      "Ключ и вход для поиска не нужны.",
+        "steam_linked": "Описание, скриншоты и отзывы — оттуда; запускается игра по-прежнему в эмуляторе.",
+    }
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.root_button.setToolTip("Эмулятор и папка с образами игр. Ничего не запускается — программа только "
+                                    "смотрит, какие файлы там лежат")
+        self.rescan_button.setToolTip("Ещё раз просмотреть папку, из которой добавляли игры в прошлый раз")
+
+    def _known(self):
+        return known_emulators(self.lib)
+
+    def _known_roms(self, skip=None):
+        """Файлы игр, которые уже в списке, — со всеми дисками."""
+        return [d for g in self.lib.ports if g is not skip for d in core.game_discs(g)]
+
+    def open_folder(self, port):
+        folder = os.path.dirname(port.get("rom") or "") if port else ""
+        if folder and os.path.isdir(folder):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        elif port:
+            notify("warning", self.win, self.T["no_folder"], self.T["no_folder_text"])
+
+    # --- Запуск: игра на нескольких дисках ---
+    def launch(self, port, disc=None):
+        """У игры несколько дисков — сначала меню «с какого диска»: выбранный запоминается, в следующий раз он
+        отмечен. Сменить диск посреди игры — в меню самого эмулятора (у многих — «Сменить диск»)."""
+        discs = core.game_discs(port) if port else []
+        if len(discs) > 1 and self.LAUNCH and not port.get("completed_at"):
+            if disc is None:
+                self._disc_menu(port, discs)
+                return
+            if not any(core.same_path(disc, d) for d in discs):
+                return
+            if not core.same_path(disc, port.get("rom")):
+                old = port.get("rom")
+                port["rom"] = disc
+                if not self.save():
+                    port["rom"] = old
+                    return
+                self.win.portsChanged.emit()
+        super().launch(port)
+
+    def _disc_menu(self, port, discs):
+        menu = RoundMenu(parent=self)
+        played = bool(port.get("last_played"))
+        for number, disc in enumerate(discs, 1):
+            current = core.same_path(disc, port.get("rom"))
+            text = f"Диск {number}" + (" — в прошлый раз" if current and played else "")
+            action = Action(FIF.PLAY if current else fluent_icon("ALBUM", FIF.FOLDER), text, menu)
+            action.setToolTip(os.path.basename(disc))
+            action.triggered.connect(lambda _=False, d=disc: self.launch(port, d))
+            menu.addAction(action)
+        menu.exec(QCursor.pos())
+
+    # --- Добавление ---
+    def add_root(self, folder=""):
+        dialog = EmuFolderDialog(self.win, self._known(), folder or core.load_settings().get(self.ROOT_SETTING) or "")
+        core.log.info("Открыто окно «Папка с играми для эмулятора»")
+        accepted = dialog.exec()
+        emulator, folder = dialog.picker.current(), dialog.folder
+        dialog.deleteLater()
+        if not accepted or not emulator:
+            return
+        core.save_settings(**{self.ROOT_SETTING: folder})
+        show_busy(self.win, self.T["scan_busy"], "Смотрю, какие файлы игр лежат в папке. Ничего не запускаю.")
+        worker = Worker(core.scan_roms, folder, emulator["emulator"], self._known_roms(), parent=self)
+        worker.finished.connect(lambda scan: self._on_roms(scan, emulator))
+        worker.failed.connect(lambda message: (hide_busy(self.win), notify(
+            "error", self.win, "Папку не удалось просмотреть", message.split(": ", 1)[-1])))
+        worker.start()
+
+    def find_new(self):
+        root = core.load_settings().get(self.ROOT_SETTING)
+        if not root or not os.path.isdir(root):
+            notify("warning", self.win, self.T["root_missing"], self.T["root_missing_text"])
+            return
+        self.add_root(root)
+
+    def _on_roms(self, scan, emulator):
+        hide_busy(self.win)
+        if not scan["found"]:
+            text = (self.T["all_known"].format(n=scan["known"]) if scan["known"] else
+                    "В папке нет файлов игр для консолей этого эмулятора.")
+            notify("info", self.win, self.T["nothing_new"], text, 6000)
+            return
+        dialog = EmuScanDialog(self.win, scan, emulator)
+        core.log.info("Открыто окно «Найдены игры» (эмулятор): %d", len(scan["found"]))
+        accepted = dialog.exec()
+        games = dialog.selected()
+        dialog.deleteLater()
+        if accepted and games:
+            self._add_ports([dict({"name": g["name"], "folder": emulator["folder"], "exe": emulator["exe"],
+                                   "emulator": emulator["emulator"], "rom": g["rom"], "system": g["system"],
+                                   "args": core.default_emulator_args(emulator["emulator"], g["system"])},
+                                  **({"discs": g["discs"]} if g.get("discs") else {}))
+                             for g in games])
+
+    def add_one(self):
+        dialog = EmuEditDialog(self.win, {"folder": "", "exe": ""}, self.T["add_title"], self._known())
+        core.log.info("Открыто окно «%s»", self.T["add_title"])
+        accepted = dialog.exec()
+        result = dialog.result_game
+        dialog.deleteLater()
+        if not accepted or not result:
+            return
+        known = self._known_roms()
+        twin = next((d for d in core.game_discs(result) if any(core.same_path(d, k) for k in known)), None)
+        if twin:
+            notify("info", self.win, self.T["already"], os.path.basename(twin))
+            return
+        core.save_settings(**{self.ROOT_SETTING: os.path.dirname(result["rom"])})
+        self._add_ports([result])
+
+    # --- Изменение ---
+    def edit(self, port):
+        if not port:
+            return
+        dialog = EmuEditDialog(self.win, port, f"«{port['name']}»", self._known())
+        accepted = dialog.exec()
+        result = dialog.result_game
+        dialog.deleteLater()
+        if not accepted or not result or not any(p is port for p in self.lib.ports):
+            return
+        name = self.lib.unique_name(result["name"], skip=port)
+        if name != port["name"]:
+            self._move_cover(port["name"], name, port)
+            port["name"] = name
+        exe_changed = not core.same_path(result["folder"], port["folder"]) or result["exe"] != port["exe"]
+        port.update(folder=result["folder"], exe=result["exe"], emulator=result["emulator"], rom=result["rom"],
+                    system=result["system"], args=result["args"])
+        if result.get("discs"):
+            port["discs"] = result["discs"]
+        else:
+            port.pop("discs", None)
+        if exe_changed:
+            port["fingerprint"] = {}  # пересчитаем: другой эмулятор выбрал сам пользователь
+            worker = Worker(core.port_fingerprint, dict(port), parent=self)
+            worker.finished.connect(lambda fingerprint: (port.update(fingerprint=fingerprint), self.save()))
+            worker.start()
+        if not self.save():
+            return
+        core.log.info("%s: «%s» изменена (%s, %s)", self.T["title"], port["name"],
+                      core.emulator_title(port["emulator"], port["exe"]), core.emu_system_title(port["system"]))
+        self.win.portsChanged.emit()
+        if self.page.port is port:
+            self.page.show_port(port, keep_origin=True)
+        notify("success", self.win, self.T["saved"], f"«{port['name']}»")
+
+
+# --- Вкладка «Игры XBOX» ------------------------------------------------------------
+class XboxEditDialog(MessageBoxBase):
+    """Игра XBOX: название и отметка Game Pass. Пока пишете название, ниже — игры из магазина Steam (живой поиск,
+    без ключа и входа): выбрали строку — игра сразу связана со Steam, оттуда описание, скриншоты и трейлер.
+    Игры в Steam нет — просто оставьте своё название."""
+
+    def __init__(self, parent, game, title, adding=False):
+        super().__init__(parent)
+        self.result_game = None
+        self.appid = None  # игра Steam, выбранная в этом окне
+        self.viewLayout.addWidget(SubtitleLabel(title, self))
+        self.name_edit = LineEdit(self)
+        self.name_edit.setText(game.get("name") or "")
+        self.name_edit.setPlaceholderText("Начните писать название, например Halo Infinite")
+        self.name_edit.textEdited.connect(self._on_edited)
+        self.viewLayout.addWidget(self.name_edit)
+        self.suggestions = LiveSuggestions(self, self.name_edit, core.store_suggestions, parent,
+                                           lambda item: f"{item['name']}   ·   Steam")
+        self.suggestions.picked.connect(self._on_picked)
+        self.viewLayout.addWidget(self.suggestions)
+        self.linked = plain_label("", self, caption=True)
+        self.viewLayout.addWidget(self.linked)
+        self.game_pass_box = CheckBox("Game Pass — игра из подписки", self)
+        self.game_pass_box.setChecked(bool(game.get("game_pass")))
+        self.game_pass_box.setToolTip("На обложке появится зелёная рамка «GAME PASS»")
+        self.viewLayout.addWidget(self.game_pass_box)
+        self.viewLayout.addWidget(plain_label(
+            "Игры XBOX на ПК не запускаются: список — для рулетки, коллекций, заметок и отметки «Пройдена». "
+            "Обложки, фоны и логотипы — из SteamGridDB по названию; описание — из Steam, если выбрать игру "
+            "в подсказках, или из Википедии.", self, caption=True))
+        self.status = plain_label("", self, caption=True)
+        self.status.setTextColor(*WARNING_TEXT)
+        self.status.hide()
+        self.viewLayout.addWidget(self.status)
+        self.widget.setMinimumWidth(560)
+        self.widget.setMaximumWidth(560)
+        self.yesButton.setText("Добавить" if adding else "Сохранить")
+        self.yesButton.clicked.disconnect()
+        self.yesButton.clicked.connect(self._save)
+        self.cancelButton.setText("Отмена")
+        self._linked_before = bool(game.get("appid"))
+        self._show_linked()
+        QTimer.singleShot(0, self.name_edit.setFocus)
+
+    def _show_linked(self, name=""):
+        if self.appid:
+            text = f"Связана со Steam: «{name}» — описание, скриншоты и трейлер будут оттуда."
+        elif self._linked_before:
+            text = "Уже связана со Steam. Выберите игру в подсказках, чтобы связать с другой."
+        else:
+            text = "Выберите игру в подсказках — будут описание, скриншоты и трейлер из Steam."
+        self.linked.setText(text)
+
+    def _on_picked(self, item):
+        self.name_edit.setText(item["name"])
+        self.appid = int(item["appid"])
+        self.suggestions.clear_found()
+        self._show_linked(item["name"])
+        self.status.hide()
+
+    def _on_edited(self, _text):
+        if self.appid:  # название поменяли после выбора — выбор больше не про эту игру
+            self.appid = None
+            self._show_linked()
+
+    def _save(self):
+        name = core.title_name(self.name_edit.text())
+        if not name:
+            self.status.setText("Впишите название игры.")
+            self.status.show()
+            return
+        self.result_game = {"name": name, "game_pass": self.game_pass_box.isChecked(), "appid": self.appid}
+        self.accept()
+
+
+class XboxGamesPage(NativePortsPage):
+    """Вкладка «Игры XBOX»: игры, купленные на консоли, — добавляются вручную, синхронизироваться не с чем.
+    Отметка Game Pass — зелёная рамка «GAME PASS» на обложке. Страница игры — как у дисковых, только без
+    «Играть»: описание, скриншоты и трейлер из Steam (если игра есть и там), заметки, обложки из SteamGridDB.
+    Свой список — xbox.json, к играм Steam он не привязан."""
+
+    OBJECT_NAME = "xboxGamesPage"
+    LIBRARY = "xbox"
+    ROOT_SETTING = "xbox_root"  # папки у игр XBOX нет — кнопка «Найти новые» не появляется
+    GITHUB = False
+    KIND = "xbox"
+    LAUNCH = False
+    T = {
+        "title": "Игры XBOX",
+        "empty_title": "Игры, купленные на Xbox",
+        "empty_text": "Добавьте игры с консоли по названию — их можно крутить в рулетке вместе с остальными, "
+                      "собирать в коллекции, вести заметки и отмечать пройденными. Игры из подписки — с отметкой "
+                      "Game Pass: на обложке будет зелёная рамка. Описание, скриншоты и трейлер — из Steam, если игра "
+                      "есть и там; обложки — из SteamGridDB.",
+        "root_button": "",
+        "add_button": "Добавить игру",
+        "add_title": "Добавить игру XBOX",
+        "count": "Игр: {n}",
+        "none": "Игр пока нет",
+        "added": "Добавлено игр: {n}",
+        "already": "Эта игра уже в списке",
+        "no_folder": "",
+        "no_folder_text": "",
+        "root_missing": "",
+        "root_missing_text": "",
+        "saved": "Игра сохранена",
+        "removed": "Убрано игр: {n}",
+        "remove_confirm": "{names} — игр: {n}. На консоли с ними ничего не случится.",
+        "remove_tip": "Убрать из списка программы — на консоли игра останется",
+        "edit_tip": "Название, отметка Game Pass и игра в Steam",
+        "not_launched": "",
+        "back": "К играм XBOX",
+        "steam_hint": "Программа найдёт игру в магазине Steam (многие игры Xbox есть и там) и возьмёт оттуда "
+                      "описание, оценки, отзывы, скриншоты и трейлер. Ключ и вход для поиска не нужны.",
+        "steam_linked": "Описание, скриншоты, трейлер и отзывы — оттуда.",
+    }
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.root_button.hide()
+        self.add_button.setIcon(FIF.ADD)
+
+    def refresh(self):
+        super().refresh()
+        self.root_button.hide()  # игры XBOX — только по названию, папки у них нет
+        self.rescan_button.hide()
+        self.buttons.invalidate()
+
+    def add_root(self):
+        self.add_one()
+
+    def find_new(self):
+        self.add_one()
+
+    def add_one(self):
+        dialog = XboxEditDialog(self.win, {}, self.T["add_title"], adding=True)
+        core.log.info("Открыто окно «%s»", self.T["add_title"])
+        accepted = dialog.exec()
+        result = dialog.result_game
+        dialog.deleteLater()
+        if not accepted or not result:
+            return
+        key = core.clean_name(result["name"]).casefold()
+        if any(core.clean_name(g["name"]).casefold() == key for g in self.lib.ports):
+            notify("info", self.win, self.T["already"], f"«{result['name']}»")
+            return
+        port = self.lib.add(result["name"], "", "", game_pass=result["game_pass"],
+                            **({"appid": result["appid"]} if result["appid"] else {}))
+        if not self.save():
+            self.lib.remove(port)
+            return
+        core.log.info("%s: добавлена «%s»%s%s", self.T["title"], port["name"],
+                      " (Game Pass)" if port["game_pass"] else "",
+                      f", связана со Steam ({port['appid']})" if port.get("appid") else "")
+        self.win.portsChanged.emit()
+        notify("success", self.win, "Игра добавлена", f"«{port['name']}». Обложка скачивается." + (
+            " Описание, скриншоты и трейлер — из Steam." if port.get("appid") else ""), 4000)
+
+    def edit(self, port):
+        if not port:
+            return
+        dialog = XboxEditDialog(self.win, port, f"«{port['name']}»")
+        accepted = dialog.exec()
+        result = dialog.result_game
+        dialog.deleteLater()
+        if not accepted or not result or not any(p is port for p in self.lib.ports):
+            return
+        name = self.lib.unique_name(result["name"], skip=port)
+        if name != port["name"]:
+            self._move_cover(port["name"], name, port)
+            port["name"] = name
+        port["game_pass"] = result["game_pass"]
+        relinked = bool(result["appid"]) and result["appid"] != port.get("appid")
+        if relinked:
+            port["appid"] = result["appid"]
+        if not self.save():
+            return
+        core.log.info("%s: «%s» изменена%s", self.T["title"], port["name"],
+                      f", связана со Steam ({port['appid']})" if relinked else "")
+        if relinked:
+            self.win.covers.forget(port["name"])  # с номером в Steam найдутся и картинки Steam
+        self.win.portsChanged.emit()
+        if self.page.port is port:
+            self.page.show_port(port, keep_origin=True)
+        notify("success", self.win, self.T["saved"], f"«{port['name']}»")
+
+    def toggle_game_pass(self, port):
+        if not port:
+            return
+        port["game_pass"] = not port.get("game_pass")
+        if not self.save():
+            port["game_pass"] = not port["game_pass"]
+            return
+        core.log.info("«%s»: Game Pass %s", port["name"], "отмечен" if port["game_pass"] else "снят")
+        self.win.portsChanged.emit()
+
+
 # --- Коллекции ------------------------------------------------------------------
 COLLECTION_ICON = fluent_icon("ALBUM", FIF.FOLDER)
-GAME_KIND_NAMES = {"steam": "Игра Steam", "port": "Порт", "disc": "Дисковая игра"}
+GAME_KIND_NAMES = {"steam": "Игра Steam", "port": "Порт", "disc": "Дисковая игра", "emu": "Игра для эмулятора",
+                   "xbox": "Игра XBOX"}
 
 
 def game_word(n):
@@ -14350,7 +15577,10 @@ def game_word(n):
 
 
 def game_kind(game):
-    return ("disc" if core.is_disc(game) else "port") if core.is_port(game) else "steam"
+    if not core.is_port(game):
+        return "steam"
+    kind = game.get("kind")
+    return kind if kind in core.OWN_KINDS else "port"
 
 
 def add_collection_menu(win, menu, games):
@@ -14733,7 +15963,8 @@ class CollectionsPage(QWidget):
         empty.addStretch(1)
         empty.addWidget(SubtitleLabel("Свои подборки игр", self.empty_box), 0, Qt.AlignHCenter)
         self.empty_text = plain_label(
-            "Соберите игры из Steam, портов и дисковых в свои коллекции: «На выходные», «Хорроры», «С друзьями». "
+            "Соберите игры из Steam, портов, дисковых, эмуляторов и XBOX в свои коллекции: «На выходные», «Хорроры», "
+            "«С друзьями». "
             "Добавить игру — правый клик по ней на любой вкладке с играми → «Добавить в коллекцию». Любую "
             "коллекцию можно крутить в рулетке.", self.empty_box)
         self.empty_text.setAlignment(Qt.AlignCenter)
@@ -15022,14 +16253,16 @@ class CollectionsPage(QWidget):
             item.setData(Qt.UserRole, game["name"])
             item.setData(Qt.UserRole + 1, row)
             item.setToolTip(f"{game['name']}\n{GAME_KIND_NAMES[game_kind(game)]}")
+            item.setData(CoverTileDelegate.FRAME_ROLE, cover_frame(game))
             item.setSizeHint(self._tile_size())
             self.games.addItem(item)
             item.setSelected(id(game) in selected)
         self.detail_title.setText(collection["name"])
-        kinds = {"steam": 0, "port": 0, "disc": 0}
+        kinds = dict.fromkeys(GAME_KIND_NAMES, 0)
         for game in games:
             kinds[game_kind(game)] += 1
-        parts = [f"{title} {kinds[k]}" for k, title in (("steam", "Steam"), ("port", "порты"), ("disc", "дисковые"))
+        parts = [f"{title} {kinds[k]}" for k, title in (("steam", "Steam"), ("port", "порты"), ("disc", "дисковые"),
+                                                         ("emu", "эмуляторы"), ("xbox", "XBOX"))
                  if kinds[k]]
         missing = len(collection["items"]) - len(games)
         text = game_word(len(games)) + (f" · {', '.join(parts)}" if len(parts) > 1 else "")
@@ -15089,7 +16322,7 @@ class CollectionsPage(QWidget):
         if not game:
             return
         if core.is_port(game):
-            (self.win.disc_page if core.is_disc(game) else self.win.native_page).launch(game)
+            self.win.page_for(game).launch(game)
         else:
             self.win.launch_game(game)
 
@@ -15127,7 +16360,7 @@ class CollectionsPage(QWidget):
             self.games.clearSelection()
             item.setSelected(True)
         menu = RoundMenu(parent=self)
-        if core.is_port(game) or game.get("appid"):
+        if not core.is_xbox(game) and (core.is_port(game) or game.get("appid")):  # игру XBOX на ПК не запустить
             installed = core.is_port(game) or core.is_installed(game["appid"])
             play = Action(FIF.PLAY if installed else FIF.DOWNLOAD, "Играть" if installed else "Установить", menu)
             play.triggered.connect(lambda: self.play(game))
@@ -15373,12 +16606,14 @@ def _paint_disc(painter, rect, color):
 class DiscIcon(FluentIconBase):
     """Значок «Дисковых игр» в боковом меню: круглый CD-диск, в цвет текста меню своей темы."""
 
+    PAINT = staticmethod(_paint_disc)
+
     def path(self, theme=Theme.AUTO):
         return ""  # не из файла — рисуется в render
 
     def render(self, painter, rect, theme=Theme.AUTO, indexes=None, **attributes):
         dark = isDarkTheme() if theme == Theme.AUTO else theme == Theme.DARK
-        _paint_disc(painter, rect, QColor(255, 255, 255) if dark else QColor(0, 0, 0, 228))
+        self.PAINT(painter, rect, QColor(255, 255, 255) if dark else QColor(0, 0, 0, 228))
 
     def icon(self, theme=Theme.AUTO, color=None):
         pixmap = QPixmap(64, 64)
@@ -15389,7 +16624,61 @@ class DiscIcon(FluentIconBase):
         return QIcon(pixmap)
 
 
+def _paint_gamepad(painter, rect, color):
+    """Значок «Эмуляторов»: геймпад контуром — крестовина слева, две кнопки справа."""
+    rect = QRectF(rect)
+    unit = min(rect.width(), rect.height()) / 16
+    x0, y0 = rect.center().x() - 8 * unit, rect.center().y() - 8 * unit
+    painter.save()
+    painter.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(color, 1.2 * unit)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    painter.drawRoundedRect(QRectF(x0 + 1.2 * unit, y0 + 4.2 * unit, 13.6 * unit, 7.8 * unit), 3.6 * unit, 3.6 * unit)
+    painter.drawLine(QPointF(x0 + 5 * unit, y0 + 6.6 * unit), QPointF(x0 + 5 * unit, y0 + 9.6 * unit))  # крестовина
+    painter.drawLine(QPointF(x0 + 3.5 * unit, y0 + 8.1 * unit), QPointF(x0 + 6.5 * unit, y0 + 8.1 * unit))
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(color)
+    for cx, cy in ((10.6, 9.0), (12.2, 7.3)):  # кнопки
+        painter.drawEllipse(QPointF(x0 + cx * unit, y0 + cy * unit), 0.95 * unit, 0.95 * unit)
+    painter.restore()
+
+
+def _paint_xbox(painter, rect, color):
+    """Значок «Игр XBOX»: круг и «X» из двух изогнутых линий, как у шара Xbox."""
+    rect = QRectF(rect)
+    unit = min(rect.width(), rect.height()) / 16
+    c = rect.center()
+    painter.save()
+    painter.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(color, 1.2 * unit)
+    pen.setCapStyle(Qt.RoundCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    painter.drawEllipse(c, 6.9 * unit, 6.9 * unit)
+    for side in (-1, 1):  # две дуги крест-накрест, чуть выгнутые вверх
+        path = QPainterPath(QPointF(c.x() + side * 4.3 * unit, c.y() - 4.6 * unit))
+        path.quadTo(QPointF(c.x() - side * 1.4 * unit, c.y() - 1.6 * unit),
+                    QPointF(c.x() - side * 4.3 * unit, c.y() + 4.6 * unit))
+        painter.drawPath(path)
+    painter.restore()
+
+
+class GamepadIcon(DiscIcon):
+    """Значок «Эмуляторов» в боковом меню."""
+    PAINT = staticmethod(_paint_gamepad)
+
+
+class XboxIcon(DiscIcon):
+    """Значок «Игр XBOX» в боковом меню."""
+    PAINT = staticmethod(_paint_xbox)
+
+
 DISC_ICON = DiscIcon()
+GAMEPAD_ICON = GamepadIcon()
+XBOX_ICON = XboxIcon()
 
 
 class AppUpdater(QObject):
@@ -15628,6 +16917,10 @@ class MainWindow(FluentWindow):
         self.ports_message = self.ports.load()
         self.discs = core.PortLibrary(core.DISCS_FILE, kind="disc")
         self.discs_message = self.discs.load()
+        self.emus = core.PortLibrary(core.EMULATORS_FILE, kind="emu")
+        self.emus_message = self.emus.load()
+        self.xbox = core.PortLibrary(core.XBOX_FILE, kind="xbox")
+        self.xbox_message = self.xbox.load()
         self.collections = core.CollectionLibrary()
         self.collections_message = self.collections.load()
         self.roulette = core.RouletteList()  # игры, убранные из рулетки (в своих разделах они остаются)
@@ -15650,6 +16943,8 @@ class MainWindow(FluentWindow):
         self.library_page = LibraryPage(self)
         self.native_page = NativePortsPage(self)
         self.disc_page = DiscGamesPage(self)
+        self.emu_page = EmuGamesPage(self)
+        self.xbox_page = XboxGamesPage(self)
         self.collections_page = CollectionsPage(self)
         self.music_page = MusicPage(self)
         self.web_page = WebPage(self) if QWebEngineView else None
@@ -15664,6 +16959,8 @@ class MainWindow(FluentWindow):
         self.addSubInterface(self.cards_page, PolaroidIcon(), "Значки и карточки Steam")
         self.addSubInterface(self.native_page, FIF.APPLICATION, "Нативные ИИ порты")
         self.addSubInterface(self.disc_page, DISC_ICON, "Дисковые игры")
+        self.addSubInterface(self.emu_page, GAMEPAD_ICON, "Эмуляторы")
+        self.addSubInterface(self.xbox_page, XBOX_ICON, "Игры XBOX")
         self.addSubInterface(self.collections_page, COLLECTION_ICON, "Коллекции")
         self.addSubInterface(self.music_page, FIF.MUSIC, "Саундтреки")
         if self.web_page:
@@ -15738,7 +17035,7 @@ class MainWindow(FluentWindow):
     def _connect_section_clicks(self):
         """Щелчок по разделу в боковом меню — его главная страница. Открыта страница игры — раздел возвращается
         к своему списку, как по кнопкам «К портам», «К коллекциям», «К рулетке». И когда раздел уже выбран."""
-        for page in (self.home_page, self.native_page, self.disc_page, self.collections_page):
+        for page in [self.home_page] + self.own_pages() + [self.collections_page]:
             item = self.navigationInterface.widget(page.objectName())
             if item is None or not hasattr(item, "clicked"):
                 continue
@@ -15796,6 +17093,10 @@ class MainWindow(FluentWindow):
             notify("warning", self, "Список портов", self.ports_message, duration=8000)
         if self.discs_message:
             notify("warning", self, "Список дисковых игр", self.discs_message, duration=8000)
+        if self.emus_message:
+            notify("warning", self, "Список игр для эмуляторов", self.emus_message, duration=8000)
+        if self.xbox_message:
+            notify("warning", self, "Список игр XBOX", self.xbox_message, duration=8000)
         if self.collections_message:
             notify("warning", self, "Коллекции", self.collections_message, duration=8000)
         if self.roulette_message:
@@ -16102,36 +17403,63 @@ class MainWindow(FluentWindow):
             self.home_page.show_loading()
 
     def all_games(self):
-        """Игры Steam, порты и дисковые игры — для обложек."""
-        return self.library.games + self.ports.ports + self.discs.ports
+        """Игры Steam и все свои списки — для обложек."""
+        return self.library.games + [game for lib in self.own_libs() for game in lib.ports]
+
+    # Свои списки игр: вид игры (core.OWN_KINDS) → (список на окне, вкладка, источник рулетки)
+    OWN_LISTS = (("port", "ports", "native_page", "ports"), ("disc", "discs", "disc_page", "discs"),
+                 ("emu", "emus", "emu_page", "emus"), ("xbox", "xbox", "xbox_page", "xbox"))
+
+    def own_libs(self):
+        return [getattr(self, lib) for _kind, lib, _page, _source in self.OWN_LISTS]
+
+    def own_pages(self):
+        """Вкладки своих списков (порты, дисковые, эмуляторы, XBOX) — те, что уже созданы."""
+        pages = (getattr(self, page, None) for _kind, _lib, page, _source in self.OWN_LISTS)
+        return [page for page in pages if page is not None]
+
+    def page_for(self, game):
+        """Вкладка, на которой живёт игра из своих списков."""
+        kind = game.get("kind")
+        page = next((page for k, _lib, page, _source in self.OWN_LISTS if k == kind), "native_page")
+        return getattr(self, page)
 
     def name_in_use(self, name, skip=None):
         """Название есть у какой-то игры в программе (кроме skip): тогда её обложку не трогаем — она общая."""
         if self.library.find(name):
             return True
         key = name.casefold()
-        return any(p is not skip and p["name"].casefold() == key for p in self.ports.ports + self.discs.ports)
+        return any(p is not skip and p["name"].casefold() == key for lib in self.own_libs() for p in lib.ports)
 
-    # Что крутит рулетка: игры Steam, порты, дисковые — по отдельности и вместе. Ключ — источники через «+»
-    POOL_SOURCES = ("steam", "ports", "discs")
+    # Что крутит рулетка: игры Steam, порты, дисковые, эмуляторы, XBOX — по отдельности и вместе. Ключ — источники
+    # через «+»; all — все, где есть игры
+    POOL_SOURCES = ("steam", "ports", "discs", "emus", "xbox")
+
+    def pool_lists(self):
+        lists = {"steam": self.library.games}
+        lists.update({source: getattr(self, lib).ports for _kind, lib, _page, source in self.OWN_LISTS})
+        return lists
 
     def pool_sources(self):
         """Источники, в которых есть игры, — из них и можно выбирать."""
-        return [s for s, games in zip(self.POOL_SOURCES, (self.library.games, self.ports.ports, self.discs.ports))
-                if games]
+        lists = self.pool_lists()
+        return [s for s in self.POOL_SOURCES if lists[s]]
 
     def roulette_pool(self):
         """Что крутит рулетка сейчас: «steam», «steam+ports», «discs», «col:<номер коллекции>» и т. п. Выбранного
         источника больше нет (порты убрали, коллекцию удалили или опустошили) — остаётся то, что есть из
-        выбранного, а если ничего — всё, где есть игры."""
+        выбранного, а если ничего — всё, где есть игры. «Все игры» (all) — все источники, где есть игры."""
         pool = self.settings.get("roulette_pool") or "steam"
-        pool = {"mix": "steam+ports"}.get(pool, pool)  # так «Steam и порты» назывались в первых сборках 2.4
+        # «mix» — так «Steam и порты» назывались в первых сборках 2.4; «steam+ports+discs» — «Все игры» до 2.7
+        pool = {"mix": "steam+ports", "steam+ports+discs": "all"}.get(pool, pool)
         if pool.startswith("col:"):
             collection = self.collections.find(pool[4:])
             if collection and self.collection_games(collection):
                 return pool
             pool = "steam"
         available = self.pool_sources()
+        if pool == "all":
+            return "+".join(available) or "steam"
         chosen = [s for s in self.POOL_SOURCES if s in pool.split("+") and s in available]
         return "+".join(chosen or available) or "steam"
 
@@ -16143,10 +17471,10 @@ class MainWindow(FluentWindow):
         pool = self.roulette_pool()
         if pool.startswith("col:"):
             return [g for g in self.collection_games(self.collections.find(pool[4:])) if not g.get("completed_at")]
-        lists = {"steam": self.library.games, "ports": self.ports.ports, "discs": self.discs.ports}
+        lists = self.pool_lists()
         games = []
         for source in pool.split("+"):
-            games += [g for g in lists[source] if not self.roulette.has(g) and not g.get("completed_at")]
+            games += [g for g in lists.get(source, []) if not self.roulette.has(g) and not g.get("completed_at")]
         if self.filters_on():
             filters, meta = self.roulette_filters(), self.steam_meta
             games = [g for g in games if g.get("appid") and core.meta_matches(meta.get(str(int(g["appid"]))), filters)]
@@ -16168,7 +17496,7 @@ class MainWindow(FluentWindow):
         if home.game_page.isVisible():
             collection, game = home.game_page.origin, home.game_page.game
             home.game_page.stop_video()
-        for ports_page in (self.native_page, self.disc_page):
+        for ports_page in self.own_pages():
             if ports_page.page.isVisible():
                 collection, game = ports_page.page.origin, ports_page.page.port
                 ports_page.show_list()  # страница игры не остаётся висеть на её вкладке
@@ -16184,12 +17512,13 @@ class MainWindow(FluentWindow):
         if not collection:
             return []
         by_appid = {int(g["appid"]): g for g in self.library.games if g.get("appid")}
+        libs = {kind: getattr(self, lib) for kind, lib, _page, _source in self.OWN_LISTS}
         games, seen = [], set()
         for ref in collection["items"]:
             if ref["kind"] == "steam":
                 game = by_appid.get(ref["appid"]) if "appid" in ref else self.library.find(ref["name"])
             else:
-                game = (self.discs if ref["kind"] == "disc" else self.ports).find(ref["id"])
+                game = libs[ref["kind"]].find(ref["id"]) if ref["kind"] in libs else None
             if game is not None and id(game) not in seen:
                 seen.add(id(game))
                 games.append(game)
@@ -16209,8 +17538,8 @@ class MainWindow(FluentWindow):
             lib.save()
             return True
         except OSError as e:
-            notify("error", self, "Не удалось сохранить список " +
-                   ("дисковых игр" if lib is self.discs else "портов"), str(e))
+            names = {"disc": "дисковых игр", "emu": "игр для эмуляторов", "xbox": "игр XBOX"}
+            notify("error", self, "Не удалось сохранить список " + names.get(lib.kind, "портов"), str(e))
             return False
 
     def save_library(self):
