@@ -32,7 +32,6 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -91,7 +90,6 @@ enum class Section(val title: String, @DrawableRes val icon: Int) {
 /** Остальное — в боковом меню, как в Google Диске. */
 enum class Page(val title: String, @DrawableRes val icon: Int = 0, val vector: ImageVector? = null) {
     COLLECTIONS("Коллекции", R.drawable.ic_folder),
-    PORTS("Нативные ИИ порты", vector = Icons.Filled.PlayArrow),
     SETTINGS("Настройки", vector = Icons.Filled.Settings),
     LOGS("Логи", R.drawable.ic_logs),
     ABOUT("О программе", vector = Icons.Filled.Info),
@@ -205,7 +203,6 @@ fun App(store: LibraryStore) {
             ) { screen ->
                 when (screen) {
                     Page.COLLECTIONS.name -> CollectionsScreen(store, startImport, onSpin = spinNow)
-                    Page.PORTS.name -> PortsScreen(open)
                     Page.SETTINGS.name -> SettingsScreen(store, startImport, open)
                     Page.LOGS.name -> LogsScreen()
                     Page.ABOUT.name -> AboutScreen(open)
@@ -243,7 +240,6 @@ private fun AppDrawer(current: Page?, onPick: (Page) -> Unit) {
             }
         }
         DrawerItem(Page.COLLECTIONS, current, onPick)
-        DrawerItem(Page.PORTS, current, onPick)
         HorizontalDivider(Modifier.padding(horizontal = 28.dp, vertical = 8.dp))
         DrawerItem(Page.SETTINGS, current, onPick)
         DrawerItem(Page.LOGS, current, onPick)

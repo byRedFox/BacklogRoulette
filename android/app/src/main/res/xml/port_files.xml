@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- Что FileProvider может отдать системному окну установки: только скачанные APK портов -->
-<paths>
-    <cache-path name="ports" path="ports/" />
-</paths>

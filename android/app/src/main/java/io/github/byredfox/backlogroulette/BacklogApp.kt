@@ -22,6 +22,15 @@ class BacklogApp : Application(), SingletonImageLoader.Factory {
         CoverUrls.init(filesDir)
         SteamGridKey.init(filesDir)
         UiPrefs.init(this)
+        removePortLeftovers()
+    }
+
+    // Раздел «Нативные ИИ порты» (0.6.0–0.6.1) убран: скачанный APK порта (десятки МБ) и метки релиза не должны
+    // оставаться на телефоне. Сами порты, если стоят, — отдельные приложения: их удаляет пользователь, как обычно.
+    private fun removePortLeftovers() {
+        val apks = cacheDir.resolve("ports")
+        if (apks.exists() && apks.deleteRecursively()) AppLog.info("Убраны файлы прежнего раздела портов")
+        deleteSharedPreferences("ports")
     }
 
     // Кэш обложек на диске — 512 МБ: по умолчанию он не больше 250 МБ, а библиотека в 800+ игр туда не влезает
