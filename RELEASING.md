@@ -89,6 +89,18 @@ gh auth status
    ```
    На странице — заметка, `BacklogRoulette.exe`, `BacklogRoulette-android.apk` (если был) и пометка **Latest**.
 
+## Если менялась только Android-версия
+
+Новый релиз **не создаём**: в нём пришлось бы выложить тот же exe с новым номером, и ПК-программа без конца
+предлагала бы «обновиться» на саму себя. APK докладываем в текущий Latest-релиз (заменяет прежний APK, exe и
+пометку Latest не трогает):
+```powershell
+$tag = gh release view --json tagName --jq .tagName
+gh release upload $tag "$env:TEMP\br-apk\BacklogRoulette-android.apk" --clobber
+gh release view $tag --web
+```
+APK перед этим скачать и сверить, как в шаге 6.
+
 ## Если что-то пошло не так
 
 - Ошибка в exe, а релиз ещё не опубликован — убрать тег и поставить заново после исправления:
