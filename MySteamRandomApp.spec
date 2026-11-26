@@ -29,20 +29,34 @@ for package in ('ctranslate2', 'sentencepiece'):
     except Exception:  # noqa: BLE001
         print(f'{package} не найден — перевод на ПК в сборку не войдёт')
 
+# SDL для кнопки Share геймпада Xbox: только SDL2.dll из пакета pysdl2-dll — в папку _sdl2 внутри программы
+# (core.sdl_library берёт её только оттуда). Нет пакета — сборка пройдёт, снимать можно будет только клавишей
+try:
+    import sdl2dll
+    SDL_DLL = os.path.join(sdl2dll.get_dllpath(), 'SDL2.dll')
+    if os.path.isfile(SDL_DLL):
+        BINARIES.append((SDL_DLL, '_sdl2'))
+    else:
+        print('SDL2.dll не найдена — кнопка Share геймпада в сборке работать не будет')
+except ImportError:
+    print('pysdl2-dll не найден — кнопка Share геймпада в сборке работать не будет')
+
 a = Analysis(
     ['MySteamRandomApp.py'],
     pathex=[],
     binaries=BINARIES,
     datas=DATAS,  # вшиваются в .exe
-    hiddenimports=[],
+    hiddenimports=['gamepad_share', 'sdl2'],  # процесс кнопки Share геймпада (BacklogRoulette.exe --gamepad-share)
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     # Лишние библиотеки, которые PyInstaller может зацепить и раздуть .exe. numpy не исключаем — он нужен
     # CTranslate2. А вот конвертеры CTranslate2 тянут за собой PyTorch, TensorFlow и Transformers (гигабайты),
-    # хотя программе они не нужны: модель уже готовая
+    # хотя программе они не нужны: модель уже готовая. sdl2dll — его SDL2.dll уже лежит в _sdl2, а остальные
+    # библиотеки пакета (звук, шрифты, картинки SDL) программе не нужны
     excludes=['tkinter', 'pandas', 'matplotlib', 'PyQt5', 'PyQt6', 'PySide2',
-              'torch', 'transformers', 'tensorflow', 'keras', 'jax', 'fairseq', 'onmt', 'opennmt', 'scipy'],
+              'torch', 'transformers', 'tensorflow', 'keras', 'jax', 'fairseq', 'onmt', 'opennmt', 'scipy',
+              'sdl2dll'],
     noarchive=False,
     optimize=0,
 )
