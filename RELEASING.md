@@ -65,13 +65,14 @@ gh auth status
 6. **APK для телефона** — один релиз на обе платформы (exe и apk вместе). APK собирает GitHub Actions в ветке
    `android` (подпись — ключом из Secrets). Скачать последнюю успешную сборку и сверить сумму:
    ```powershell
-   gh run list --workflow Android --branch android --status success --limit 1
-   gh run download <номер из первой колонки> -n BacklogRoulette-android -D "$env:TEMP\br-apk"
+   $run = gh run list --workflow Android --branch android --status success --limit 1 --json databaseId --jq '.[0].databaseId'
+   gh run download $run -n BacklogRoulette-android -D "$env:TEMP\br-apk"
    Get-Content "$env:TEMP\br-apk\SHA256SUMS.txt"
    Get-FileHash "$env:TEMP\br-apk\BacklogRoulette-android.apk" -Algorithm SHA256
    ```
-   Суммы должны совпасть. Если в Android-версии в этот раз ничего не менялось — шаг можно пропустить
-   и выложить релиз только с exe.
+   Суммы должны совпасть. Если папка `br-apk` осталась от прошлого раза — сначала удалите её. Проверить APK
+   на телефоне по кабелю: `adb install -r "$env:TEMP\br-apk\BacklogRoulette-android.apk"`. Если в Android-версии
+   в этот раз ничего не менялось — шаг можно пропустить и выложить релиз только с exe.
 
 7. **Релиз**
    ```powershell
