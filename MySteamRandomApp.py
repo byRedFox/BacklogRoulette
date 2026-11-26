@@ -16,6 +16,12 @@ import time
 from collections import OrderedDict
 from urllib.parse import quote_plus
 
+# Сборка, запущенная программой с ключом --gamepad-share, — это процесс чтения кнопки Share геймпада, а не окно:
+# ни Qt, ни журнала, ни второй копии программы
+if __name__ == "__main__" and sys.argv[1:2] == ["--gamepad-share"]:
+    import gamepad_share
+    sys.exit(gamepad_share.main())
+
 LAUNCHED = time.monotonic()  # для замера запуска: отсюда начинается загрузка Qt и библиотек
 
 from PySide6.QtCore import (QAbstractAnimation, QAbstractNativeEventFilter, QEasingCurve, QEvent, QObject, QPoint,
@@ -151,7 +157,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.7"
+__version__ = "2.7.1"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -810,6 +816,7 @@ class MusicPlayer(QObject):
     FADE_IN_MS = 1500  # появление музыки при запуске и ручном переключении
     PAUSE_FADE_MS = 400
     RESTART_MS = 3000  # «Предыдущий» после трёх секунд трека — к началу этого трека, раньше — к прошлому
+    OUTPUTS_SETTLE_MS = 2000  # список звуковых устройств не менялся столько — можно переключаться
     BUILTIN_TITLE = "Soliloquy — Matthew Pablo"
     SHUFFLE_MODES = ("off", "all", "soundtracks")
 
@@ -842,9 +849,14 @@ class MusicPlayer(QObject):
 
         # Звуковые устройства Windows поменялись (Steam при выходе убирает свои виртуальные колонки
         # Steam Streaming, отключили наушники и т. п.). Сам вывод звука Qt на новое устройство
-        # не переходит и молчит, поэтому пересоздаём его на устройстве по умолчанию.
+        # не переходит и молчит, поэтому переводим его на устройство по умолчанию. Сигналы о смене списка
+        # приходят пачками (Bluetooth-устройства подключаются и засыпают по нескольку раз) — ждём, пока стихнут
         self.devices = QMediaDevices(self)
-        self.devices.audioOutputsChanged.connect(self._on_outputs_changed)
+        self._outputs_timer = QTimer(self)
+        self._outputs_timer.setSingleShot(True)
+        self._outputs_timer.setInterval(self.OUTPUTS_SETTLE_MS)
+        self._outputs_timer.timeout.connect(self._on_outputs_settled)
+        self.devices.audioOutputsChanged.connect(self._outputs_timer.start)
         self._output_id = QMediaDevices.defaultAudioOutput().id()
 
         # Страховка: если музыка остановилась, а сигнала о конце трека не было — включаем следующий;
@@ -880,30 +892,52 @@ class MusicPlayer(QObject):
         if old:
             old.deleteLater()
 
-    def _renew_output(self, reason):
-        core.log.info("Музыка: %s — переключаю звук на «%s»", reason, QMediaDevices.defaultAudioOutput().description())
-        self._output_id = QMediaDevices.defaultAudioOutput().id()
+    def _renew_output(self, reason, force=False):
+        """Звук — на устройство Windows по умолчанию. Вывод звука не пересоздаётся, а переводится на другое
+        устройство (QAudioOutput.setDevice): проигрыватель перестраивает звук в своём потоке, и окно не ждёт его.
+        Пересоздание (setAudioOutput) ждёт поток звука — а он, если устройство как раз пропадает, может висеть
+        в Windows: так окно и замирало. Пересоздаём только по force (звук завис на том же устройстве), и то
+        сначала остановив проигрыватель."""
+        device = QMediaDevices.defaultAudioOutput()
+        core.log.info("Музыка: %s — переключаю звук на «%s»", reason, device.description())
+        self._output_id = device.id()
         for deck in self.decks:
             player = deck["player"]
             state, position = player.playbackState(), player.position()
-            self._attach_audio(deck)
-            if deck is self.deck and state == QMediaPlayer.PlayingState:
+            if deck is not self.deck:
+                deck["fade"].stop()
+                player.stop()  # хвост кроссфейда не нужен
+            same = deck["audio"].device().id() == device.id()
+            if same and not force:
+                continue
+            playing = deck is self.deck and state == QMediaPlayer.PlayingState
+            if same:
+                player.stop()
+                self._attach_audio(deck)
+            else:
+                if playing:
+                    player.pause()
+                deck["audio"].setDevice(device)
+            if playing:
                 # Плеер мог встать вместе со звуком: перезапускаем с того же места
-                player.pause()
                 player.setPosition(position)
                 player.play()
                 if not self.ducked:
                     self._fade(deck, self.volume, self.PAUSE_FADE_MS)
-            elif deck is not self.deck:
-                player.stop()  # хвост кроссфейда не нужен
         self._errors_in_row = 0
         self._stalled_checks = 0
 
-    def _on_outputs_changed(self):
-        # Даже если устройство по умолчанию то же, после смены списка вывод звука Qt мог отвалиться
-        changed = QMediaDevices.defaultAudioOutput().id() != self._output_id
-        self._renew_output("сменилось звуковое устройство Windows" if changed
-                           else "поменялся список звуковых устройств")
+    def _on_outputs_settled(self):
+        """Список звуковых устройств поменялся и уже 2 секунды не меняется. Устройство по умолчанию то же
+        и наше никуда не делось — ничего не трогаем: если звук всё же встанет, это заметит сторож."""
+        default = QMediaDevices.defaultAudioOutput().id()
+        present = {d.id() for d in QMediaDevices.audioOutputs()}
+        lost = any(deck["audio"].device().id() not in present for deck in self.decks)
+        if default == self._output_id and not lost:
+            core.log.info("Музыка: список звуковых устройств поменялся, устройство то же — звук не трогаю")
+            return
+        self._renew_output("сменилось звуковое устройство Windows" if default != self._output_id
+                           else "пропало звуковое устройство")
 
     @property
     def deck(self):
@@ -1194,7 +1228,7 @@ class MusicPlayer(QObject):
         self._last_position = position
         self._stalled_checks = self._stalled_checks + 1 if stalled else 0
         if self._stalled_checks >= 3:
-            self._renew_output("трек играет, но время в нём стоит")
+            self._renew_output("трек играет, но время в нём стоит", force=True)
             return
         # Срабатывает, только если текущий трек стоит две проверки подряд и прошло больше 10 секунд с его старта
         if len(self.tracks) < 2:
@@ -1213,7 +1247,7 @@ class MusicPlayer(QObject):
         if error == QMediaPlayer.ResourceError and os.path.exists(self.path or "") and not self._errors_in_row:
             # Файл на месте, а открыть не вышло — обычно это отвалился вывод звука, а не битый трек.
             # Пересоздаём вывод и пробуем этот же трек ещё раз (один раз, чтобы не крутиться по кругу).
-            self._renew_output("ошибка вывода звука")
+            self._renew_output("ошибка вывода звука", force=True)
             self._errors_in_row = 1
             path = self.path
             QTimer.singleShot(0, lambda: self._start(path, crossfade=False))
@@ -5666,6 +5700,128 @@ class ShotThumb(QLabel):
         super().mouseReleaseEvent(event)
 
 
+class ShotViewer(QWidget):
+    """Снимки записи во весь экран: ← → (и колесо мыши) — листать, Esc или щелчок мимо снимка — закрыть,
+    кнопка вверху — открыть файл в программе просмотра Windows. Картинка читается сразу под размер экрана —
+    4K-снимок не занимает лишней памяти."""
+
+    BUTTON = 44
+
+    def __init__(self, parent, paths, index):
+        super().__init__(parent, Qt.Window | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setWindowModality(Qt.ApplicationModal)  # стрелки и Esc — просмотру, а не окну заметок под ним
+        self.setWindowTitle("Снимки экрана")
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.paths, self.index = list(paths), max(0, min(index, len(paths) - 1))
+        self.pixmap, self._loaded = QPixmap(), None
+        self.image_rect = QRectF()
+        self.prev_button = self._button(FIF.LEFT_ARROW, "Предыдущий снимок (←)", lambda: self.step(-1))
+        self.next_button = self._button(FIF.RIGHT_ARROW, "Следующий снимок (→)", lambda: self.step(1))
+        self.close_button = self._button(FIF.CLOSE, "Закрыть (Esc)", self.close)
+        self.open_button = self._button(FIF.PHOTO, "Открыть в программе просмотра Windows", self.open_external)
+        for button in (self.prev_button, self.next_button):
+            button.setVisible(len(self.paths) > 1)
+        screen = parent.screen() if parent is not None else QApplication.primaryScreen()
+        self.setGeometry(screen.geometry())
+        self.showFullScreen()
+        self.activateWindow()
+        self.setFocus()
+
+    def _button(self, icon, tip, handler):
+        button = TransparentToolButton(icon.icon(color=WHITE), self)
+        button.setFixedSize(self.BUTTON, self.BUTTON)
+        button.setIconSize(QSize(20, 20))
+        button.setToolTip(tip)
+        button.setFocusPolicy(Qt.NoFocus)  # стрелки не должны уходить кнопкам
+        button.clicked.connect(handler)
+        return button
+
+    def _load(self):
+        """Снимок под размер окна; уже прочитан для этого размера — заново не читаем."""
+        key = (self.index, self.width(), self.height())
+        if key == self._loaded or not self.paths:
+            return
+        self._loaded = key
+        ratio = self.devicePixelRatioF()
+        reader = QImageReader(self.paths[self.index])
+        reader.setAutoTransform(True)
+        size = reader.size()
+        room = QSize(int((self.width() - 2 * self.BUTTON - 48) * ratio), int((self.height() - 80) * ratio))
+        if size.isValid() and (size.width() > room.width() or size.height() > room.height()):
+            reader.setScaledSize(size.scaled(room, Qt.KeepAspectRatio))
+        image = reader.read()
+        self.pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
+        self.pixmap.setDevicePixelRatio(ratio)
+        self.update()
+
+    def step(self, step):
+        if len(self.paths) > 1:
+            self.index = (self.index + step) % len(self.paths)  # по кругу: после последнего — первый
+            self._load()
+
+    def open_external(self):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self.paths[self.index]))
+        self.close()
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key_Left, Qt.Key_Up, Qt.Key_PageUp, Qt.Key_Backspace):
+            self.step(-1)
+        elif key in (Qt.Key_Right, Qt.Key_Down, Qt.Key_PageDown, Qt.Key_Space):
+            self.step(1)
+        elif key == Qt.Key_Home and self.paths:
+            self.index = 0
+            self._load()
+        elif key == Qt.Key_End and self.paths:
+            self.index = len(self.paths) - 1
+            self._load()
+        elif key == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta:
+            self.step(-1 if delta > 0 else 1)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and not self.image_rect.contains(QPointF(event.position())):
+            self.close()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        side, margin = self.BUTTON, 16
+        middle = (self.height() - side) // 2
+        self.prev_button.move(margin, middle)
+        self.next_button.move(self.width() - side - margin, middle)
+        self.close_button.move(self.width() - side - margin, margin)
+        self.open_button.move(self.width() - 2 * side - margin - 8, margin)
+        self._load()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(12, 12, 14))
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        if not self.pixmap.isNull():
+            size = QSizeF(self.pixmap.size()) / self.pixmap.devicePixelRatio()
+            self.image_rect = QRectF((self.width() - size.width()) / 2, (self.height() - 40 - size.height()) / 2,
+                                     size.width(), size.height())
+            painter.drawPixmap(self.image_rect, self.pixmap, QRectF(self.pixmap.rect()))
+        else:
+            self.image_rect = QRectF()
+            painter.setPen(QColor(255, 255, 255, 170))
+            painter.drawText(self.rect(), Qt.AlignCenter, "Снимок не открылся")
+        if self.paths:
+            painter.setPen(QColor(255, 255, 255, 200))
+            caption = os.path.splitext(os.path.basename(self.paths[self.index]))[0]
+            if len(self.paths) > 1:
+                caption = f"{self.index + 1} / {len(self.paths)}   ·   {caption}"
+            painter.drawText(QRect(0, self.height() - 52, self.width(), 40), Qt.AlignCenter, caption)
+        painter.end()
+
+
 class NotesDialog(MessageBoxBase):
     """«Свои заметки» игры: общий текст об игре и записи по сессиям с датой — мысли после игры, наброски обзора
     или статьи. Слева — «Об игре» и записи, новые сверху; справа — редактор с простым оформлением.
@@ -5756,7 +5912,7 @@ class NotesDialog(MessageBoxBase):
             shortcut.activated.connect(handler)
         self.status = CaptionLabel("", self)
         self.status.setWordWrap(True)
-        # Снимки экрана записи — лентой под текстом. Щелчок — снимок в программе просмотра Windows
+        # Снимки экрана записи — лентой под текстом. Щелчок — просмотр во весь экран, ← → листают снимки записи
         self.shots_title = CaptionLabel("", self)
         self.shots_folder = TransparentPushButton("Папка снимков", self, FIF.FOLDER)
         self.shots_folder.setToolTip("Все снимки этой игры — в папке screenshots рядом с программой")
@@ -5888,13 +6044,17 @@ class NotesDialog(MessageBoxBase):
         if not images:
             return
         self.shots_title.setText(f"Снимки экрана: {len(images)}")
+        thumbs = []
         for image in images:
             path = core.screenshot_file(image)
             thumb = ShotThumb(path if path and os.path.exists(path) else None, self.shots_strip)
             if thumb.path:
-                thumb.clicked.connect(lambda p=thumb.path: QDesktopServices.openUrl(QUrl.fromLocalFile(p)))
+                thumbs.append(thumb)
                 self._shot_queue.append(thumb)
             self.shots_layout.insertWidget(self.shots_layout.count() - 1, thumb)
+        paths = [thumb.path for thumb in thumbs]
+        for i, thumb in enumerate(thumbs):
+            thumb.clicked.connect(lambda i=i: ShotViewer(self.win, paths, i))
         QTimer.singleShot(0, self._load_next_shot)
 
     def _load_next_shot(self):
@@ -8844,7 +9004,7 @@ class LibraryPage(QWidget):
         if core.griddb_key():
             grid_cover = Action(FIF.DOWNLOAD, "Обложка из SteamGridDB", menu)
             grid_cover.setToolTip("Обложка из SteamGridDB — например, если Steam собрал её из горизонтальной шапки. "
-                                  "Выберите ещё раз — будет следующий вариант")
+                                  "Варианты листаются стрелками, «Отмена» вернёт прежнюю")
             grid_cover.triggered.connect(lambda: self.cover_from_griddb(game))
             menu.addAction(grid_cover)
         menu.addSeparator()
@@ -8891,14 +9051,20 @@ class LibraryPage(QWidget):
         notify("success", self.win, "Обложка сохранена", f"«{game['name']}»")
 
     def cover_from_griddb(self, game):
-        """Каждое нажатие — следующая вертикальная обложка 600×900 из SteamGridDB, по кругу."""
+        """Окно с вариантами обложки из SteamGridDB: стрелки и «N / M», как у фона и логотипа в шапке страницы
+        игры. Порты, дисковые игры, эмуляторы, XBOX и коллекции открывают это же окно."""
+        if not game:
+            return
         name = game["name"]
-        worker = Worker(core.cover_from_griddb, dict(game), core.griddb_key(), parent=self)
-        worker.finished.connect(lambda result: self._on_griddb_cover(name, result))
-        worker.failed.connect(lambda message: notify("warning", self.win, "SteamGridDB не ответил",
-                                                     message.split(": ", 1)[-1], 6000))
-        worker.start()
-        notify("info", self.win, "Ищу обложку в SteamGridDB", f"«{name}»", 2500)
+        dialog = GriddbCoverDialog(self.win, game)
+        dialog.changed.connect(self.cover_changed)
+        core.log.info("Открыто окно «Обложка из SteamGridDB» для «%s»", name)
+        accepted = dialog.exec()
+        touched, index, count = dialog.touched, dialog.index, dialog.count
+        dialog.deleteLater()
+        if accepted and touched:
+            notify("success", self.win, "Обложка заменена",
+                   f"«{name}» — из SteamGridDB, вариант {index + 1} из {count}.", 4000)
 
     def _on_griddb_cover(self, name, result):
         if not result:
@@ -10841,6 +11007,24 @@ class SettingsPage(QWidget):
         shot_sound_row.addWidget(self.shot_sound_switch)
         shot_sound_row.addWidget(listen)
         shot_sound_row.addStretch(1)
+        # Кнопка Share геймпада Xbox: её читает SDL, пока идёт игра
+        self.gamepad_switch = SwitchButton(self)
+        self.gamepad_switch.setOnText("Вкл")
+        self.gamepad_switch.setOffText("Выкл")
+        self.gamepad_switch.setChecked(bool(settings.get("screenshot_gamepad", True)))
+        self.gamepad_switch.checkedChanged.connect(self.set_screenshot_gamepad)
+        gamepad_row = QHBoxLayout()
+        gamepad_row.addWidget(BodyLabel("Кнопка Share геймпада Xbox", self))
+        gamepad_row.addSpacing(16)
+        gamepad_row.addWidget(self.gamepad_switch)
+        gamepad_row.addStretch(1)
+        gamepad_hint = CaptionLabel(
+            "Геймпады Xbox One и Xbox Series — по кабелю и по Bluetooth. Кнопку Share Windows программам не отдаёт, "
+            "поэтому её читает библиотека SDL (та же, что у Steam и многих эмуляторов): пока идёт игра, запущенная "
+            "из программы, Share делает тот же снимок, что и клавиша. Геймпад только читается — в игре он работает "
+            "как прежде, вибрацию, подсветку и настройки Windows программа не трогает. Xbox Game Bar для этого не "
+            "нужен.", self)
+        gamepad_hint.setWordWrap(True)
         shots_hint = CaptionLabel(
             "Работает, пока идёт порт, дисковая игра или игра в эмуляторе, запущенная из программы: снимается окно "
             "игры (без рамки), "
@@ -10914,7 +11098,7 @@ class SettingsPage(QWidget):
         sound_section.add(self.credit_label)
         shots_section = SettingsSection(fluent_icon("CAMERA", FIF.PHOTO), "Снимки экрана в портах и дисковых играх",
                                         content)
-        for item in (shots_row, hotkey_row, shot_sound_row, shots_hint, self.shots_status):
+        for item in (shots_row, hotkey_row, shot_sound_row, shots_hint, gamepad_row, gamepad_hint, self.shots_status):
             shots_section.add(item)
         shots_section.add(shots_folder, 0, Qt.AlignLeft)
         look = SettingsSection(fluent_icon("PALETTE", FIF.PHOTO), "Оформление", content)
@@ -11037,6 +11221,11 @@ class SettingsPage(QWidget):
     def open_screenshots_folder(self):
         os.makedirs(core.SCREENSHOTS_DIR, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(core.SCREENSHOTS_DIR))
+
+    def set_screenshot_gamepad(self, on):
+        core.save_settings(screenshot_gamepad=on)
+        core.log.info("Снимки кнопкой Share геймпада: %s", "включены" if on else "выключены")
+        self.win.play_tracker.shots.sync()  # игра уже идёт — сразу
 
     def forget_store_login(self):
         if not confirm(self.win, "Выйти из магазина Steam?",
@@ -13454,7 +13643,10 @@ class Screenshots(QObject):
     """Снимки экрана в портах и дисковых играх. Клавиша зарегистрирована, только пока идёт игра, запущенная из
     программы (PlayTracker), и снимается только окно этой игры — если оно впереди. Снимок — PNG в папку
     screenshots/<игра> и в запись сессии в «Своих заметках» (одна запись на запуск игры). Поверх игры ничего
-    не показывается: снимок получился — щелчок затвора, не получился — два низких «бип»."""
+    не показывается: снимок получился — щелчок затвора, не получился — два низких «бип».
+
+    Кнопка Share геймпада Xbox: пока идёт игра, её нажатие ловит фоновый поток SDL (core.GamepadShareWatcher) —
+    и делается тот же снимок, что по клавише (Share программам Windows не отдаёт, а SDL читает её у геймпада сам)."""
 
     HOTKEY_ID = 0x5B01
     FRAMES_KEPT = 50  # со сколькими прошлыми снимками запуска сверяется новый
@@ -13468,11 +13660,17 @@ class Screenshots(QObject):
         self.filter = None
         self.saving = 0
         self.effects = {}
+        self.gamepad = None  # поток SDL, который ждёт кнопку Share, — пока идёт игра
+        self.gamepad_warned = False
+        self.relay = GamepadRelay(self)  # из потока SDL — в окно программы
+        self.relay.pressed.connect(self._on_gamepad_pressed)
+        self.relay.status.connect(self._on_gamepad_status)
 
     # --- Клавиша ---
     def sync(self):
         """Клавиша — за программой, только если снимки включены и идёт хотя бы одна игра."""
         settings = core.load_settings()
+        self._sync_gamepad(settings)
         hotkey = core.screenshot_hotkey(settings)
         want = (sys.platform == "win32" and bool(settings.get("screenshots_enabled", True))
                 and bool(self.tracker.sessions))
@@ -13606,6 +13804,55 @@ class Screenshots(QObject):
         page = getattr(session.get("page"), "page", None)  # страница игры на вкладке портов или дисковых
         if page is not None and getattr(page, "port", None) is port and hasattr(page, "notes_button"):
             show_notes_count(page.notes_button, port)  # на открытой странице игры — новое число записей
+
+    # --- Кнопка Share геймпада Xbox (через SDL) ---
+    def _sync_gamepad(self, settings):
+        want = (sys.platform == "win32" and bool(settings.get("screenshots_enabled", True))
+                and bool(settings.get("screenshot_gamepad", True)) and bool(self.tracker.sessions))
+        if want == (self.gamepad is not None):
+            return
+        if not want:
+            self.gamepad.stop()  # поток сам отпустит геймпады и SDL — окно его не ждёт
+            self.gamepad = None
+            core.log.info("Кнопка Share геймпада: не слушаю — игр не идёт")
+            return
+        if self.relay.watcher is not None and self.relay.watcher.alive():
+            self.relay.watcher.stop(1.0)  # прошлый поток ещё закрывает SDL — двум сразу нельзя
+        for name in ("shot", "shot_fail"):
+            self._effect(name)
+        relay = self.relay
+        self.gamepad = core.GamepadShareWatcher(relay.pressed.emit, relay.status.emit)
+        relay.watcher = self.gamepad
+        self.gamepad.start()
+
+    def _on_gamepad_pressed(self, name):
+        if self.gamepad is None:
+            return  # нажали, пока поток закрывался
+        core.log.info("Снимок кнопкой Share геймпада (%s)", name)
+        self.take()
+
+    def _on_gamepad_status(self, status):
+        if status == "ready" or self.gamepad_warned:
+            return
+        self.gamepad_warned = True  # один раз за запуск программы — не в каждой игре
+        if status == "no_sdl":
+            text = ("Для кнопки Share нужна библиотека SDL, а её нет рядом с программой. Снимки по клавише "
+                    "работают как обычно.")
+        else:
+            text = "Чтение геймпада через SDL прервалось — подробности в журнале. Снимки по клавише работают."
+        notify("warning", self.win, "Кнопка Share геймпада не работает", text, 8000)
+
+
+class GamepadRelay(QObject):
+    """Нажатия Share и состояние SDL — из фонового потока в окно программы: сигнал объекта, который живёт в потоке
+    окна, Qt доставит туда сам, в очередь."""
+
+    pressed = Signal(str)
+    status = Signal(str)
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.watcher = None  # последний запущенный поток SDL
 
 
 class PlayTracker(QObject):
@@ -14674,6 +14921,144 @@ class LiveSuggestions(QWidget):
         row = self.list.row(item)
         if 0 <= row < len(self._rows):
             self.picked.emit(self._rows[row])
+
+
+# --- Обложка из SteamGridDB ---------------------------------------------------------
+class GriddbCoverDialog(MessageBoxBase):
+    """«Обложка из SteamGridDB»: варианты обложки со стрелками и счётчиком «N / M» — как фоны и логотипы в шапке
+    страницы игры. Каждый вариант сразу ставится на место обложки (его видно и на плитке за окном). «Оставить» —
+    так и остаётся; «Отмена» — возвращается прежняя обложка, как была до окна (core.restore_cover).
+    Пока вариант качается, окно не закрывается: иначе он лёг бы поверх уже возвращённой обложки."""
+
+    PREVIEW = QSize(200, 300)
+    changed = Signal(str)  # обложка игры сменилась — перерисовать плитки
+
+    def __init__(self, parent, game):
+        super().__init__(parent)
+        self.game = dict(game)
+        self.name = game["name"]
+        self.key = core.griddb_key()
+        self.snapshot = core.cover_snapshot(self.game)
+        self.touched = False  # вариант уже ставили — по «Отмене» вернуть прежнюю обложку
+        self.busy = False
+        self.index = self.count = None
+        self._first = True
+        self._pending = None  # окно закрыли, пока качался вариант, — закроется, когда он придёт
+
+        self.viewLayout.addWidget(SubtitleLabel("Обложка из SteamGridDB", self))
+        self.viewLayout.addWidget(plain_label(f"«{self.name}»", self, caption=True))
+        self.preview = QLabel(self)
+        self.preview.setFixedSize(self.PREVIEW)
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.prev_button = TransparentToolButton(FIF.LEFT_ARROW, self)
+        self.prev_button.setToolTip("Предыдущий вариант (←)")
+        self.prev_button.clicked.connect(lambda: self.step(-1))
+        self.next_button = TransparentToolButton(FIF.RIGHT_ARROW, self)
+        self.next_button.setToolTip("Следующий вариант (→)")
+        self.next_button.clicked.connect(lambda: self.step(1))
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        row.addStretch(1)
+        row.addWidget(self.prev_button, 0, Qt.AlignVCenter)
+        row.addWidget(self.preview)
+        row.addWidget(self.next_button, 0, Qt.AlignVCenter)
+        row.addStretch(1)
+        self.viewLayout.addLayout(row)
+        self.counter = StrongBodyLabel("", self)
+        self.counter.setAlignment(Qt.AlignCenter)
+        self.viewLayout.addWidget(self.counter, 0, Qt.AlignHCenter)
+        self.status = plain_label("", self, caption=True)
+        self.viewLayout.addWidget(self.status)
+
+        self.widget.setMinimumWidth(440)
+        self.widget.setMaximumWidth(440)
+        self.yesButton.setText("Оставить")
+        self.cancelButton.setText("Отмена")
+        self._show_cover(core.find_cover(self.name))
+        QTimer.singleShot(0, lambda: self.step(1))  # сразу первый вариант — как раньше по нажатию в меню
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Left, Qt.Key_Right):
+            self.step(-1 if event.key() == Qt.Key_Left else 1)
+            return
+        super().keyPressEvent(event)
+
+    def _show_cover(self, path):
+        image = QImage(path) if path else QImage()  # не QPixmap(path): тот же файл с новой картинкой он берёт из кэша
+        if image.isNull():
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText("Обложки нет")
+            return
+        ratio = self.devicePixelRatioF()
+        pixmap = QPixmap.fromImage(image.scaled(self.PREVIEW * ratio, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        pixmap.setDevicePixelRatio(ratio)
+        self.preview.setPixmap(pixmap)
+
+    def _set_busy(self, busy):
+        self.busy = busy
+        # Вариант один — листать нечего; первый не пришёл (сайт не ответил) — стрелкой можно попробовать ещё раз
+        can_step = not busy and (self.count is None or self.count > 1)
+        self.prev_button.setEnabled(can_step)
+        self.next_button.setEnabled(can_step)
+        self.yesButton.setEnabled(not busy)
+        if busy:
+            self.status.setText("Загружаю вариант из SteamGridDB…")
+
+    def step(self, step):
+        if self.busy or (self.count is not None and self.count < 2 and not self._first):
+            return
+        self._set_busy(True)
+        if self._first:  # первый раз — с записью в лог, как выглядела прежняя обложка (core.cover_from_griddb)
+            worker = Worker(core.cover_from_griddb, dict(self.game), self.key, parent=self)
+        else:
+            worker = Worker(core.next_griddb_art, dict(self.game), "cover", self.key, step, parent=self)
+        worker.finished.connect(self._on_variant)
+        worker.failed.connect(self._on_failed)
+        worker.start()
+
+    def _on_variant(self, result):
+        self._first = False
+        if not result:
+            self.count = 0
+            self.counter.setText("0 / 0")
+            self._set_busy(False)
+            self.status.setText("В SteamGridDB вертикальной обложки для этой игры пока нет. Можно поставить свою: "
+                                "правый клик по игре → «Своя обложка…».")
+        else:
+            self.touched = True
+            self.index, self.count = result["index"], result["count"]
+            self.counter.setText(f"{self.index + 1} / {self.count}")
+            self._show_cover(result["path"])
+            self._set_busy(False)
+            self.status.setText("Других вариантов там нет." if self.count == 1 else
+                                "Стрелками — другие варианты. «Оставить» — эта обложка, «Отмена» — прежняя.")
+            self.changed.emit(self.name)
+        self._close_pending()
+
+    def _on_failed(self, message):
+        self._set_busy(False)
+        self.status.setText(message.split(": ", 1)[-1])
+        self._close_pending()
+
+    def _close_pending(self):
+        if self._pending is not None:
+            code, self._pending = self._pending, None
+            self.done(code)
+
+    def done(self, code):
+        if self.busy:
+            self._pending = code
+            self.status.setText("Дожидаюсь картинки и закрою окно…")
+            return
+        if not code and self.touched:
+            self.touched = False
+            try:
+                core.restore_cover(self.snapshot)
+            except OSError as e:
+                core.log.warning("Прежняя обложка «%s» не вернулась: %s", self.name, e)
+                notify("error", self.parent(), "Прежняя обложка не вернулась", str(e))
+            self.changed.emit(self.name)
+        super().done(code)
 
 
 # --- Вкладка «Эмуляторы» ------------------------------------------------------------

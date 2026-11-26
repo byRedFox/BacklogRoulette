@@ -15,6 +15,7 @@ import random
 import re
 import secrets
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -132,6 +133,9 @@ DEFAULT_SETTINGS = {
     "screenshots_enabled": True,
     "screenshot_hotkey": {"vk": 0x7B, "mods": 2, "text": "Ctrl+F12"},
     "screenshot_sound": True,  # свой щелчок затвора — поверх игры программа ничего не показывает
+    # Снимки кнопкой Share геймпада Xbox: пока идёт игра, программа только читает кнопку через SDL — снимок тот же,
+    # что по клавише. Настройки Windows и самого геймпада программа не трогает
+    "screenshot_gamepad": True,
     # Коллекционные карточки (тест): показывать ли весь набор игры, вместе с недостающими (неофициальный способ)
     "cards_show_missing": True,
     "badges_sort": 0,  # витрина значков: 0 — новые первыми, 1 — старые, 2 — А→Я, 3 — Я→А
@@ -917,6 +921,60 @@ def cover_from_griddb(game, api_key):
         except (OSError, ValueError):
             pass
     return next_griddb_art(game, "cover", api_key)
+
+
+def cover_snapshot(game):
+    """Обложка игры как есть — чтобы окно «Обложка из SteamGridDB» по «Отмене» вернуло всё как было: сам файл,
+    отметку «выбрана вручную» и какой вариант SteamGridDB был показан. Файл обложки — до 300×450, это десятки КБ."""
+    name = clean_name(game["name"])
+    path = find_cover(name)
+    content = None
+    if path:
+        try:
+            with open(path, "rb") as f:
+                content = f.read()
+        except OSError as e:
+            log.warning("Обложку «%s» не прочитать (вернуть её по «Отмене» не выйдет): %s", name, e)
+            path = None
+    with _cover_checks_lock:
+        custom = name in _load_cover_checks()["custom"]
+    key = _variant_key(game, "cover")
+    with _griddb_variants_lock:
+        variant = _load_griddb_variants().get(key)
+    return {"name": name, "ext": os.path.splitext(path)[1] if path else "", "content": content, "custom": custom,
+            "key": key, "variant": variant}
+
+
+def restore_cover(snapshot):
+    """Вернуть обложку из cover_snapshot. Не записалась — OSError."""
+    name = snapshot["name"]
+    delete_cover(name)
+    if snapshot["content"] is not None and snapshot["ext"] in IMAGE_EXTENSIONS:
+        os.makedirs(COVERS_DIR, exist_ok=True)
+        path = os.path.join(COVERS_DIR, name + snapshot["ext"])
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(snapshot["content"])
+        os.replace(tmp_path, path)
+    with _cover_checks_lock:
+        checks = _load_cover_checks()
+        if snapshot["custom"]:
+            checks["custom"].add(name)
+        else:
+            checks["custom"].discard(name)
+        _save_cover_checks(checks)
+    with _griddb_variants_lock:
+        data = _load_griddb_variants()
+        if snapshot["variant"] is None:
+            data.pop(snapshot["key"], None)
+        else:
+            data[snapshot["key"]] = snapshot["variant"]
+        try:
+            save_json(GRIDDB_VARIANTS_FILE, data)
+        except OSError:
+            log.exception("Не удалось вернуть запомненный вариант обложки SteamGridDB")
+    log.info("Обложка «%s»: выбор из SteamGridDB отменён — %s", name,
+             "возвращена прежняя" if snapshot["content"] is not None else "прежней не было, убрана")
 
 
 # --- Steam ------------------------------------------------------------------
@@ -3095,8 +3153,8 @@ def save_phone_export(path, app_version=""):
 
 
 # --- Другой вариант картинки из SteamGridDB --------------------------------------
-# «Обложка из SteamGridDB» в меню и кнопки «Фон ›» и «Логотип ›» в шапке страницы игры берут из SteamGridDB
-# следующий вариант при каждом нажатии, по кругу. Обложки — только 600×900, как остальные на барабане
+# Окно «Обложка из SteamGridDB» (из меню) и кнопки «Фон» и «Логотип» в шапке страницы игры листают варианты
+# из SteamGridDB стрелками, по кругу. Обложки — только 600×900, как остальные на барабане
 # (нет таких — любые вертикальные). Список вариантов и какой сейчас показан — в cache/griddb_variants.json.
 GRIDDB_VARIANTS_FILE = os.path.join(CACHE_DIR, "griddb_variants.json")
 GRIDDB_VARIANTS_TTL = 7 * 24 * 3600  # за неделю на сайт выкладывают новые картинки — список спрашиваем заново
@@ -5851,6 +5909,120 @@ def attach_screenshot(note, session_id, image):
         note["sessions"].append(session)
     session["images"].append(image)
     return session["id"]
+
+
+# --- Снимки кнопкой Share геймпада Xbox -------------------------------------------
+# Кнопку Share штатный способ Windows (XInput) программам не отдаёт. Её видит библиотека SDL (на ней работают
+# Steam и многие эмуляторы) через Raw Input Windows. Пока идёт игра, запущенная из программы, кнопку читает
+# отдельный маленький процесс (gamepad_share.py): внутри окна программы Raw Input делить с Qt и браузером, и нажатия
+# до SDL не доходили. Процесс — это сама программа (в сборке — BacklogRoulette.exe --gamepad-share, из исходников —
+# python -I gamepad_share.py), без оболочки, только читает геймпад и сообщает о нажатиях строками; программа делает
+# тот же снимок, что по клавише, со своим щелчком затвора. Вибрацию, подсветку, настройки Windows и Game Bar никто
+# не трогает. SDL2.dll — только своя: из папки программы (в сборке) или из пакета pysdl2-dll.
+GAMEPAD_LINE_MAX = 400  # строка от процесса длиннее — обрезается (в журнал — не больше)
+
+
+def sdl_library():
+    """Папка со своей SDL2.dll или "" — её нет. В сборке — _sdl2 внутри программы, из исходников — пакет pysdl2-dll."""
+    if sys.platform != "win32":
+        return ""
+    if getattr(sys, "frozen", False):
+        folder = os.path.join(RESOURCE_DIR, "_sdl2")
+    else:
+        try:
+            import sdl2dll
+            folder = sdl2dll.get_dllpath()
+        except (ImportError, AttributeError, OSError):
+            return ""
+    return folder if folder and os.path.isfile(os.path.join(folder, "SDL2.dll")) else ""
+
+
+def gamepad_share_command():
+    """Чем запустить процесс чтения геймпада: сама сборка с ключом или python -I gamepad_share.py рядом с core.py."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--gamepad-share"]
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gamepad_share.py")
+    return [sys.executable, "-I", script] if os.path.isfile(script) else []
+
+
+class GamepadShareWatcher:
+    """Процесс, который ждёт нажатия Share на геймпадах Xbox, и поток, который его слушает. on_press(имя геймпада)
+    и on_status(состояние) вызываются из этого потока: "ready" — SDL работает, "no_sdl" — SDL нет или
+    не запустилась, "failed" — сбой."""
+
+    def __init__(self, on_press, on_status):
+        self.on_press, self.on_status = on_press, on_status
+        self._stop = threading.Event()
+        self._process = None
+        self._thread = threading.Thread(target=self._run, name="gamepad-share", daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self, wait=0.0):
+        """Закрыть процесс: сначала просьбой (закрыть его stdin), не послушался за секунду — завершить."""
+        self._stop.set()
+        process = self._process
+        if process is not None and process.poll() is None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+            threading.Thread(target=self._finish, args=(process,), name="gamepad-share-stop", daemon=True).start()
+        if wait and self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(wait)
+
+    @staticmethod
+    def _finish(process):
+        try:
+            process.wait(1.5)
+        except Exception:  # noqa: BLE001 — subprocess.TimeoutExpired
+            process.kill()
+            log.info("Кнопка Share геймпада: процесс не закрылся сам — завершён")
+
+    def alive(self):
+        return self._thread.is_alive()
+
+    def _run(self):
+        folder, command = sdl_library(), gamepad_share_command()
+        if not folder or not command:
+            log.info("Кнопка Share геймпада: библиотеки SDL нет (pip install pysdl2 pysdl2-dll) — только клавиша")
+            self.on_status("no_sdl")
+            return
+        env = dict(os.environ, PYSDL2_DLL_PATH=folder, PYTHONIOENCODING="utf-8")
+        try:
+            self._process = subprocess.Popen(
+                command + ["--parent", str(os.getpid())], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, env=env, cwd=os.path.dirname(command[-1]) if len(command) > 2 else None,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), close_fds=True)
+        except OSError as e:
+            log.warning("Кнопка Share геймпада: процесс не запустился (%s) — только клавиша", e)
+            self.on_status("failed")
+            return
+        if self._stop.is_set():  # игру закрыли, пока процесс запускался
+            self.stop()
+        statuses = 0
+        for raw in self._process.stdout:
+            kind, _, text = raw.decode("utf-8", "replace").rstrip("\r\n").partition("\t")
+            text = "".join(c if c.isprintable() else " " for c in text)[:GAMEPAD_LINE_MAX]
+            if kind == "press":
+                if not self._stop.is_set():
+                    self.on_press(text)
+            elif kind == "log":
+                log.info("Кнопка Share геймпада: %s", text)
+            elif kind == "ready":
+                statuses += 1
+                log.info("Кнопка Share геймпада: SDL %s слушает геймпады Xbox (отдельный процесс)", text)
+                self.on_status("ready")
+            elif kind in ("no_sdl", "failed"):
+                statuses += 1
+                log.warning("Кнопка Share геймпада: %s — только клавиша", text)
+                self.on_status(kind)
+        code = self._process.wait()
+        if not self._stop.is_set():
+            log.warning("Кнопка Share геймпада: процесс закрылся сам (код %s) — только клавиша", code)
+            if not statuses:
+                self.on_status("failed")
 
 
 _WIN_API = None
