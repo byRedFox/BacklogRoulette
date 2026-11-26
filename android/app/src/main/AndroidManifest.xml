@@ -13,10 +13,16 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- «Нативные ИИ порты»: открыть системное окно установки и удаления порта. Ставит и удаляет сам Android —
+         каждый раз после подтверждения пользователя; разрешение на установку пользователь выдаёт в настройках сам -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
 
-    <!-- Страницы Steam — в приложении Steam, если оно стоит. Android сообщает только о нём одном -->
+    <!-- Страницы Steam — в приложении Steam, если оно стоит. Порты — только те, что в каталоге программы:
+         Android сообщает только о перечисленных приложениях, остальные программе не видны -->
     <queries>
         <package android:name="com.valvesoftware.android.steam.community" />
+        <package android:name="com.linkzenic.soh" />
     </queries>
 
     <application
@@ -43,5 +49,17 @@
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:foregroundServiceType="dataSync"
             tools:node="merge" />
+
+        <!-- Скачанный APK порта — системному окну установки: только папка cache/ports, только на чтение,
+             только на время установки -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.ports"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/port_files" />
+        </provider>
     </application>
 </manifest>
