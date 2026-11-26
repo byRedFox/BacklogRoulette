@@ -118,14 +118,25 @@
 
 ## Android-версия (ветка `android`)
 
-- Kotlin + Jetpack Compose, подпись — ключ в GitHub Secrets, сборка в GitHub Actions.
-- Данные берёт из файла «Экспорт для телефона» ПК-версии (с 2.6.1). Игры эмуляторов и XBOX в экспорт пока
-  не попадают.
-- *Подробности о текущем состоянии Android-версии в этот файл ещё не внесены — дополнить при следующей работе с ней.*
+- Проект — в папке `android/` (Kotlin + Jetpack Compose, minSdk 26, targetSdk 36), пакет
+  `io.github.byredfox.backlogroulette`. Версия — `versionCode`/`versionName` в `android/app/build.gradle.kts`
+  (`versionCode` растёт с каждой сборкой).
+- Сборка — GitHub Actions (`.github/workflows/android.yml`) при push в `android`, если менялась папка `android/`.
+  Подпись — ключом из Secrets `BR_KEYSTORE_BASE64` / `BR_KEYSTORE_PASSWORD`. Результат — артефакт
+  `BacklogRoulette-android` (`BacklogRoulette-android.apk` + `SHA256SUMS.txt`).
+- Устройство: `MainActivity` → `ui/App.kt` (нижняя панель «Рулетка» / «Игры Steam», боковое меню — `Page`),
+  данные — `data/LibraryStore`, журнал — `data/AppLog` (`files/logs/app.log`), тема — `ui/Theme.kt`, обложки — Coil.
+- Данные берёт из файла «Экспорт для телефона» ПК-версии (с 2.6.1).
+- **0.6.0** — раздел «Нативные ИИ порты» (`data/Ports.kt` — каталог и логика, `ui/PortsScreen.kt` — экраны):
+  каталог (пока один порт — Ship of Harkinian от linkzenic, `com.linkzenic.soh`), страница порта, скачивание APK
+  из релиза GitHub со сверкой SHA-256 (`digest` GitHub) и имени пакета, установка и удаление — системными окнами
+  Android, «Играть», «Есть обновление». Новые порты: запись в `PortCatalog` + имя пакета в `<queries>` манифеста.
+- Релизы — общие с ПК (вариант А): `BacklogRoulette.exe` и `BacklogRoulette-android.apk` в одном релизе.
 
 ## На чём остановились и идеи
 
-- **Сейчас:** 2.7.1 выпущена, `master` и `android` синхронизированы, `RELEASING.md` добавлен.
-- **Идея (обсуждается):** раздел «Нативные ИИ порты» в Android-версии — каталог портов для Android с картинками,
-  страница порта (описание, версия, техданные), установка скачанного APK, запуск установленного порта из программы,
-  передача своего дампа игры. Начать с одного простого порта.
+- **Сейчас:** 2.7.1 выпущена. В работе — Android 0.6.0 с разделом «Нативные ИИ порты» (первая проверка на телефоне).
+- **Дальше по портам:** сверить у Ship of Harkinian имя пакета и записать отпечаток подписи автора (`signer`)
+  из журнала; затем добавить порты с играми других платформ (кандидаты проверять: APK в релизах GitHub, `digest`,
+  как порт получает игру). Sonic Robo Blast 2 (`SRB2-Mobile/SRB2-Android`) не годится — репозиторий в архиве,
+  релизов нет. Из Android 11+ писать в папки другого приложения нельзя: игру порт должен брать сам.
