@@ -62,18 +62,31 @@ gh auth status
    ```
    Строка `'@` — в самом начале строки, без пробелов перед ней.
 
-6. **Релиз**
+6. **APK для телефона** — один релиз на обе платформы (exe и apk вместе). APK собирает GitHub Actions в ветке
+   `android` (подпись — ключом из Secrets). Скачать последнюю успешную сборку и сверить сумму:
+   ```powershell
+   gh run list --workflow Android --branch android --status success --limit 1
+   gh run download <номер из первой колонки> -n BacklogRoulette-android -D "$env:TEMP\br-apk"
+   Get-Content "$env:TEMP\br-apk\SHA256SUMS.txt"
+   Get-FileHash "$env:TEMP\br-apk\BacklogRoulette-android.apk" -Algorithm SHA256
+   ```
+   Суммы должны совпасть. Если в Android-версии в этот раз ничего не менялось — шаг можно пропустить
+   и выложить релиз только с exe.
+
+7. **Релиз**
    ```powershell
    Get-FileHash dist\BacklogRoulette.exe -Algorithm SHA256
-   gh release create vX.Y.Z dist\BacklogRoulette.exe --title "Backlog Roulette X.Y.Z" --notes-file "$env:TEMP\BacklogRoulette-X.Y.Z.md" --verify-tag --latest
+   gh release create vX.Y.Z dist\BacklogRoulette.exe "$env:TEMP\br-apk\BacklogRoulette-android.apk" --title "Backlog Roulette X.Y.Z" --notes-file "$env:TEMP\BacklogRoulette-X.Y.Z.md" --verify-tag --latest
    ```
-   `--verify-tag` не даст создать релиз без уже отправленного тега.
+   `--verify-tag` не даст создать релиз без уже отправленного тега. ПК-программа ищет в релизе ровно
+   `BacklogRoulette.exe` и на APK не смотрит. Отдельный релиз только с APK **не делаем**: став Latest, он спрятал бы
+   обновление ПК-версии.
 
-7. **Проверка**
+8. **Проверка**
    ```powershell
    gh release view vX.Y.Z --web
    ```
-   На странице — заметка, `BacklogRoulette.exe` и пометка **Latest**.
+   На странице — заметка, `BacklogRoulette.exe`, `BacklogRoulette-android.apk` (если был) и пометка **Latest**.
 
 ## Если что-то пошло не так
 
