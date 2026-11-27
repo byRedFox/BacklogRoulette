@@ -157,7 +157,7 @@ except ImportError:
 
 import core
 
-__version__ = "2.7.1"
+__version__ = "2.7.2"
 APP_NAME = "Backlog Roulette"
 APP_ID = "byRedFox.BacklogRoulette"  # для Windows: своя иконка и группа на панели задач
 AUTHOR = "Sergey Tsepa"
@@ -637,10 +637,10 @@ def hide_busy(window):
         busy.vanish()
 
 
-def confirm(window, title, text, yes="Да"):
+def confirm(window, title, text, yes="Да", no="Отмена"):
     box = MessageBox(title, text, window)
     box.yesButton.setText(yes)
-    box.cancelButton.setText("Отмена")
+    box.cancelButton.setText(no)
     core.log.info("Открыто окно «%s»", title)  # если программа застрянет на окне — это будет видно в логе
     result = bool(box.exec())
     core.log.info("Окно «%s» закрыто: %s", title, "да" if result else "отмена")
@@ -5678,7 +5678,7 @@ class ShotThumb(QLabel):
         if path:
             self.setText("…")
             self.setCursor(Qt.PointingHandCursor)
-            self.setToolTip(f"{os.path.basename(path)} — открыть")
+            self.setToolTip(f"{os.path.basename(path)} — открыть (в просмотре Del — удалить)")
         else:
             self.setText("файла нет")
             self.setToolTip("Снимок удалили из папки screenshots")
@@ -5703,17 +5703,23 @@ class ShotThumb(QLabel):
 class ShotViewer(QWidget):
     """Снимки записи во весь экран: ← → (и колесо мыши) — листать, Esc или щелчок мимо снимка — закрыть,
     кнопка вверху — открыть файл в программе просмотра Windows. Картинка читается сразу под размер экрана —
-    4K-снимок не занимает лишней памяти."""
+    4K-снимок не занимает лишней памяти.
+
+    Del — удалить снимок, который на экране: по центру окно «Удалить?» (Да / Нет). Удаляет его on_delete(путь) —
+    окно заметок: файл и строку в записи; ответ "" — удалён, иначе — почему нет. Потом на экране следующий снимок,
+    удалили последний — просмотр закрывается."""
 
     BUTTON = 44
 
-    def __init__(self, parent, paths, index):
+    def __init__(self, parent, paths, index, on_delete=None):
         super().__init__(parent, Qt.Window | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.setWindowModality(Qt.ApplicationModal)  # стрелки и Esc — просмотру, а не окну заметок под ним
         self.setWindowTitle("Снимки экрана")
         self.setFocusPolicy(Qt.StrongFocus)
         self.paths, self.index = list(paths), max(0, min(index, len(paths) - 1))
+        self.on_delete = on_delete
+        self.notice = ""  # снимок не удалился — почему; видно вместо подписи, пока не перелистнули
         self.pixmap, self._loaded = QPixmap(), None
         self.image_rect = QRectF()
         self.prev_button = self._button(FIF.LEFT_ARROW, "Предыдущий снимок (←)", lambda: self.step(-1))
@@ -5758,7 +5764,33 @@ class ShotViewer(QWidget):
     def step(self, step):
         if len(self.paths) > 1:
             self.index = (self.index + step) % len(self.paths)  # по кругу: после последнего — первый
+            self.notice = ""
             self._load()
+
+    def delete_current(self):
+        """Del: удалить снимок на экране — после «Да» в окне по центру экрана."""
+        if not self.paths or self.on_delete is None:
+            return
+        path = self.paths[self.index]
+        name = os.path.splitext(os.path.basename(path))[0]
+        if not confirm(self, "Удалить?", f"Снимок «{name}» удалится вместе с файлом.", "Да", "Нет"):
+            self.setFocus()
+            return
+        problem = self.on_delete(path)
+        self.setFocus()
+        if problem:
+            self.notice = f"Снимок не удалился: {problem}"
+            self.update()
+            return
+        del self.paths[self.index]
+        if not self.paths:
+            self.close()  # снимков в записи больше нет
+            return
+        self.index %= len(self.paths)  # на его месте — следующий; удалили последний — снова первый
+        self.notice, self._loaded = "", None
+        for button in (self.prev_button, self.next_button):
+            button.setVisible(len(self.paths) > 1)
+        self._load()
 
     def open_external(self):
         QDesktopServices.openUrl(QUrl.fromLocalFile(self.paths[self.index]))
@@ -5776,6 +5808,8 @@ class ShotViewer(QWidget):
         elif key == Qt.Key_End and self.paths:
             self.index = len(self.paths) - 1
             self._load()
+        elif key == Qt.Key_Delete:
+            self.delete_current()
         elif key == Qt.Key_Escape:
             self.close()
         else:
@@ -5814,20 +5848,22 @@ class ShotViewer(QWidget):
             painter.setPen(QColor(255, 255, 255, 170))
             painter.drawText(self.rect(), Qt.AlignCenter, "Снимок не открылся")
         if self.paths:
-            painter.setPen(QColor(255, 255, 255, 200))
             caption = os.path.splitext(os.path.basename(self.paths[self.index]))[0]
             if len(self.paths) > 1:
                 caption = f"{self.index + 1} / {len(self.paths)}   ·   {caption}"
-            painter.drawText(QRect(0, self.height() - 52, self.width(), 40), Qt.AlignCenter, caption)
+            painter.setPen(QColor(255, 140, 120) if self.notice else QColor(255, 255, 255, 200))
+            painter.drawText(QRect(0, self.height() - 52, self.width(), 40), Qt.AlignCenter, self.notice or caption)
         painter.end()
 
 
 class NotesDialog(MessageBoxBase):
-    """«Свои заметки» игры: общий текст об игре и записи по сессиям с датой — мысли после игры, наброски обзора
-    или статьи. Слева — «Об игре» и записи, новые сверху; справа — редактор с простым оформлением.
+    """«Заметки и Скриншоты» игры: общий текст об игре и записи по сессиям с датой — мысли после игры, наброски
+    обзора или статьи, снимки экрана. Слева — «Об игре» и записи, новые сверху; справа — редактор с простым
+    оформлением и лента снимков записи.
 
     Всё сохраняется само (core.save_note): через секунду после правки, при переходе к другой записи и при закрытии
-    окна. Пустые записи не сохраняются — нажали «Новая запись» и ничего не написали, после закрытия её не будет."""
+    окна. Пустые записи не сохраняются — нажали «Новая запись» и ничего не написали, после закрытия её не будет.
+    «Удалить запись» и «Удалить скриншоты» срабатывают со второго нажатия: кнопка сначала краснеет."""
 
     SAVE_DELAY_MS = 1000
     DELETE_CONFIRM_MS = 3000
@@ -5850,6 +5886,7 @@ class NotesDialog(MessageBoxBase):
         self.dirty = False
         self.save_failed = ""
         self._delete_armed = False
+        self._shots_armed = False
         self.save_timer = QTimer(self)
         self.save_timer.setSingleShot(True)
         self.save_timer.setInterval(self.SAVE_DELAY_MS)
@@ -5858,8 +5895,12 @@ class NotesDialog(MessageBoxBase):
         self.delete_timer.setSingleShot(True)
         self.delete_timer.setInterval(self.DELETE_CONFIRM_MS)
         self.delete_timer.timeout.connect(self._reset_delete)
+        self.shots_timer = QTimer(self)
+        self.shots_timer.setSingleShot(True)
+        self.shots_timer.setInterval(self.DELETE_CONFIRM_MS)
+        self.shots_timer.timeout.connect(self._reset_shots_delete)
 
-        title = SubtitleLabel(f"Свои заметки — {game['name']}", self)
+        title = SubtitleLabel(f"Заметки и Скриншоты — {game['name']}", self)
         title.setWordWrap(True)
         hint = CaptionLabel("Хранятся только на этом ПК, в папке notes рядом с программой, и сохраняются сами.", self)
         hint.setWordWrap(True)
@@ -5873,6 +5914,10 @@ class NotesDialog(MessageBoxBase):
         self.delete_button = PushButton("Удалить запись", self, FIF.DELETE)
         self.delete_button.clicked.connect(self.delete_session)
         self._delete_style = self.delete_button.styleSheet()  # обычный вид кнопки — вернуть после «Точно удалить?»
+        self.shots_delete_button = PushButton("Удалить скриншоты", self, FIF.DELETE)
+        self.shots_delete_button.setToolTip("Снимки экрана этой записи — вместе с файлами в папке screenshots. "
+                                            "Текст записи останется")
+        self.shots_delete_button.clicked.connect(self.delete_shots)
         export_button = PushButton("Экспорт в .md", self, FIF.SAVE)
         export_button.setToolTip("Вся заметка одним файлом Markdown: его открывает любой редактор, "
                                  "текст легко перенести в обзор или статью")
@@ -5882,6 +5927,7 @@ class NotesDialog(MessageBoxBase):
         left.addWidget(new_button)
         left.addWidget(self.entries, 1)
         left.addWidget(self.delete_button)
+        left.addWidget(self.shots_delete_button)
         left.addWidget(export_button)
 
         self.entry_title = StrongBodyLabel("", self)
@@ -6020,6 +6066,7 @@ class NotesDialog(MessageBoxBase):
             self.editor.setPlaceholderText("Что было в этой сессии: где остановились, что запомнилось, мысли…")
         self.delete_button.setEnabled(entry is not None)
         self._reset_delete()
+        self._reset_shots_delete()
         self._show_shots(entry)
 
     # --- Снимки записи ---
@@ -6039,6 +6086,7 @@ class NotesDialog(MessageBoxBase):
         images = (entry or {}).get("images") or []
         for widget in (self.shots_title, self.shots_folder, self.shots_scroll):
             widget.setVisible(bool(images))
+        self.shots_delete_button.setEnabled(bool(images))
         self._fit_editor(bool(images))
         self._shot_queue = []
         if not images:
@@ -6054,7 +6102,8 @@ class NotesDialog(MessageBoxBase):
             self.shots_layout.insertWidget(self.shots_layout.count() - 1, thumb)
         paths = [thumb.path for thumb in thumbs]
         for i, thumb in enumerate(thumbs):
-            thumb.clicked.connect(lambda i=i: ShotViewer(self.win, paths, i))
+            thumb.clicked.connect(lambda i=i: ShotViewer(self.win, paths, i,
+                                                         lambda path: self._delete_shot(entry, path)))
         QTimer.singleShot(0, self._load_next_shot)
 
     def _load_next_shot(self):
@@ -6115,9 +6164,7 @@ class NotesDialog(MessageBoxBase):
         if (entry["text"].strip() or entry.get("images")) and not self._delete_armed:
             # Запись с текстом или снимками удаляется вторым нажатием — случайно не потерять. Кнопка на это время красная
             self._delete_armed = True
-            self.delete_button.setText("Точно удалить?")
-            self.delete_button.setIcon(FIF.DELETE.icon(color=QColor("white")))
-            self.delete_button.setStyleSheet(self._delete_style + self.DELETE_ARMED_QSS)
+            self._arm(self.delete_button)
             self.delete_timer.start()
             return
         self._reset_delete()
@@ -6126,16 +6173,84 @@ class NotesDialog(MessageBoxBase):
         self.dirty = True
         self._fill_list()
         if self.save() and entry.get("images"):
-            # Сами файлы программа не удаляет: снимок мог пригодиться и без записи
+            # Сами файлы программа здесь не удаляет: снимок мог пригодиться и без записи
             self._set_status(f"Запись удалена. Её снимки ({len(entry['images'])}) остались в папке screenshots "
-                             "рядом с программой.")
+                             "рядом с программой. Удалить и их — «Удалить скриншоты», пока запись ещё есть.")
+
+    def _arm(self, button):
+        """Первое нажатие «Удалить…»: кнопка красная, на ней «Точно удалить?»."""
+        button.setText("Точно удалить?")
+        button.setIcon(FIF.DELETE.icon(color=QColor("white")))
+        button.setStyleSheet(self._delete_style + self.DELETE_ARMED_QSS)
+
+    def _disarm(self, button, text):
+        button.setText(text)
+        button.setIcon(FIF.DELETE)
+        button.setStyleSheet(self._delete_style)
 
     def _reset_delete(self):
         self.delete_timer.stop()
         self._delete_armed = False
-        self.delete_button.setText("Удалить запись")
-        self.delete_button.setIcon(FIF.DELETE)
-        self.delete_button.setStyleSheet(self._delete_style)
+        self._disarm(self.delete_button, "Удалить запись")
+
+    def _reset_shots_delete(self):
+        self.shots_timer.stop()
+        self._shots_armed = False
+        self._disarm(self.shots_delete_button, "Удалить скриншоты")
+
+    # --- Удаление снимков ---
+    def delete_shots(self):
+        """«Удалить скриншоты»: снимки открытой записи — вместе с файлами; текст записи остаётся. Со второго
+        нажатия, как «Удалить запись». Файлы — только PNG из папки screenshots (core.delete_screenshot)."""
+        entry = self.current
+        if entry is None or not entry.get("images"):
+            return
+        if not self._shots_armed:
+            self._shots_armed = True
+            self._arm(self.shots_delete_button)
+            self.shots_timer.start()
+            return
+        self._reset_shots_delete()
+        self._store()
+        kept, removed = [], 0
+        for image in entry["images"]:
+            try:
+                core.delete_screenshot(image)
+                removed += 1
+            except OSError as e:
+                kept.append(image)  # файл открыт в другой программе — строка в записи остаётся
+                core.log.warning("Снимок %s не удалился: %s", os.path.basename(image), e.strerror or type(e).__name__)
+        entry["images"] = kept
+        self.dirty = True
+        self._show_shots(entry)
+        saved = self.save()
+        self._refresh_row()
+        core.log.info("Заметка «%s»: удалено снимков %d, не удалилось %d", self.game["name"], removed, len(kept))
+        if kept:
+            self._set_status(f"Удалено снимков: {removed}. Не удалились: {len(kept)} — возможно, файл открыт "
+                             "в другой программе. Закройте её и нажмите ещё раз.", warning=True)
+        elif saved:
+            self._set_status(f"Удалено снимков: {removed} — вместе с файлами.")
+
+    def _delete_shot(self, entry, path):
+        """Del в просмотре снимков: файл снимка удаляется, из записи он убирается. "" — удалён, иначе — почему нет."""
+        image = next((i for i in entry.get("images") or [] if core.screenshot_file(i) == path), None)
+        if image is None:
+            return "этого снимка уже нет в записи"
+        try:
+            core.delete_screenshot(image)
+        except OSError as e:
+            reason = e.strerror or type(e).__name__
+            core.log.warning("Снимок %s не удалился: %s", os.path.basename(image), reason)
+            return f"{reason}. Возможно, файл открыт в другой программе"
+        entry["images"] = [i for i in entry["images"] if i != image]
+        self.dirty = True
+        self.save()
+        if entry is self.current:
+            self._show_shots(entry)
+            self._refresh_row()
+        core.log.info("Заметка «%s»: снимок удалён из просмотра", self.game["name"])
+        return ""
 
     # --- Оформление ---
     def _bold(self):
@@ -6224,11 +6339,12 @@ class NotesDialog(MessageBoxBase):
     def done(self, code):
         self.save()
         self.delete_timer.stop()
+        self.shots_timer.stop()
         super().done(code)
 
 
 def open_notes(win, game, button):
-    """«Свои заметки» — окном поверх программы; после закрытия на кнопке видно, сколько в заметке записей."""
+    """«Заметки и Скриншоты» — окном поверх программы; после закрытия на кнопке видно, сколько в заметке записей."""
     dialog = NotesDialog(win, game)
     core.log.info("Открыты заметки «%s»", game["name"])
     win.notes_dialog = dialog  # снимок экрана, сделанный сейчас, пойдёт прямо в это окно
@@ -6245,8 +6361,8 @@ def open_notes(win, game, button):
 
 def show_notes_count(button, game):
     count = core.note_count(game)
-    button.setText(f"Свои заметки · {count}" if count else "Свои заметки")
-    button.setToolTip("Общая заметка об игре и записи по сессиям — хранятся только на этом ПК" +
+    button.setText(f"Заметки и Скриншоты · {count}" if count else "Заметки и Скриншоты")
+    button.setToolTip("Общая заметка об игре, записи по сессиям и снимки экрана — хранятся только на этом ПК" +
                       (f". Сейчас частей: {count}" if count else ""))
 
 
@@ -6337,7 +6453,7 @@ class GamePage(QWidget):
         self.win.rouletteChanged.connect(lambda: self.game is not None and self.update_buttons())
         self.cover_button = PushButton("Своя обложка", self, FIF.PHOTO)
         self.cover_button.clicked.connect(self.home.choose_cover)
-        self.notes_button = PushButton("Свои заметки", self, fluent_icon("QUICK_NOTE", FIF.EDIT))
+        self.notes_button = PushButton("Заметки и Скриншоты", self, fluent_icon("QUICK_NOTE", FIF.EDIT))
         self.notes_button.clicked.connect(lambda: self.game and open_notes(self.win, self.game, self.notes_button))
         # Коллекционные карточки (тест) — у игр, связанных со Steam
         self.cards_button = PushButton("Карточки Steam", self, PolaroidIcon())
@@ -11029,7 +11145,7 @@ class SettingsPage(QWidget):
             "Работает, пока идёт порт, дисковая игра или игра в эмуляторе, запущенная из программы: снимается окно "
             "игры (без рамки), "
             "если оно сейчас впереди. Снимок — PNG в папке screenshots рядом с программой и в запись этой сессии "
-            "в «Своих заметках». Поверх игры ничего не появляется — только щелчок затвора; не получилось — два "
+            "в «Заметках и Скриншотах». Поверх игры ничего не появляется — только щелчок затвора; не получилось — два "
             "низких «бип». Клавиша нужна программе только на время игры: потом она снова свободна. Чёрные снимки — "
             "у игр в исключительном полноэкранном режиме: включите в игре оконный или «безрамочный».", self)
         shots_hint.setWordWrap(True)
@@ -12853,7 +12969,7 @@ class PortPage(QWidget):
         self.edit_button.clicked.connect(lambda: self.ports_page.edit(self.port))
         self.cover_button = PushButton("Своя обложка", self, FIF.PHOTO)
         self.cover_button.clicked.connect(lambda: self.win.library_page.choose_cover(self.port))
-        self.notes_button = PushButton("Свои заметки", self, fluent_icon("QUICK_NOTE", FIF.EDIT))
+        self.notes_button = PushButton("Заметки и Скриншоты", self, fluent_icon("QUICK_NOTE", FIF.EDIT))
         self.notes_button.clicked.connect(lambda: self.port and open_notes(self.win, self.port, self.notes_button))
         self.spin_button = PushButton("Крутить ещё", self, FIF.SYNC)
         self.spin_button.clicked.connect(self._spin_again)
@@ -13126,7 +13242,9 @@ class PortPage(QWidget):
         update = core.port_has_update(port) and not completed  # пройденную обновлять незачем
         self.update_button.setVisible(update)
         self.updated_button.setVisible(update)
-        self.play_button.setVisible(launch)  # игру XBOX на ПК не запустить
+        # Игру XBOX на ПК не запустить — «Играть» у неё нет, но пройденная, как и остальные, показывает
+        # неактивную кнопку с кубком «Пройдена»
+        self.play_button.setVisible(launch or completed)
         self.play_button.setEnabled(not completed)
         self.play_button.setText("Пройдена" if completed else "Играть")
         self.play_button.setIcon(trophy_icon() if completed else FIF.PLAY)
@@ -13642,7 +13760,7 @@ class HotkeyFilter(QAbstractNativeEventFilter):
 class Screenshots(QObject):
     """Снимки экрана в портах и дисковых играх. Клавиша зарегистрирована, только пока идёт игра, запущенная из
     программы (PlayTracker), и снимается только окно этой игры — если оно впереди. Снимок — PNG в папку
-    screenshots/<игра> и в запись сессии в «Своих заметках» (одна запись на запуск игры). Поверх игры ничего
+    screenshots/<игра> и в запись сессии в «Заметках и Скриншотах» (одна запись на запуск игры). Поверх игры ничего
     не показывается: снимок получился — щелчок затвора, не получился — два низких «бип».
 
     Кнопка Share геймпада Xbox: пока идёт игра, её нажатие ловит фоновый поток SDL (core.GamepadShareWatcher) —
